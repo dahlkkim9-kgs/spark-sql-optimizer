@@ -34,3 +34,28 @@ def test_extract_multiple_line_comments():
     assert len(comments) == 2
     assert comments[0]['content'] == ' first comment'
     assert comments[1]['content'] == ' second comment'
+
+
+def test_extract_block_comment():
+    """Test extraction of /* */ block comment"""
+    preserver = CommentPreserver()
+    sql = "SELECT id /* this is a block comment */"
+
+    comments = preserver.extract_comments(sql)
+
+    assert len(comments) == 1
+    assert comments[0]['content'] == ' this is a block comment '
+    assert comments[0]['type'] == 'block'
+
+
+def test_extract_mixed_comments():
+    """Test extraction of both line and block comments"""
+    preserver = CommentPreserver()
+    sql = """SELECT id -- line comment
+     , name /* block comment */"""
+
+    comments = preserver.extract_comments(sql)
+
+    assert len(comments) == 2
+    assert comments[0]['type'] == 'line'
+    assert comments[1]['type'] == 'block'
