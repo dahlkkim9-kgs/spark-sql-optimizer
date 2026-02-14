@@ -98,3 +98,29 @@ class CommentPreserver:
             result = result[:comment['start']] + comment['placeholder'] + result[comment['end']:]
 
         return result
+
+    def get_token_before_placeholder(self, sql: str, placeholder: str) -> str:
+        """
+        Get the SQL token immediately before a placeholder.
+
+        Args:
+            sql: SQL string with placeholders
+            placeholder: The placeholder to find
+
+        Returns:
+            The token before the placeholder, or empty string if not found
+        """
+        pos = sql.find(placeholder)
+        if pos == -1:
+            return ''
+
+        # Get text before placeholder
+        before = sql[:pos].rstrip()
+
+        # Find the last token (word, identifier, or keyword)
+        # Skip trailing whitespace and find the last word
+        tokens = before.split()
+        if tokens:
+            return tokens[-1]
+
+        return ''

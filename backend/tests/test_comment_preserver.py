@@ -86,3 +86,30 @@ def test_replace_preserves_structure():
     # The structure should be preserved
     assert "SELECT id, name" in result
     assert "FROM table" in result
+
+
+def test_comment_context_field_name():
+    """Test that we capture what field a comment follows"""
+    preserver = CommentPreserver()
+    sql = "SELECT id -- primary key\n     , name -- user name"
+
+    comments = preserver.extract_comments(sql)
+    result = preserver.replace_with_placeholders(sql)
+
+    # After replacement, we should be able to find the token before placeholder
+    # for mapping purposes during insert
+    assert comments[0]['placeholder'] in result
+    assert comments[1]['placeholder'] in result
+
+
+def test_get_token_before_placeholder():
+    """Test getting the token immediately before a placeholder"""
+    preserver = CommentPreserver()
+    sql = "SELECT id -- primary key\nFROM table"
+
+    preserver.extract_comments(sql)
+    result = preserver.replace_with_placeholders(sql)
+
+    # Find what comes before the placeholder
+    token = preserver.get_token_before_placeholder(result, '___COMMENT_001___')
+    assert token == 'id'
