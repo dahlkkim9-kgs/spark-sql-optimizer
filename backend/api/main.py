@@ -1,0 +1,183 @@
+"""
+FastAPI 主应用
+Spark SQL优化工具的REST API
+"""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import sys
+import os
+
+# 处理 PyInstaller 打包后的路径
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包后的环境
+    # 获取可执行文件所在目录
+    if hasattr(sys, '_MEIPASS'):
+        # 数据文件被解压到的临时目录
+        sys.path.insert(0, os.path.join(sys._MEIPASS, 'core'))
+        sys.path.insert(0, sys._MEIPASS)
+    else:
+        # 备用方案
+        script_dir = os.path.dirname(os.path.abspath(sys.executable))
+        sys.path.insert(0, os.path.join(script_dir, 'core'))
+else:
+    # 开发环境
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from core.analyzer import StaticAnalyzer
+
+
+app = FastAPI(
+    title="Spark SQL 优化工具 API",
+    description="离线Spark SQL静态分析和优化建议",
+    version="1.0.0"
+)
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+# 初始化分析器
+analyzer = StaticAnalyzer()
+
+
+# 数据模型
+class SQLRequest(BaseModel):
+    sql: str
+    filename: Optional[str] = None
+
+
+class Issue(BaseModel):
+    rule: str
+    severity: str
+    message: str
+    line: int
+    suggestion: str
+
+
+class AnalysisResult(BaseModel):
+    file: Optional[str]
+    original_sql: str
+    optimized_sql: str
+    issues: List[Issue]
+    issue_count: int
+    high_priority: int
+    medium_priority: int
+    low_priority: int
+
+
+class FormatRequest(BaseModel):
+    sql: str
+    keyword_case: Optional[str] = "upper"  # upper, lower, capitalize
+    indent: Optional[int] = 4
+    comma_start: Optional[bool] = False
+    semicolon: Optional[bool] = False
+
+
+class FormatResult(BaseModel):
+    original_sql: str
+    formatted_sql: str
+
+
+@app.get("/")
+def read_root():
+    """API根路径"""
+    return {
+        "name": "Spark SQL 优化工具",
+        "version": "1.0.0",
+        "status": "running"
+    }
+
+
+@app.get("/health")
+def health_check():
+    """健康检查"""
+    return {"status": "healthy"}
+
+
+@app.post("/analyze", response_model=AnalysisResult)
+def analyze_sql(request: SQLRequest):
+    """
+    分析SQL并提供优化建议
+
+    - **sql**: Spark SQL语句
+    - **filename**: 可选的文件名
+    """
+    result = analyzer.analyze(request.sql, filename=request.filename)
+    return result
+
+
+@app.post("/analyze/file")
+def analyze_file(file_path: str):
+    """
+    分析SQL文件
+
+    - **file_path**: SQL文件的绝对路径
+    """
+    result = analyzer.analyze_file(file_path)
+    return result
+
+
+@app.post("/analyze/batch")
+def analyze_batch(folder: str):
+    """
+    批量分析文件夹中的SQL文件
+
+    - **folder**: 文件夹路径
+    """
+    results = analyzer.analyze_batch(folder)
+    return {
+        "total_files": len(results),
+        "results": results
+    }
+
+
+@app.get("/rules")
+def get_rules():
+    """获取所有优化规则列表"""
+    return {
+        "rules": [
+            {
+                "name": rule["name"],
+                "severity": rule["severity"],
+                "description": rule["message"]
+            }
+            for rule in analyzer.rules
+        ]
+    }
+
+
+@app.post("/format", response_model=FormatResult)
+def format_sql(request: FormatRequest):
+    """
+    格式化SQL语句
+
+    - **sql**: 原始SQL语句
+    - **keyword_case**: 关键字大小写 (upper/lower/capitalize)
+    - **indent**: 缩进空格数
+    - **comma_start**: 逗号是否在行首
+    - **semicolon**: 结尾是否添加分号
+    """
+    formatted = analyzer.format_sql(
+        request.sql,
+        keyword_case=request.keyword_case,
+        indent=request.indent,
+        comma_start=request.comma_start,
+        semicolon=request.semicolon
+    )
+    return {
+        "original_sql": request.sql,
+        "formatted_sql": formatted
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8888)

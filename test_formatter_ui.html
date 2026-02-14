@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL格式化器测试 - V3版本</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .test-panel {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+
+        .test-panel h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+
+        .panel-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 200px;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 14px;
+            resize: vertical;
+            transition: border-color 0.3s;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            flex: 1;
+            min-width: 150px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        .btn-secondary:hover {
+            background: #e0e0e0;
+        }
+
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #059669;
+        }
+
+        .test-cases {
+            margin-top: 20px;
+        }
+
+        .test-case-item {
+            background: #f8f9fa;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-left: 4px solid #667eea;
+        }
+
+        .test-case-item:hover {
+            background: #e9ecef;
+            transform: translateX(5px);
+        }
+
+        .test-case-item h4 {
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .test-case-item p {
+            font-size: 13px;
+            color: #666;
+        }
+
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            display: none;
+        }
+
+        .status.success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 2px solid #10b981;
+            display: block;
+        }
+
+        .status.error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 2px solid #ef4444;
+            display: block;
+        }
+
+        .features {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            margin-top: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+
+        .features h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+
+        .feature-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .feature-item h3 {
+            font-size: 1.1em;
+            margin-bottom: 8px;
+        }
+
+        .feature-item p {
+            font-size: 0.9em;
+            opacity: 0.9;
+        }
+
+        @media (max-width: 768px) {
+            .panel-row {
+                grid-template-columns: 1fr;
+            }
+
+            .header h1 {
+                font-size: 1.8em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>SQL格式化器测试</h1>
+            <p>符合《大数据SQL开发规范》的V3版本 | 支持逗号前置、AND右对齐、ON右对齐等特性</p>
+        </div>
+
+        <div class="test-panel">
+            <h2>格式化测试</h2>
+            <div class="panel-row">
+                <div>
+                    <div class="input-group">
+                        <label for="inputSql">输入SQL:</label>
+                        <textarea id="inputSql" placeholder="请输入需要格式化的SQL语句...">SELECT t1.id, t1.name, t2.amount FROM table1 t1 LEFT JOIN table2 t2 ON t1.id = t2.id AND t2.status = '1' WHERE t1.date >= '2024-01-01' AND t1.status = '1'</textarea>
+                    </div>
+
+                    <div class="button-group">
+                        <button class="btn-primary" onclick="formatSql()">格式化 SQL</button>
+                        <button class="btn-secondary" onclick="clearInput()">清空</button>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="input-group">
+                        <label for="outputSql">格式化结果:</label>
+                        <textarea id="outputSql" readonly placeholder="格式化后的SQL将显示在这里..."></textarea>
+                    </div>
+
+                    <div class="button-group">
+                        <button class="btn-success" onclick="copyOutput()">复制结果</button>
+                        <button class="btn-secondary" onclick="clearOutput()">清空</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="status" class="status"></div>
+        </div>
+
+        <div class="test-panel">
+            <h2>测试用例</h2>
+            <div class="test-cases">
+                <div class="test-case-item" onclick="loadTestCase(1)">
+                    <h4>测试1: 逗号前置格式</h4>
+                    <p>验证字段列表的逗号是否前置并左对齐</p>
+                </div>
+
+                <div class="test-case-item" onclick="loadTestCase(2)">
+                    <h4>测试2: WHERE中AND右对齐</h4>
+                    <p>验证WHERE子句中多个AND条件是否右对齐</p>
+                </div>
+
+                <div class="test-case-item" onclick="loadTestCase(3)">
+                    <h4>测试3: JOIN中ON右对齐</h4>
+                    <p>验证多表JOIN时ON条件是否右对齐</p>
+                </div>
+
+                <div class="test-case-item" onclick="loadTestCase(4)">
+                    <h4>测试4: CASE WHEN格式化</h4>
+                    <p>验证CASE WHEN语句的格式化效果</p>
+                </div>
+
+                <div class="test-case-item" onclick="loadTestCase(5)">
+                    <h4>测试5: 复杂查询</h4>
+                    <p>综合测试包含JOIN、WHERE、GROUP BY、ORDER BY的复杂查询</p>
+                </div>
+
+                <div class="test-case-item" onclick="loadTestCase(6)">
+                    <h4>测试6: INSERT SELECT</h4>
+                    <p>测试INSERT SELECT语句的格式化</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="features">
+            <h2>格式化特性</h2>
+            <div class="feature-grid">
+                <div class="feature-item">
+                    <h3>4空格缩进</h3>
+                    <p>统一使用4个空格缩进</p>
+                </div>
+
+                <div class="feature-item">
+                    <h3>逗号前置</h3>
+                    <p>逗号写在字段名前面</p>
+                </div>
+
+                <div class="feature-item">
+                    <h3>AND右对齐</h3>
+                    <p>WHERE中AND与WHERE右对齐</p>
+                </div>
+
+                <div class="feature-item">
+                    <h3>ON右对齐</h3>
+                    <p>JOIN中ON与JOIN右对齐</p>
+                </div>
+
+                <div class="feature-item">
+                    <h3>分号另起行</h3>
+                    <p>SQL结束分号单独一行</p>
+                </div>
+
+                <div class="feature-item">
+                    <h3>关键字大写</h3>
+                    <p>所有SQL关键字自动大写</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8888';
+
+        const testCases = {
+            1: `SELECT t1.id, t1.name, t2.amount FROM table1 t1 LEFT JOIN table2 t2 ON t1.id = t2.id`,
+            2: `SELECT * FROM orders WHERE status = '1' AND date >= '2024-01-01' AND amount > 100`,
+            3: `SELECT t1.id, t2.name FROM table1 t1 LEFT JOIN table2 t2 ON t1.id = t2.id AND t2.status = '1' LEFT JOIN table3 t3 ON t1.id = t3.id AND t3.type = 'A'`,
+            4: `SELECT CASE WHEN status = '1' THEN 'Active' WHEN status = '0' THEN 'Inactive' ELSE 'Unknown' END AS status_desc FROM users`,
+            5: `SELECT t1.user_id, t1.user_name, t2.order_amount, CASE WHEN t1.vip_level = '1' THEN '金牌会员' WHEN t1.vip_level = '2' THEN '银牌会员' ELSE '普通会员' END AS vip_desc FROM users t1 LEFT JOIN orders t2 ON t1.user_id = t2.user_id AND t2.order_date >= '2024-01-01' LEFT JOIN products t3 ON t2.product_id = t3.product_id AND t3.status = '1' WHERE t1.status = '1' AND t1.create_time >= '2023-01-01' AND t2.order_amount > 0 GROUP BY t1.user_id, t1.user_name, t2.order_amount ORDER BY t1.user_id DESC LIMIT 100`,
+            6: `INSERT INTO target_table SELECT id, name, amount FROM source_table WHERE date >= '2024-01-01'`
+        };
+
+        async function formatSql() {
+            const inputSql = document.getElementById('inputSql').value.trim();
+
+            if (!inputSql) {
+                showStatus('请输入SQL语句', 'error');
+                return;
+            }
+
+            try {
+                showStatus('正在格式化...', 'success');
+
+                const response = await fetch(`${API_URL}/format`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        sql: inputSql,
+                        keyword_case: 'upper',
+                        indent: 4,
+                        comma_start: true,
+                        semicolon: true
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                document.getElementById('outputSql').value = data.formatted_sql;
+                showStatus('格式化成功！', 'success');
+
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus(`格式化失败: ${error.message}`, 'error');
+            }
+        }
+
+        function loadTestCase(testNum) {
+            const testCase = testCases[testNum];
+            document.getElementById('inputSql').value = testCase;
+            showStatus(`已加载测试用例 ${testNum}`, 'success');
+        }
+
+        function clearInput() {
+            document.getElementById('inputSql').value = '';
+            hideStatus();
+        }
+
+        function clearOutput() {
+            document.getElementById('outputSql').value = '';
+            hideStatus();
+        }
+
+        function copyOutput() {
+            const outputSql = document.getElementById('outputSql');
+            outputSql.select();
+            document.execCommand('copy');
+            showStatus('已复制到剪贴板！', 'success');
+        }
+
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${type}`;
+        }
+
+        function hideStatus() {
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = 'status';
+        }
+
+        // 页面加载时自动运行第一个测试
+        window.onload = function() {
+            loadTestCase(1);
+        };
+    </script>
+</body>
+</html>

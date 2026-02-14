@@ -1,0 +1,72 @@
+{
+  "name": "spark-sql-optimizer",
+  "version": "1.0.0",
+  "description": "Spark SQL离线优化工具",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.company.spark-sql-optimizer",
+    "productName": "Spark SQL优化工具",
+    "electronDownload": {
+      "mirror": "https://npmmirror.com/mirrors/electron/"
+    },
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "frontend/build/**/*",
+      "resources/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/dist/spark-sql-backend.exe",
+        "to": "backend/spark-sql-backend.exe"
+      },
+      {
+        "from": "backend/core",
+        "to": "backend/core"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "resources/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "resources/icon.png",
+      "category": "Development"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^40.2.1",
+    "electron-builder": "^26.7.0"
+  },
+  "repository": "https://github.com/yourusername/spark-sql-optimizer",
+  "author": "Your Name",
+  "license": "MIT"
+}

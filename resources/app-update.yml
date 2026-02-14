@@ -1,0 +1,4 @@
+owner: yourusername
+repo: spark-sql-optimizer
+provider: github
+updaterCacheDirName: spark-sql-optimizer-updater
