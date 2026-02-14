@@ -77,3 +77,24 @@ class CommentPreserver:
         self._comments.sort(key=lambda c: c['start'])
 
         return self._comments
+
+    def replace_with_placeholders(self, sql: str) -> str:
+        """
+        Replace all comments with unique placeholders.
+
+        Args:
+            sql: Original SQL string with comments
+
+        Returns:
+            SQL string with comments replaced by placeholders
+        """
+        result = sql
+
+        # Sort by position descending to replace from end to start
+        # This preserves string positions
+        sorted_comments = sorted(self._comments, key=lambda c: c['start'], reverse=True)
+
+        for comment in sorted_comments:
+            result = result[:comment['start']] + comment['placeholder'] + result[comment['end']:]
+
+        return result

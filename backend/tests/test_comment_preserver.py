@@ -59,3 +59,30 @@ def test_extract_mixed_comments():
     assert len(comments) == 2
     assert comments[0]['type'] == 'line'
     assert comments[1]['type'] == 'block'
+
+
+def test_replace_with_placeholders():
+    """Test replacing comments with placeholders"""
+    preserver = CommentPreserver()
+    sql = "SELECT id -- comment\nFROM table"
+
+    comments = preserver.extract_comments(sql)
+    result = preserver.replace_with_placeholders(sql)
+
+    assert "___COMMENT_001___" in result
+    assert "-- comment" not in result
+    assert "SELECT id" in result
+    assert "FROM table" in result
+
+
+def test_replace_preserves_structure():
+    """Test that replacement preserves SQL structure"""
+    preserver = CommentPreserver()
+    sql = "SELECT id, name /* comment */ FROM table"
+
+    preserver.extract_comments(sql)
+    result = preserver.replace_with_placeholders(sql)
+
+    # The structure should be preserved
+    assert "SELECT id, name" in result
+    assert "FROM table" in result
