@@ -8,3 +8,29 @@ def test_comment_preserver_exists():
     """Test that CommentPreserver class can be instantiated"""
     preserver = CommentPreserver()
     assert preserver is not None
+
+
+def test_extract_single_line_comment():
+    """Test extraction of single -- comment"""
+    preserver = CommentPreserver()
+    sql = "SELECT id -- this is a comment"
+
+    comments = preserver.extract_comments(sql)
+
+    assert len(comments) == 1
+    assert comments[0]['content'] == ' this is a comment'
+    assert comments[0]['type'] == 'line'
+    assert comments[0]['placeholder'] == '___COMMENT_001___'
+
+
+def test_extract_multiple_line_comments():
+    """Test extraction of multiple -- comments"""
+    preserver = CommentPreserver()
+    sql = """SELECT id -- first comment
+     , name -- second comment"""
+
+    comments = preserver.extract_comments(sql)
+
+    assert len(comments) == 2
+    assert comments[0]['content'] == ' first comment'
+    assert comments[1]['content'] == ' second comment'
