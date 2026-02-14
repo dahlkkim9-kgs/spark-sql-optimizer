@@ -61,3 +61,4 @@ yarn-error.log*
 # Frontend
 frontend/build/
 nul
+.worktrees/
