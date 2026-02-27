@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 SQL Formatter V4 - With Comment Preservation
-
 Wraps formatter_v3 with comment preservation capability.
 """
-from .formatter_v3 import format_sql_v3, SQLFormatterV3
-from .comment_preserver import CommentPreserver
+from formatter_v3 import format_sql_v3, SQLFormatterV3
+from comment_preserver import CommentPreserver
 
 
 def format_sql_v4(sql: str, **options) -> str:
@@ -23,6 +22,7 @@ def format_sql_v4(sql: str, **options) -> str:
         **options: Options passed to formatter_v3
             - keyword_case: upper/lower (default upper)
             - newline: semicolon on new line (default True)
+            - semicolon: semicolon on new line (default True)
 
     Returns:
         Formatted SQL with comments preserved
@@ -33,10 +33,10 @@ def format_sql_v4(sql: str, **options) -> str:
     comments = preserver.extract_comments(sql)
 
     # Step 2: Replace with placeholders
-    sql_with_placeholders = preserver.replace_with_placeholders(sql)
+    sql_clean = preserver.replace_with_placeholders(sql)
 
     # Step 3: Format using v3
-    formatted = format_sql_v3(sql_with_placeholders, **options)
+    formatted = format_sql_v3(sql_clean, **options)
 
     # Step 4: Insert comments back
     result = preserver.insert_comments(formatted, sql)

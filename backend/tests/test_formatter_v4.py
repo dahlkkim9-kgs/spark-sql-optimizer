@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'core'))
 
-from formatter_v4 import format_sql_v4
+from core.formatter_v4 import format_sql_v4
 
 def test_format_preserves_field_comments():
     """Test that formatter v4 preserves field-level comments"""
