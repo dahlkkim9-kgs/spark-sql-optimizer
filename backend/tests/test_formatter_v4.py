@@ -33,3 +33,51 @@ END"""
     result = format_sql_v4(sql)
 
     assert "-- condition A" in result
+
+
+def test_format_complex_sql_with_comments():
+    """Test formatting complex SQL with multiple comment types"""
+    sql = """SELECT id -- primary key
+     , name -- user name
+     , CASE
+         WHEN status = 1 THEN 'active' -- active status
+         ELSE 'inactive'
+     END AS status_text
+FROM users -- user table
+    LEFT JOIN orders -- order table
+        ON users.id = orders.user_id
+WHERE users.active = 1 -- only active users
+;"""
+
+    result = format_sql_v4(sql)
+
+    # All comments should be preserved
+    assert "-- primary key" in result
+    assert "-- user name" in result
+    assert "-- active status" in result
+    assert "-- user table" in result
+    assert "-- order table" in result
+    assert "-- only active users" in result
+
+
+def test_format_block_comments():
+    """Test preserving block comments"""
+    sql = "SELECT id /* primary key */, name FROM users"
+
+    result = format_sql_v4(sql)
+
+    assert "/* primary key */" in result
+
+
+def test_format_standalone_comment_lines():
+    """Test preserving standalone comment lines"""
+    sql = """-- This is a header comment
+SELECT id, name
+-- Filter active users
+FROM users
+WHERE active = 1"""
+
+    result = format_sql_v4(sql)
+
+    assert "-- This is a header comment" in result
+    assert "-- Filter active users" in result
