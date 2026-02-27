@@ -4,8 +4,8 @@ SQL Formatter V4 - With Comment Preservation
 
 Wraps formatter_v3 with comment preservation capability.
 """
-from formatter_v3 import format_sql_v3, SQLFormatterV3
-from comment_preserver import CommentPreserver
+from .formatter_v3 import format_sql_v3, SQLFormatterV3
+from .comment_preserver import CommentPreserver
 
 
 def format_sql_v4(sql: str, **options) -> str:

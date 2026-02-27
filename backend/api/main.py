@@ -26,6 +26,7 @@ else:
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from core.analyzer import StaticAnalyzer
+from core.formatter_v4 import format_sql_v4
 
 
 app = FastAPI(
@@ -176,6 +177,16 @@ def format_sql(request: FormatRequest):
         "original_sql": request.sql,
         "formatted_sql": formatted
     }
+
+
+@app.post("/format/v4")
+async def format_sql_v4_endpoint(request: FormatRequest):
+    """Format SQL with comment preservation"""
+    try:
+        result = format_sql_v4(request.sql)
+        return {"formatted": result, "success": True}
+    except Exception as e:
+        return {"error": str(e), "success": False}
 
 
 if __name__ == "__main__":
