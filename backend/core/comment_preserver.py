@@ -124,3 +124,56 @@ class CommentPreserver:
             return tokens[-1]
 
         return ''
+
+    def insert_comments(self, formatted_sql: str, original_sql: str) -> str:
+        """
+        Insert comments back into formatted SQL.
+
+        Args:
+            formatted_sql: SQL after formatting (may have placeholders)
+            original_sql: Original SQL (for reference)
+
+        Returns:
+            Formatted SQL with comments restored
+        """
+        result = formatted_sql
+
+        for comment in self._comments:
+            # Find the placeholder in formatted SQL
+            if comment['placeholder'] in result:
+                # Replace placeholder with original comment
+                if comment['type'] == 'line':
+                    replacement = '--' + comment['content']
+                else:
+                    replacement = '/*' + comment['content'] + '*/'
+
+                result = result.replace(comment['placeholder'], replacement)
+            else:
+                # Placeholder not found - try to find the token and append
+                # Get token that was before the comment in original
+                sql_with_placeholder = self.replace_with_placeholders(original_sql)
+                token = self.get_token_before_placeholder(sql_with_placeholder, comment['placeholder'])
+
+                if token:
+                    # Find token in formatted SQL and append comment
+                    result = self._append_comment_after_token(result, token, comment)
+
+        return result
+
+    def _append_comment_after_token(self, sql: str, token: str, comment: dict) -> str:
+        """Append a comment after the first occurrence of a token on its line"""
+        lines = sql.split('\n')
+
+        for i, line in enumerate(lines):
+            # Find token in line (not inside a string)
+            if token in line:
+                # Check if this line already has a comment
+                if '--' not in line:
+                    # Append comment at end of line
+                    if comment['type'] == 'line':
+                        lines[i] = line.rstrip() + ' --' + comment['content']
+                    else:
+                        lines[i] = line.rstrip() + ' /*' + comment['content'] + '*/'
+                break
+
+        return '\n'.join(lines)

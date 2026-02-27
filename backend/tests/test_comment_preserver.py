@@ -113,3 +113,28 @@ def test_get_token_before_placeholder():
     # Find what comes before the placeholder
     token = preserver.get_token_before_placeholder(result, '___COMMENT_001___')
     assert token == 'id'
+
+
+def test_insert_comment_after_token():
+    """Test inserting comment after finding its token in formatted SQL"""
+    preserver = CommentPreserver()
+    original = "SELECT id -- primary key"
+    formatted_without_comment = "SELECT id\n     \n;"
+
+    preserver.extract_comments(original)
+    result = preserver.insert_comments(formatted_without_comment, original)
+
+    assert "-- primary key" in result
+
+
+def test_insert_multiple_comments():
+    """Test inserting multiple comments"""
+    preserver = CommentPreserver()
+    original = "SELECT id -- primary key\n     , name -- user name"
+    formatted = "SELECT id\n     , name\n;"
+
+    preserver.extract_comments(original)
+    result = preserver.insert_comments(formatted, original)
+
+    assert "-- primary key" in result
+    assert "-- user name" in result
