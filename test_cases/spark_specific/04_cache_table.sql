@@ -1,0 +1,3 @@
+-- 测试: CACHE TABLE
+-- 预期: CACHE TABLE AS SELECT格式化
+CACHE TABLE cache_t AS SELECT * FROM large_table WHERE date = '20240101';

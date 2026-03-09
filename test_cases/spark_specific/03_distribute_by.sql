@@ -1,0 +1,3 @@
+-- 测试: DISTRIBUTE BY
+-- 预期: DISTRIBUTE BY子句格式化
+SELECT col1, col2 FROM table DISTRIBUTE BY key;

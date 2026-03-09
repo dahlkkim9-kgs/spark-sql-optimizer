@@ -1,0 +1,10 @@
+-- 测试: 窗口函数 - 窗口范围 ROWS BETWEEN
+-- 预期: 正确格式化窗口范围子句
+SELECT date
+     , product
+     , sales
+     , SUM(sales) OVER (PARTITION BY product ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+     , AVG(sales) OVER (PARTITION BY product ORDER BY date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg
+     , FIRST_VALUE(sales) OVER (PARTITION BY product ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_sales
+     , LAST_VALUE(sales) OVER (PARTITION BY product ORDER BY date ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS last_sales
+FROM sales_data;
