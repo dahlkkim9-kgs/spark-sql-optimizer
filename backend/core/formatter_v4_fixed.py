@@ -391,7 +391,8 @@ def _normalize_single_field(field: str) -> str:
                'INNER', 'OUTER', 'FULL', 'CROSS', 'NATURAL', 'VARCHAR', 'INT', 'DECIMAL',
                'STRING', 'DATE', 'TIMESTAMP', 'BOOLEAN', 'FLOAT', 'DOUBLE', 'BIGINT',
                'SMALLINT', 'TINYINT', 'CHAR', 'TEXT', 'COMMENT', 'LPAD', 'SUBSTRING',
-               'ROW_NUMBER', 'OVER', 'PARTITION', 'ORDER', 'NVL', 'CONCAT', 'CAST'}
+               'ROW_NUMBER', 'OVER', 'PARTITION', 'ORDER', 'NVL', 'CONCAT', 'CAST',
+               'DISTINCT', 'ALL', 'ANY', 'EXISTS'}
 
     # 分割单词
     parts = field.split()
@@ -406,14 +407,24 @@ def _normalize_single_field(field: str) -> str:
     # 分析最后一个单词是否是隐式别名
     if len(parts) >= 2:
         last_word = parts[-1]
+        # 检查第一个单词是否是 DISTINCT
+        is_distinct_field = (len(parts) >= 2 and parts[0].upper() == 'DISTINCT')
+
         # 检查最后一个单词是否可能是别名（字母和下划线组成，且不是关键字）
+        # 排除注释占位符（__COMMENT_X__ 或 __COMMENT_STR_X__）
+        is_comment_placeholder = re.match(r'^__COMMENT_(?:STR_)?\d+__$', last_word)
+
         # 修改：支持小写开头的别名
-        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word) and last_word.upper() not in keywords:
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word) and last_word.upper() not in keywords and not is_comment_placeholder:
             # 检查倒数第二个单词是否不是运算符
             if len(parts) >= 2 and parts[-2] not in {',', '+', '-', '*', '/', '(', ')'}:
                 # 检查倒数第二个单词是否已经是 AS 关键字
                 if len(parts) >= 2 and parts[-2].upper() == 'AS':
                     # 已经有 AS，不需要添加
+                    field_value = field
+                # 如果是 DISTINCT 字段，不要添加 AS
+                elif is_distinct_field:
+                    # DISTINCT 后面的是字段名，不是别名
                     field_value = field
                 else:
                     # 最后一个单词是隐式别名，需要添加 AS
@@ -1458,6 +1469,13 @@ def _format_create_table(sql: str) -> str:
     create_header = header_match.group(0)
     remaining_sql = sql[header_match.end():].strip()
 
+    # 检查是否有 PARTITIONED BY 但没有列定义的情况
+    # 如: CREATE TABLE test PARTITIONED BY (...)
+    if remaining_sql.upper().startswith('PARTITIONED'):
+        # 直接格式化 PARTITIONED BY 部分
+        partition_formatted = _format_partitioned_by(remaining_sql)
+        return create_header + '\n' + '\n'.join(partition_formatted)
+
     # 查找第一个括号（列定义的开始）
     if not remaining_sql.startswith('('):
         return sql
@@ -1609,13 +1627,25 @@ def _format_partitioned_by(partition_str: str) -> List[str]:
     if current.strip():
         partition_columns.append(current.strip())
 
-    # 格式化分区列（使用相同的对齐逻辑）
+    # 格式化分区列（逗号前置风格）
     result = [partition_header, '(']
 
     if partition_columns:
         # 总是应用智能对齐，确保所有列都对齐
         aligned = _align_columns_smartly(partition_columns)
-        result.extend(aligned)
+        # 处理逗号前置风格
+        for i, col in enumerate(aligned):
+            if i == 0:
+                # 第一个字段：去除前导空格，不添加逗号
+                result.append(col.lstrip())
+            else:
+                # 后续字段：确保逗号在行首，格式为 ', field'
+                if col.startswith(','):
+                    # 已经有逗号，直接使用
+                    result.append(col)
+                else:
+                    # 没有逗号，添加逗号
+                    result.append(', ' + col)
 
     result.append(')')
 
@@ -2029,36 +2059,207 @@ def _parse_select_field_parts(field: str) -> dict:
 
     # 检查是否有 AS 别名
     # AS 别名格式: AS alias 或直接 alias（在表达式后面）
-    as_pattern = re.compile(r'\s+AS\s+(\w+)(?:\s*)$', re.IGNORECASE)
-    as_match = as_pattern.search(field)
-    if as_match:
-        result['alias'] = as_match.group(1)
-        result['expression'] = field[:as_match.start()].strip()
-        result['had_as'] = True  # 标记原始字段已有 AS
-        # 保存包含 AS 的完整表达式
-        result['original_expression'] = field  # 包含 AS 的完整表达式
+    # 首先检测重复的AS（如: expr AS alias AS 或 expr AS alias AS alias2）
+    # 模式: 表达式 AS 别名 AS [可能的其他内容]
+    duplicate_as_pattern = re.compile(r'^(.+?)\s+AS\s+(\w+)\s+AS\s*$', re.IGNORECASE)
+    duplicate_match = duplicate_as_pattern.search(field)
+    if duplicate_match:
+        # 发现重复AS，格式：expr AS alias AS
+        # 这种情况下，alias 被重复了，只保留一个
+        result['alias'] = duplicate_match.group(2)
+        result['expression'] = duplicate_match.group(1)
+        result['had_as'] = True
+        # 保存包含 AS 的完整表达式（去除重复AS）
+        result['original_expression'] = duplicate_match.group(1) + ' AS ' + duplicate_match.group(2)
     else:
-        # 检查是否有无 AS 的别名（表达式后直接跟标识符）
-        # 这种情况比较复杂，需要排除函数调用等情况
-        # 简化处理：如果最后一个单词是标识符且不是函数关键字，可能是别名
-        words = field.split()
-        if len(words) > 1:
-            last_word = words[-1]
-            # 检查是否可能是别名（不包含特殊字符，不是关键字）
-            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word):
-                # 确保不是函数或关键字
-                keywords = {'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL',
-                           'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AS', 'JOIN', 'ON'}
-                if last_word.upper() not in keywords:
-                    # 检查前面是否有逗号或运算符，如果有则不是别名
-                    if len(words) >= 2 and words[-2] not in {',', '+', '-', '*', '/', '(', ')'}:
-                        result['alias'] = last_word
-                        result['expression'] = ' '.join(words[:-1])
-        # 如果没有别名，确保 expression 是处理后的 field（已去除注释）
-        if result['alias'] is None:
-            result['expression'] = field
+        # 正常的AS检测
+        as_pattern = re.compile(r'\s+AS\s+(\w+)(?:\s*)$', re.IGNORECASE)
+        as_match = as_pattern.search(field)
+        if as_match:
+            result['alias'] = as_match.group(1)
+            result['expression'] = field[:as_match.start()].strip()
+            result['had_as'] = True  # 标记原始字段已有 AS
+            # 保存包含 AS 的完整表达式
+            result['original_expression'] = field  # 包含 AS 的完整表达式
+        else:
+            # 检查是否有无 AS 的别名（表达式后直接跟标识符）
+            # 这种情况比较复杂，需要排除函数调用等情况
+            # 首先检查第一个单词是否是 DISTINCT
+            words = field.split()
+            if len(words) > 1 and words[0].upper() == 'DISTINCT':
+                # DISTINCT 后面的字段不是别名，直接返回
+                result['expression'] = field
+            elif len(words) > 1:
+                last_word = words[-1]
+                # 检查是否可能是别名（不包含特殊字符，不是关键字）
+                if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word):
+                    # 确保不是函数或关键字
+                    keywords = {'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL',
+                               'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AS', 'JOIN', 'ON', 'DISTINCT'}
+                    if last_word.upper() not in keywords:
+                        # 检查前面是否有逗号或运算符，如果有则不是别名
+                        if len(words) >= 2 and words[-2] not in {',', '+', '-', '*', '/', '(', ')'}:
+                            result['alias'] = last_word
+                            result['expression'] = ' '.join(words[:-1])
+            # 如果没有别名，确保 expression 是处理后的 field（已去除注释）
+            if result['alias'] is None:
+                result['expression'] = field
 
     return result
+
+
+def _format_function_call_intelligently(expression: str, max_line_length: int = 80) -> str:
+    """智能格式化函数调用
+
+    根据函数参数数量、长度和嵌套深度判断是否需要换行
+    - 单参数且较短：保持单行
+    - 参数多或参数长：每个参数一行
+    - 嵌套函数：递归格式化
+
+    Args:
+        expression: 函数调用表达式，如 "CONCAT('a', 'b', 'c')"
+        max_line_length: 最大单行长度，超过此长度考虑换行
+
+    Returns:
+        格式化后的表达式
+    """
+    # 常见的 SQL 函数名
+    COMMON_FUNCTIONS = {
+        'CONCAT', 'LPAD', 'RPAD', 'SUBSTRING', 'SUBSTR', 'TRIM', 'UPPER', 'LOWER',
+        'COALESCE', 'IFNULL', 'NULLIF', 'ISNULL', 'CAST', 'CONVERT',
+        'DATE_FORMAT', 'DATE_ADD', 'DATE_SUB', 'DATEDIFF',
+        'ROUND', 'CEIL', 'FLOOR', 'ABS', 'MOD', 'POWER', 'SQRT',
+        'MAX', 'MIN', 'AVG', 'SUM', 'COUNT', 'STDDEV', 'VARIANCE',
+        'ROW_NUMBER', 'RANK', 'DENSE_RANK', 'LEAD', 'LAG', 'FIRST_VALUE', 'LAST_VALUE',
+        'REGEXP_REPLACE', 'REGEXP_EXTRACT', 'SPLIT', 'EXPLODE',
+        'GET_JSON_OBJECT', 'FROM_JSON', 'TO_JSON',
+        'HASH', 'MD5', 'SHA', 'SHA1', 'SHA2'
+    }
+
+    # 检测函数调用：IDENTIFIER(...)
+    func_match = re.match(r'^([A-Z_][A-Z0-9_]*)\s*\((.*)\)\s*$', expression.strip(), re.IGNORECASE | re.DOTALL)
+
+    if not func_match:
+        # 不是函数调用，返回原表达式
+        return expression
+
+    func_name = func_match.group(1).upper()
+
+    # 如果不是已知函数，可能不是函数调用（如列名），保持原样
+    if func_name not in COMMON_FUNCTIONS:
+        return expression
+
+    params_str = func_match.group(2).strip()
+
+    # 如果参数为空，返回原表达式
+    if not params_str:
+        return expression
+
+    # 解析参数（考虑嵌套括号和字符串）
+    params = _split_function_params(params_str)
+
+    # 判断是否需要换行
+    needs_multiline = (
+        len(params) >= 3 or  # 3个或更多参数
+        any(len(p.strip()) > 40 for p in params) or  # 有参数长度超过40
+        len(expression) > max_line_length  # 整体长度超过限制
+    )
+
+    if not needs_multiline:
+        # 保持单行，但递归处理嵌套函数
+        formatted_params = []
+        for param in params:
+            formatted_param = _format_function_call_intelligently(param.strip(), max_line_length)
+            formatted_params.append(formatted_param)
+        return f"{func_name}({', '.join(formatted_params)})"
+
+    # 多行格式化：每个参数一行，统一缩进
+    # 检查是否有嵌套函数（参数中包含换行）
+    has_nested = any('\n' in _format_function_call_intelligently(p.strip(), max_line_length) for p in params)
+
+    result = [f"{func_name}("]
+    for i, param in enumerate(params):
+        param = param.strip()
+        # 递归格式化参数
+        formatted_param = _format_function_call_intelligently(param, max_line_length)
+
+        if '\n' in formatted_param:
+            # 嵌套函数，保持其多行结构，统一缩进
+            lines = formatted_param.split('\n')
+            if i == 0:
+                result.append(f"    {lines[0]}")
+            else:
+                result.append(f",    {lines[0]}")
+            for line in lines[1:]:
+                result.append(f"     {line}")
+        else:
+            # 单行参数
+            if i == 0:
+                result.append(f"    {formatted_param}")
+            else:
+                result.append(f",    {formatted_param}")
+    result.append(")")
+
+    return '\n'.join(result)
+
+
+def _split_function_params(params_str: str) -> List[str]:
+    """分割函数参数，考虑嵌套括号和字符串
+
+    Args:
+        params_str: 参数字符串，如 "'a', 'b', CONCAT('c', 'd')"
+
+    Returns:
+        参数列表
+    """
+    params = []
+    current_param = []
+    depth = 0
+    in_string = False
+    string_char = None
+
+    i = 0
+    while i < len(params_str):
+        char = params_str[i]
+
+        # 处理字符串
+        if not in_string and char in ('"', "'"):
+            in_string = True
+            string_char = char
+            current_param.append(char)
+        elif in_string and char == string_char:
+            # 检查是否是转义
+            if i > 0 and params_str[i-1] == '\\':
+                current_param.append(char)
+            else:
+                in_string = False
+                current_param.append(char)
+        elif in_string:
+            current_param.append(char)
+        # 处理括号
+        elif char == '(':
+            depth += 1
+            current_param.append(char)
+        elif char == ')':
+            depth -= 1
+            current_param.append(char)
+        # 处理逗号分隔符（仅在顶层）
+        elif char == ',' and depth == 0 and not in_string:
+            param = ''.join(current_param).strip()
+            if param:
+                params.append(param)
+            current_param = []
+        else:
+            current_param.append(char)
+
+        i += 1
+
+    # 添加最后一个参数
+    last_param = ''.join(current_param).strip()
+    if last_param:
+        params.append(last_param)
+
+    return params
 
 
 def _align_select_fields_smartly(fields: List[str]) -> List[str]:
@@ -2066,6 +2267,7 @@ def _align_select_fields_smartly(fields: List[str]) -> List[str]:
 
     根据字段表达式的最大宽度，对齐 AS 别名和注释
     注意：多行字段（如 CASE 表达式）不参与对齐计算
+    现在支持智能函数换行格式化
     """
     if not fields:
         return fields
@@ -2121,13 +2323,52 @@ def _align_select_fields_smartly(fields: List[str]) -> List[str]:
     # 生成对齐的字段字符串
     result = [None] * len(parsed_fields)
 
-    # 处理单行字段（应用对齐）
+    # 处理单行字段（应用对齐和智能函数格式化）
     for i, p in single_line_fields:
         # 如果原始字段已有 AS，使用包含 AS 的完整表达式
         if p.get('had_as', False) and p.get('original_expression'):
             field_str = p['original_expression']  # 包含 AS 的完整表达式
         else:
             field_str = p['expression']  # 只有表达式部分
+
+        # 智能格式化函数调用（在提取 AS 别名之前）
+        # 注意：field_str 可能包含 AS 别名，需要先分离
+        expression_part = field_str
+        alias_part = None
+
+        # 检查是否有 AS 别名（在已有 AS 的情况下）
+        if p.get('had_as', False):
+            as_match = re.search(r'\s+AS\s+(\w+)$', field_str, re.IGNORECASE)
+            if as_match:
+                expression_part = field_str[:as_match.start()].strip()
+                alias_part = as_match.group(1)
+
+        # 应用智能函数格式化
+        formatted_expr = _format_function_call_intelligently(expression_part)
+
+        # 检查格式化后是否变成多行
+        is_multiline = '\n' in formatted_expr
+
+        if is_multiline:
+            # 多行字段，不参与对齐
+            field_str = formatted_expr
+            # 添加 AS 别名（如果有）
+            if alias_part:
+                field_str += f" AS {alias_part}"
+            elif p['alias'] and not p.get('had_as', False):
+                field_str += f" AS {p['alias']}"
+            # 添加注释（如果有）
+            if p['comment']:
+                field_str += f"  {p['comment']}"
+            result[i] = field_str
+            continue
+
+        # 单行字段，应用对齐
+        field_str = formatted_expr
+
+        # 如果有 AS 别名，恢复它
+        if alias_part:
+            field_str += f" AS {alias_part}"
 
         # 添加 AS 别名（如果有）
         if p['alias'] and not p.get('had_as', False):

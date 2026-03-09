@@ -209,6 +209,34 @@ class StaticAnalyzer:
                 "message": "LEFT JOIN 的左表过滤条件写在 ON 子句中不会过滤结果行数，逻辑可能错误",
                 "suggestion": "左表的过滤条件应移至 WHERE 子句，右表的过滤条件应在 ON 子句中",
                 "rewrite": self._rewrite_left_join_where_filter
+            },
+            # ========== 代码规范规则 ==========
+            # 10. 表名中包含日期检测
+            {
+                "name": "TABLE_NAME_WITH_DATE",
+                "severity": "HIGH",
+                "pattern": r"\b(?:FROM|JOIN|TABLE|INSERT\s+INTO|UPDATE|CREATE\s+TABLE)\s+(?:\w+\.)?\w*[12]\d{3}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\w*",
+                "message": "检测到表名中包含日期（如 table_20250102），请检查是否为分区表命名或临时表",
+                "suggestion": "建议使用分区表规范命名，如 table_name PARTITION(dt='20250102')，或使用变量替代硬编码日期",
+                "rewrite": None
+            },
+            # 11. 注释中包含分号检测
+            {
+                "name": "COMMENT_WITH_SEMICOLON",
+                "severity": "HIGH",
+                "pattern": r"--[^;\n]*;",
+                "message": "检测到注释行中包含分号（;），可能导致SQL解析错误",
+                "suggestion": "请检查注释内容，如果分号是注释说明的一部分，请确保不会影响SQL解析；如果是误写的分号，请删除",
+                "rewrite": None
+            },
+            # 12. 敏感信息检测（身份证号、敏感字段名）
+            {
+                "name": "SENSITIVE_INFO_DETECTED",
+                "severity": "HIGH",
+                "pattern": r"\b1[1-9]\d{5}(18|19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b|(?:身份证|证件号|id_card|idcard|identity|sfz)",
+                "message": "检测到可能的敏感信息（身份证号或相关字段名），请确保符合数据安全规范",
+                "suggestion": "建议对敏感字段进行脱敏处理（如 md5/hash），或确保已获得相应授权；检查字段命名是否符合安全规范",
+                "rewrite": None
             }
         ]
 
