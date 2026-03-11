@@ -258,6 +258,14 @@ def _protect_multiline_in_lists(sql: str) -> Tuple[str, Dict[str, str]]:
                 # 提取完整的 IN 列表：IN (...)
                 in_list_full = sql[in_start:paren_end + 1]
 
+                # 检查是否包含 SELECT（子查询），如果是则跳过保护
+                # 子查询应该由子查询保护逻辑处理，而不是 IN 列表保护逻辑
+                if re.search(r'\bSELECT\b', in_list_full, re.IGNORECASE):
+                    # 这是一个子查询，不作为 IN 列表保护
+                    protected_sql.append(sql[i:paren_end + 1])
+                    i = paren_end + 1
+                    continue
+
                 # 检查 IN 列表内部是否有换行
                 if '\n' in in_list_full:
                     # 有换行，需要保护
@@ -1152,7 +1160,8 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         # 为子查询中的 WHERE 添加缩进
         if indent_level > 0:
             for line in where_lines:
-                lines.append(base_indent + line.lstrip())
+                # 保留多行子查询的原始缩进，不为非首行添加额外缩进
+                lines.append(base_indent + line if not line.startswith(' ') else line)
         else:
             lines.extend(where_lines)
 
@@ -2028,24 +2037,17 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                 # 所以我们只需要检测 before_placeholder 是否以 IN/NOT IN/EXISTS 加空格结尾
                                 in_pattern = re.search(r'\b(IN|NOT IN|EXISTS)\s*$', before_placeholder, re.IGNORECASE)
                                 if in_pattern:
-                                    # 嵌套子查询：需要根据外层子句的基础缩进计算
-                                    # 对于 WHERE 子句中的嵌套子查询
-                                    # 外层 WHERE 有 6 个空格基础缩进
-                                    # "WHERE khzjdm NOT IN (" 中 ( 的位置 = 6 + len("WHERE khzjdm NOT IN (")
-                                    # 但 before_placeholder = "khzjdm NOT IN "
-                                    # 所以我们需要计算：
-                                    # 基础缩进 + 子句关键字长度 + before_placeholder 长度 + 1 (for ()
+                                    # 嵌套子查询：SELECT 缩进到开括号位置 + 1
+                                    # 计算开括号位置
                                     if clause_type == 'WHERE':
                                         # WHERE 子句的基础缩进是 6 个空格
                                         base_clause_indent = 6
                                         # "WHERE " 的长度是 6
                                         # before_placeholder 包含条件内容（如 "khzjdm NOT IN "）
-                                        # 括号位置 = 基础缩进 + "WHERE " 长度 + before_placeholder 长度（包含尾随空格）+ 1 (for ()
-                                        paren_pos = base_clause_indent + 6 + len(before_placeholder) + 1
+                                        paren_pos = base_clause_indent + 6 + len(before_placeholder)
                                     elif clause_type in ('JOIN', 'LEFT_JOIN', 'RIGHT_JOIN', 'INNER_JOIN', 'FULL_JOIN', 'CROSS_JOIN'):
                                         # JOIN 子句的基础缩进是 0 个空格
                                         base_clause_indent = 0
-                                        # "JOIN ", "LEFT JOIN " 等的长度
                                         join_keyword = match.group(1).upper() if 'match' in dir() else 'JOIN'
                                         join_len = len(join_keyword) + 1  # +1 for space
                                         paren_pos = base_clause_indent + join_len + len(before_placeholder.strip())
@@ -2058,8 +2060,10 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                         in_pattern = None
 
                                     if in_pattern:
-                                        subquery_indent = ' ' * paren_pos
-                                        close_paren_indent = ' ' * (paren_pos - 1)
+                                        # SELECT 缩进到开括号位置 + 1
+                                        subquery_indent = ' ' * (paren_pos + 1)
+                                        # 闭括号缩进到开括号位置
+                                        close_paren_indent = ' ' * paren_pos
                                 else:
                                     # 其他情况：使用标准缩进
                                     base_indent = '    ' * (indent_level + 1)
@@ -2070,10 +2074,56 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                             indented_lines = []
                             for line in formatted_subquery.split('\n'):
                                 if line.strip():  # 非空行添加缩进
-                                    indented_lines.append(subquery_indent + line)
+                                    # 移除行首的原始缩进，只添加新计算的缩进
+                                    indented_lines.append(subquery_indent + line.lstrip())
                                 else:  # 空行保持空行
                                     indented_lines.append('')
                             indented_subquery = '\n'.join(indented_lines)
+
+                            # 后处理：如果子查询内部有嵌套的子查询（在 IN/NOT IN 中），需要重新计算缩进
+                            # 检测是否有 NOT IN ( ... ) 或 IN ( ... ) 模式，其中 ... 包含换行
+                            has_nested = '\n(' in indented_subquery and re.search(r'\b(?:NOT IN|IN|EXISTS)\s*\(', indented_subquery, re.IGNORECASE)
+                            if has_nested:
+                                # 找到 NOT IN ( 的位置，并计算嵌套子查询应该缩进到的位置
+                                lines = indented_subquery.split('\n')
+                                result_lines = []
+                                i = 0
+                                while i < len(lines):
+                                    line = lines[i]
+                                    # 检测是否是 NOT IN ( 或 IN ( 或 EXISTS (
+                                    match = re.search(r'(\s+(?:NOT IN|IN|EXISTS)\s+\()$', line.rstrip(), re.IGNORECASE)
+                                    if match:
+                                        # 找到了 IN ( 模式，下一行应该有嵌套的子查询
+                                        # 计算括号位置（与 IN ( 中的 ( 对齐）
+                                        paren_start_pos = len(line.rstrip()) - len(match.group(1)) + len(match.group(1))
+                                        # 将子查询内容缩进到括号位置
+                                        result_lines.append(line)
+                                        i += 1
+                                        # 处理子查询内容
+                                        paren_depth = 1
+                                        while i < len(lines) and paren_depth > 0:
+                                            nested_line = lines[i]
+                                            # 计算括号深度
+                                            paren_depth += nested_line.count('(') - nested_line.count(')')
+                                            # 如果不是闭括号行，添加缩进
+                                            if i < len(lines) - 1 or paren_depth > 0:
+                                                if nested_line.strip() == ')':
+                                                    # 闭括号，对齐到开括号
+                                                    result_lines.append(' ' * (paren_start_pos - 1) + nested_line.strip())
+                                                elif nested_line.strip():
+                                                    # 内容行，缩进到括号位置
+                                                    result_lines.append(' ' * paren_start_pos + nested_line.strip())
+                                                else:
+                                                    result_lines.append('')
+                                            i += 1
+                                    else:
+                                        result_lines.append(line)
+                                        i += 1
+                                else:
+                                    result_lines.append(line)
+                                    i += 1
+                                indented_subquery = '\n'.join(result_lines)
+
                             clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + close_paren_indent + ')')
                         else:
                             clause_content = clause_content.replace(placeholder, '(' + formatted_subquery + ')')
@@ -3798,20 +3848,30 @@ def _format_where_clause(where: str) -> List[str]:
     """Format WHERE clause with AND on new lines
 
     WHERE 与 FROM 对齐（无缩进），AND 缩进 4 个空格
+    保留子查询的多行格式
     """
     lines = []
 
-    conditions = _split_by_logical_op(where, 'AND')
+    # 检测 WHERE 子句是否包含换行
+    has_newlines = '\n' in where
 
-    if conditions:
-        first_formatted = _format_condition_with_ors(conditions[0].strip(), 4)
-        # WHERE 与 FROM 对齐（无缩进）
-        lines.append(f'WHERE {first_formatted}')
+    if has_newlines:
+        # 包含换行，保留原有格式
+        # 添加 WHERE 前缀
+        lines.append(f'WHERE {where}')
+    else:
+        # 没有换行，使用原有逻辑
+        conditions = _split_by_logical_op(where, 'AND')
 
-        for cond in conditions[1:]:
-            cond_formatted = _format_condition_with_ors(cond.strip(), 4)
-            # AND 缩进 4 个空格
-            lines.append(f'    AND {cond_formatted}')
+        if conditions:
+            first_formatted = _format_condition_with_ors(conditions[0].strip(), 4)
+            # WHERE 与 FROM 对齐（无缩进）
+            lines.append(f'WHERE {first_formatted}')
+
+            for cond in conditions[1:]:
+                cond_formatted = _format_condition_with_ors(cond.strip(), 4)
+                # AND 缩进 4 个空格
+                lines.append(f'    AND {cond_formatted}')
 
     return lines
 
