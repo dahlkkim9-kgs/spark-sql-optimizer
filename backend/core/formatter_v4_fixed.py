@@ -1160,8 +1160,8 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         # 为子查询中的 WHERE 添加缩进
         if indent_level > 0:
             for line in where_lines:
-                # 保留多行子查询的原始缩进，不为非首行添加额外缩进
-                lines.append(base_indent + line if not line.startswith(' ') else line)
+                new_line = base_indent + line if not line.startswith(' ') else line
+                lines.append(new_line)
         else:
             lines.extend(where_lines)
 
@@ -2005,7 +2005,15 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
         clause_type = match.group(1).upper().replace(' ', '_')
         start = match.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(protected_sql)
-        clause_content = protected_sql[start:end].strip().rstrip(',')
+        # 获取原始内容
+        raw_content = protected_sql[start:end]
+        # 检查内容是否以换行开头（包含嵌套的缩进子查询）
+        if raw_content.lstrip().startswith('\n'):
+            # 包含嵌套的缩进子查询，保留完整内容
+            clause_content = raw_content.rstrip(' ,')
+        else:
+            # 普通内容，strip 移除多余空格
+            clause_content = raw_content.strip().rstrip(',')
 
         # Restore placeholders in content and format subqueries
         for placeholder, original in placeholders.items():
@@ -2064,6 +2072,8 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                         subquery_indent = ' ' * (paren_pos + 1)
                                         # 闭括号缩进到开括号位置
                                         close_paren_indent = ' ' * paren_pos
+                                        # 调试输出
+                                        import sys
                                 else:
                                     # 其他情况：使用标准缩进
                                     base_indent = '    ' * (indent_level + 1)
@@ -2072,10 +2082,25 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
 
                             # 为子查询的每一行添加缩进
                             indented_lines = []
+                            in_nested_subquery = False  # 标记是否在嵌套子查询中
                             for line in formatted_subquery.split('\n'):
                                 if line.strip():  # 非空行添加缩进
-                                    # 移除行首的原始缩进，只添加新计算的缩进
-                                    indented_lines.append(subquery_indent + line.lstrip())
+                                    # 检查是否是嵌套子查询的开始（有多余的缩进）
+                                    leading_spaces = len(line) - len(line.lstrip())
+                                    # 如果缩进超过标准缩进（4个空格的倍数），说明是嵌套子查询
+                                    if leading_spaces > 4 and leading_spaces % 4 != 0:
+                                        # 嵌套子查询，保留原始缩进
+                                        in_nested_subquery = True
+                                        indented_lines.append(line)
+                                    elif in_nested_subquery and leading_spaces > 0:
+                                        # 仍在嵌套子查询中，保留原始缩进
+                                        indented_lines.append(line)
+                                        # 检查是否是嵌套子查询的结束（闭括号行）
+                                        if ')' in line and '(' not in line:
+                                            in_nested_subquery = False
+                                    else:
+                                        # 普通行，移除原始缩进，添加新计算的缩进
+                                        indented_lines.append(subquery_indent + line.lstrip())
                                 else:  # 空行保持空行
                                     indented_lines.append('')
                             indented_subquery = '\n'.join(indented_lines)
