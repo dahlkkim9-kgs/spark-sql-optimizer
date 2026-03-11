@@ -1,0 +1,29 @@
+SELECT SUBSTR(t8.cdpt_accno,1,16) AS accountno --主帐号，除历史5个账号报错，保持连续性，5个账号还按之前的报，其他账号取前16位
+     , CASE
+           WHEN t1.itm_no LIKE '1025%'
+                   OR t1.itm_no LIKE '3145%'
+           THEN (
+               CASE
+                   WHEN t1.dr_cr_flag = '借'
+                   THEN '1'
+                   WHEN t1.dr_cr_flag = '贷'
+                   THEN '2'
+                   ELSE ''
+               END
+               )
+           WHEN t1.itm_no LIKE '1%'
+           THEN (
+               CASE
+                   WHEN t1.dr_cr_flag = '借'
+                   THEN '2'
+                   WHEN t1.dr_cr_flag = '贷'
+                   THEN '1'
+                   ELSE ''
+               END
+               )
+           ELSE ''
+       END AS cdflag11 --出入账标志
+
+FROM t1
+    WHERE t1.etl_load_date = '{DATA_DT}'
+;

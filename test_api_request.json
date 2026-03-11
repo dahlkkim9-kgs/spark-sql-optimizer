@@ -1,0 +1,1 @@
+{"sql": "SELECT 'A' ACTIONTYPE, --操作类型\n       ACTIONDESC, --删除原因\nFROM table1;"}

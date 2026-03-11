@@ -25,7 +25,7 @@ FROM_PATTERN = re.compile(r'\bFROM\b', re.IGNORECASE)
 
 # CREATE TABLE 相关
 CREATE_TABLE_PATTERN = re.compile(r'(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?\S+)\s*', re.IGNORECASE)
-CREATE_TABLE_AS_PATTERN = re.compile(r'(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?\S+(?:\s+AS\s+)?)\s*(SELECT\s+.*)', re.IGNORECASE | re.DOTALL)
+CREATE_TABLE_AS_PATTERN = re.compile(r'(CREATE\s+TABLE\s+\S+)\s+AS\s+(SELECT\s+.*)', re.IGNORECASE | re.DOTALL)
 
 # PARTITIONED BY 相关
 PARTITIONED_BY_PATTERN = re.compile(r'(PARTITIONED\s+BY)\s*', re.IGNORECASE)
@@ -74,23 +74,9 @@ def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
     例如：CONCAT('a',
                 'b')
     会被替换为占位符 __FUNC_0__，normalize 后再恢复
-
-    注意：需要排除 SQL 关键字，避免将 FROM (SELECT) 等误认为函数调用
     """
     function_map = {}
     placeholder_count = 0
-
-    # SQL 关键字列表，不应该被当作函数名
-    SQL_KEYWORDS = {
-        'SELECT', 'FROM', 'WHERE', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP',
-        'ALTER', 'TRUNCATE', 'ANALYZE', 'GRANT', 'REVOKE', 'MERGE', 'UNION',
-        'INTERSECT', 'EXCEPT', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'LEFT',
-        'RIGHT', 'INNER', 'OUTER', 'FULL', 'JOIN', 'ON', 'AND', 'OR', 'NOT',
-        'IN', 'EXISTS', 'BETWEEN', 'LIKE', 'IS', 'NULL', 'ORDER', 'BY', 'GROUP',
-        'HAVING', 'LIMIT', 'OFFSET', 'WITH', 'RECURSIVE', 'PARTITION', 'OVERWRITE',
-        'TABLE', 'VIEW', 'INDEX', 'DATABASE', 'SCHEMA', 'FUNCTION', 'PROCEDURE',
-        'INTO', 'VALUES', 'SET', 'DESC', 'ASC', 'DISTINCT', 'ALL', 'ANY', 'SOME'
-    }
 
     def find_matching_paren(s, start):
         """找到匹配的右括号"""
@@ -121,15 +107,12 @@ def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
             while i < len(sql) and (sql[i].isalnum() or sql[i] == '_'):
                 i += 1
 
-            # 提取标识符
-            identifier = sql[func_name_start:i].upper()
-
             # 检查后面是否直接跟着括号（跳过空白）
             while i < len(sql) and sql[i] in ' \t':
                 i += 1
 
-            # 如果是括号，且标识符不是 SQL 关键字，说明这是函数调用
-            if i < len(sql) and sql[i] == '(' and identifier not in SQL_KEYWORDS:
+            # 如果是括号，说明这是函数调用
+            if i < len(sql) and sql[i] == '(':
                 paren_start = i
                 paren_end = find_matching_paren(sql, paren_start)
 
@@ -169,130 +152,6 @@ def _restore_multiline_functions(sql: str, function_map: Dict[str, str]) -> str:
     """恢复被保护的函数多行结构"""
     result = sql
     for placeholder, original in function_map.items():
-        result = result.replace(placeholder, original)
-    return result
-
-
-def _protect_multiline_in_lists(sql: str) -> Tuple[str, Dict[str, str]]:
-    """保护 IN 列表中的多行结构，避免被 normalize 压缩
-
-    例如：IN ('1070' --注释
-            ,'1080')
-    会被替换为占位符 __INLIST_0__，normalize 后再恢复
-
-    同时保护 NOT IN 的情况
-    """
-    in_list_map = {}
-    placeholder_count = 0
-
-    def find_matching_paren(s, start):
-        """找到匹配的右括号，考虑字符串和注释"""
-        depth = 0
-        in_string = False
-        string_char = None
-        in_line_comment = False
-        i = start
-
-        while i < len(s):
-            char = s[i]
-
-            # 处理行注释
-            if not in_string and char == '-' and i + 1 < len(s) and s[i + 1] == '-':
-                in_line_comment = True
-                i += 2
-                continue
-
-            if in_line_comment:
-                if char == '\n':
-                    in_line_comment = False
-                i += 1
-                continue
-
-            # 处理字符串
-            if not in_string and char in ('"', "'"):
-                in_string = True
-                string_char = char
-                i += 1
-                continue
-            elif in_string and char == string_char:
-                # 检查是否转义
-                if i > 0 and s[i - 1] != '\\':
-                    in_string = False
-                    string_char = None
-                i += 1
-                continue
-
-            if in_string:
-                i += 1
-                continue
-
-            # 处理括号
-            if char == '(':
-                depth += 1
-            elif char == ')':
-                depth -= 1
-                if depth == 0:
-                    return i
-
-            i += 1
-
-        return -1
-
-    protected_sql = []
-    i = 0
-
-    while i < len(sql):
-        # 检测 IN 或 NOT IN 模式
-        # 需要确保 IN/NOT IN 是独立的关键字，不是其他标识符的一部分
-        in_pattern = re.search(r'\b(IN|NOT IN)\s*\(', sql[i:], re.IGNORECASE)
-
-        if in_pattern:
-            in_keyword = in_pattern.group(1)
-            in_start = i + in_pattern.start()
-            paren_start = i + in_pattern.end() - 1  # 左括号的位置
-
-            # 找到匹配的右括号
-            paren_end = find_matching_paren(sql, paren_start)
-
-            if paren_end > 0:
-                # 提取完整的 IN 列表：IN (...)
-                in_list_full = sql[in_start:paren_end + 1]
-
-                # 检查 IN 列表内部是否有换行
-                if '\n' in in_list_full:
-                    # 有换行，需要保护
-                    placeholder = f"__INLIST_{placeholder_count}__"
-                    in_list_map[placeholder] = in_list_full
-                    placeholder_count += 1
-
-                    # 添加 IN 之前的内容（如果有）
-                    protected_sql.append(sql[i:in_start])
-                    # 添加占位符
-                    protected_sql.append(placeholder)
-
-                    i = paren_end + 1
-                    continue
-                else:
-                    # 没有换行，不需要保护
-                    protected_sql.append(sql[i:paren_end + 1])
-                    i = paren_end + 1
-                    continue
-            else:
-                # 没有找到匹配的右括号，按普通字符处理
-                protected_sql.append(sql[i])
-                i += 1
-        else:
-            # 没有找到 IN 模式，添加当前字符
-            protected_sql.append(sql[i])
-            i += 1
-
-    return ''.join(protected_sql), in_list_map
-
-
-def _restore_multiline_in_lists(sql: str, in_list_map: Dict[str, str]) -> str:
-    """恢复被保护的 IN 列表多行结构"""
-    result = sql
-    for placeholder, original in in_list_map.items():
         result = result.replace(placeholder, original)
     return result
 
@@ -376,14 +235,13 @@ def _normalize_select_fields(sql: str) -> str:
                 # 检查是否有行注释（只匹配到行尾，不匹配换行符后的内容）
                 comment_match = re.match(r'\s*([^\n]*--.*)', rest)
                 # 检查是否有注释占位符（__COMMENT_X__）
-                # 使用 re.match 确保注释占位符紧跟在逗号后面（只允许空白字符）
-                comment_placeholder_match = re.match(r'\s*(__COMMENT_\d+__)\s*$', rest)
+                comment_placeholder_match = re.match(r'\s*(__COMMENT_\d+__)', rest)
                 if comment_match:
                     # 把逗号后面的注释也添加到当前字段
                     current += char + comment_match.group(0)
                     i += len(comment_match.group(0)) + 1
                 elif comment_placeholder_match:
-                    # 注释占位符紧跟在逗号后面，添加到当前字段
+                    # 把逗号后面的注释占位符也添加到当前字段
                     current += char + comment_placeholder_match.group(0)
                     i += len(comment_placeholder_match.group(0)) + 1
                 else:
@@ -515,8 +373,7 @@ def _normalize_single_field(field: str) -> str:
                'INNER', 'OUTER', 'FULL', 'CROSS', 'NATURAL', 'VARCHAR', 'INT', 'DECIMAL',
                'STRING', 'DATE', 'TIMESTAMP', 'BOOLEAN', 'FLOAT', 'DOUBLE', 'BIGINT',
                'SMALLINT', 'TINYINT', 'CHAR', 'TEXT', 'COMMENT', 'LPAD', 'SUBSTRING',
-               'ROW_NUMBER', 'OVER', 'PARTITION', 'ORDER', 'NVL', 'CONCAT', 'CAST',
-               'DISTINCT', 'ALL', 'ANY', 'EXISTS'}
+               'ROW_NUMBER', 'OVER', 'PARTITION', 'ORDER', 'NVL', 'CONCAT', 'CAST'}
 
     # 分割单词
     parts = field.split()
@@ -531,24 +388,14 @@ def _normalize_single_field(field: str) -> str:
     # 分析最后一个单词是否是隐式别名
     if len(parts) >= 2:
         last_word = parts[-1]
-        # 检查第一个单词是否是 DISTINCT
-        is_distinct_field = (len(parts) >= 2 and parts[0].upper() == 'DISTINCT')
-
         # 检查最后一个单词是否可能是别名（字母和下划线组成，且不是关键字）
-        # 排除注释占位符（__COMMENT_X__ 或 __COMMENT_STR_X__）
-        is_comment_placeholder = re.match(r'^__COMMENT_(?:STR_)?\d+__$', last_word)
-
         # 修改：支持小写开头的别名
-        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word) and last_word.upper() not in keywords and not is_comment_placeholder:
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word) and last_word.upper() not in keywords:
             # 检查倒数第二个单词是否不是运算符
             if len(parts) >= 2 and parts[-2] not in {',', '+', '-', '*', '/', '(', ')'}:
                 # 检查倒数第二个单词是否已经是 AS 关键字
                 if len(parts) >= 2 and parts[-2].upper() == 'AS':
                     # 已经有 AS，不需要添加
-                    field_value = field
-                # 如果是 DISTINCT 字段，不要添加 AS
-                elif is_distinct_field:
-                    # DISTINCT 后面的是字段名，不是别名
                     field_value = field
                 else:
                     # 最后一个单词是隐式别名，需要添加 AS
@@ -589,8 +436,9 @@ def format_sql_v4_fixed(sql: str, **options) -> str:
     sql_protected, comment_map = _protect_comments(sql)
 
     # Step 1.5: Preprocess - Normalize field aliases and comments (新增)
-    # 启用预处理，在 FROM 前添加换行，避免注释后直接跟 FROM 导致合并
-    sql_normalized = _normalize_select_fields(sql_protected)
+    # 暂时禁用预处理，避免与子查询处理的冲突
+    # sql_normalized = _normalize_select_fields(sql_protected)
+    sql_normalized = sql_protected
 
     # Step 2: Split by semicolon (respecting parentheses and strings)
     statements = _split_by_semicolon(sql_normalized)
@@ -610,12 +458,12 @@ def format_sql_v4_fixed(sql: str, **options) -> str:
     statements_with_semicolon = [f'{stmt}\n;' for stmt in formatted_statements]
     result = '\n\n'.join(statements_with_semicolon)
 
-    # Step 5: Uppercase keywords if requested（在注释恢复之前执行，避免大写注释中的关键字）
+    # Step 5: Restore comments from placeholders
+    result = _restore_protected_comments(result, comment_map)
+
+    # Step 6: Uppercase keywords if requested
     if keyword_case == 'upper':
         result = _uppercase_keywords(result)
-
-    # Step 6: Restore comments from placeholders
-    result = _restore_protected_comments(result, comment_map)
 
     # Step 7: Clean up empty lines within SQL statements (keep only one empty line between statements)
     result = _cleanup_empty_lines(result)
@@ -708,7 +556,8 @@ def _protect_comments(sql: str) -> tuple:
         comment_map[placeholder] = match.group(0)
         counter[0] += 1
         return placeholder
-
+    protected = re.sub(r'(--[^
+]*)(s)?', lambda m: replace_comment(m) + (m.group(2) if m.group(2) else ' '), protected)
     # Protect line comments
     protected = re.sub(r'--[^\n]*', replace_comment, protected)
 
@@ -753,23 +602,12 @@ def _restore_protected_comments(sql: str, comment_map: dict) -> str:
                 follows_another_comment = bool(re.match(r'\s*__COMMENT_\d+__', after_raw))
 
                 if is_standalone_before:
-                    # 独立行注释
+                    # 独立行注释：前面换行，后面也换行
                     if follows_another_comment:
-                        # 相邻注释：后面不添加换行（下一个注释会添加前导换行）
-                        if match.start() == 0:
-                            # 在字符串开头，不需要前导换行
-                            result = result.replace(placeholder, comment, 1)
-                        else:
-                            # 在换行符后，需要前导换行
-                            result = result.replace(placeholder, '\n' + comment, 1)
+                        # 相邻注释：也添加前导换行（确保每个注释都在新的一行）
+                        result = result.replace(placeholder, '\n' + comment + '\n', 1)
                     else:
-                        # 最后一个注释：后面添加换行
-                        if match.start() == 0:
-                            # 在字符串开头，不需要前导换行
-                            result = result.replace(placeholder, comment + '\n', 1)
-                        else:
-                            # 在换行符后，需要前导换行
-                            result = result.replace(placeholder, '\n' + comment + '\n', 1)
+                        result = result.replace(placeholder, '\n' + comment + '\n', 1)
                 else:
                     # 行内注释（字段后的注释）：保持同一行
                     result = result.replace(placeholder, ' ' + comment, 1)
@@ -807,17 +645,6 @@ def _restore_protected_comments(sql: str, comment_map: dict) -> str:
             cleaned_lines.append(line.rstrip())
     result = '\n'.join(cleaned_lines)
 
-    # 确保 FROM 前有换行（修复注释后 FROM 合并到同一行的问题）
-    # 匹配：任意内容 + 注释或字段 + FROM
-    # 替换为：确保 FROM 前有换行符
-    # 这个正则会匹配没有换行分隔的情况，如 "d0117 --comment FROM"
-    result = re.sub(
-        r'([^\s\n][^\n]*?--.*?)\s+(FROM\b)',
-        r'\1\n\2',
-        result,
-        flags=re.IGNORECASE
-    )
-
     return result
 
 
@@ -844,25 +671,6 @@ def _protect_select_field_comments(sql: str) -> tuple:
     fields = _parse_select_fields(fields_section)
 
     return sql, fields
-
-
-def _protect_from_newline(sql: str) -> str:
-    """保护 FROM 前的换行，避免 normalize 后注释直接跟 FROM
-
-    在 normalize 之前，将 FROM 前的换行替换为占位符
-    normalize 后恢复为换行
-    """
-    # 匹配：任何内容 + 换行 + FROM
-    # 替换为：任何内容 + 占位符 + FROM
-    # 使用非贪婪匹配，避免匹配多个换行
-    result = re.sub(r'(\S)\s*\n\s*\b(FROM)\b', r'\1 __FROM_NEWLINE__ \2', sql, flags=re.IGNORECASE)
-    return result
-
-
-def _restore_from_newline(sql: str) -> str:
-    """恢复 FROM 前的换行"""
-    # 将 __FROM_NEWLINE__ 替换为换行符
-    return sql.replace('__FROM_NEWLINE__ ', '\n')
 
 
 # ============================================================
@@ -901,9 +709,6 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
     # 保护函数调用的多行结构（在 normalize 之前）
     sql, function_map = _protect_multiline_functions(sql)
 
-    # 保护 IN 列表的多行结构（在 normalize 之前）
-    sql, in_list_map = _protect_multiline_in_lists(sql)
-
     # 保护 COMMENT '...' 字符串中的空格（在 normalize 之前）
     comment_string_map = {}
     def protect_comment_strings(match):
@@ -927,18 +732,13 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         sql = '\n'.join(cleaned_lines)
     else:
         # 未对齐：执行完整 normalize
-        # 在 normalize 之前，保护 FROM 前的换行（避免注释后直接跟 FROM）
+        # 但在 normalize 之前，保护 SELECT 字段的注释边界
         if re.search(r'\bSELECT\b', sql, re.IGNORECASE):
             sql, extracted_fields = _protect_select_field_comments(sql)
-            # 保护 FROM 前的换行
-            sql = _protect_from_newline(sql)
         sql = ' '.join(sql.split())
 
     # 确保相邻的注释占位符之间有换行（normalize 可能会把换行变成空格）
     sql = COMMENT_ADJACENT_PATTERN.sub(r'\1\n\2', sql)
-
-    # 恢复 FROM 前的换行（normalize 之前保护的）
-    sql = _restore_from_newline(sql)
 
     # 检查语句类型（跳过注释占位符）
     sql_upper = sql.strip().upper()
@@ -952,15 +752,13 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
     # 移除注释前缀后的SQL
     sql_without_comments = sql[len(comment_prefix):].strip() if comment_prefix else sql
 
-    # 辅助函数：恢复 COMMENT 字符串、函数多行结构和 IN 列表多行结构
+    # 辅助函数：恢复 COMMENT 字符串和函数多行结构
     def restore_comment_strings(text):
         result = text
         for placeholder, original in comment_string_map.items():
             result = result.replace(placeholder, original)
         # 恢复函数多行结构
         result = _restore_multiline_functions(result, function_map)
-        # 恢复 IN 列表多行结构
-        result = _restore_multiline_in_lists(result, in_list_map)
         return result
 
     # ============ DDL 语句 ============
@@ -1022,8 +820,6 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
                 # 格式化 SELECT ... 部分
                 select_formatted = _format_sql_structure(select_part, keyword_case)
                 result = insert_header + '\n' + select_formatted
-                # 添加注释前缀（如果有的话）
-                result = comment_prefix.strip() + '\n' + result if comment_prefix.strip() else result
                 return restore_comment_strings(result)
 
     elif sql_for_type.startswith('INSERT OVERWRITE') or sql_for_type.startswith('INSERT INTO'):
@@ -1096,86 +892,42 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
     # 移除注释前缀后的SQL（用于解析）
     sql_without_comments = sql[len(comment_prefix):].strip() if comment_prefix else sql
 
-    # 检测是否包含 UNION
-    if re.search(r'\bUNION\b', sql_without_comments, re.IGNORECASE):
-        # 使用 UNION 格式化
-        formatted = _format_union_statement(sql_without_comments, keyword_case)
-        final_result = comment_prefix.strip() + '\n' + formatted if comment_prefix.strip() else formatted
-        return restore_comment_strings(final_result)
-
     # Parse SQL clauses（使用没有注释前缀的SQL）
     parts = _parse_sql_parts(sql_without_comments, keyword_case, indent_level, extracted_fields)
 
     # Format each part
     lines = []
 
-    # 计算基础缩进（用于子查询）
-    base_indent = '    ' * indent_level
-
     # SELECT clause
     if parts['select']:
         select_lines = _format_select_clause(parts['select'])
-        # 为子查询中的 SELECT 添加缩进
-        if indent_level > 0:
-            lines.append(base_indent + select_lines[0])
-            for line in select_lines[1:]:
-                lines.append(base_indent + line)
-        else:
-            lines.extend(select_lines)
+        lines.extend(select_lines)
 
     # FROM clause
     if parts['from']:
-        if indent_level > 0:
-            # 子查询：FROM 需要缩进
-            from_line = f'{base_indent}FROM {parts["from"]}'
-        else:
-            # 主查询：FROM 不需要缩进（但内容可能包含换行的子查询）
-            from_line = f'FROM {parts["from"]}'
-        # 确保前面有换行（除了第一行 SELECT）
-        if lines:
-            from_line = '\n' + from_line
-        lines.append(from_line)
+        lines.append(f'\nFROM {parts["from"]}')
 
     # JOIN clauses
     for join in parts['joins']:
         join_lines = _format_join_clause(join)
-        # 为子查询中的 JOIN 添加缩进
-        if indent_level > 0:
-            for line in join_lines:
-                lines.append(base_indent + line.lstrip())
-        else:
-            lines.extend(join_lines)
+        lines.extend(join_lines)
 
     # WHERE clause
     if parts['where']:
         where_lines = _format_where_clause(parts['where'])
-        # 为子查询中的 WHERE 添加缩进
-        if indent_level > 0:
-            for line in where_lines:
-                lines.append(base_indent + line.lstrip())
-        else:
-            lines.extend(where_lines)
+        lines.extend(where_lines)
 
     # GROUP BY clause
     if parts['group_by']:
-        group_by_line = f'    GROUP BY {parts["group_by"]}'
-        if indent_level > 0:
-            group_by_line = f'{base_indent}    GROUP BY {parts["group_by"]}'
-        lines.append('\n' + group_by_line)
+        lines.append(f'\n    GROUP BY {parts["group_by"]}')
 
     # ORDER BY clause
     if parts['order_by']:
-        order_by_line = f'    ORDER BY {parts["order_by"]}'
-        if indent_level > 0:
-            order_by_line = f'{base_indent}    ORDER BY {parts["order_by"]}'
-        lines.append('\n' + order_by_line)
+        lines.append(f'\n    ORDER BY {parts["order_by"]}')
 
     # DISTRIBUTE BY clause
     if parts['distribute_by']:
-        distribute_by_line = f'DISTRIBUTE BY {parts["distribute_by"]}'
-        if indent_level > 0:
-            distribute_by_line = f'{base_indent}DISTRIBUTE BY {parts["distribute_by"]}'
-        lines.append('\n' + distribute_by_line)
+        lines.append(f'\nDISTRIBUTE BY {parts["distribute_by"]}')
 
     result = '\n'.join(lines)
 
@@ -1565,10 +1317,6 @@ def _align_columns_smartly(column_lines: List[str]) -> List[str]:
     """智能对齐列定义
 
     根据最长字段名和类型计算对齐位置，生成美观的格式
-    对齐规则类似用户原始格式：
-    - 字段名右对齐在位置 20
-    - 类型右对齐在位置 40
-    - COMMENT 左对齐在位置 60
     """
     if not column_lines:
         return column_lines
@@ -1589,12 +1337,9 @@ def _align_columns_smartly(column_lines: List[str]) -> List[str]:
     max_name_len = max(len(c['name']) for c in parsed_columns)
     max_type_len = max(len(c['type']) for c in parsed_columns)
 
-    # 使用更精确的对齐位置（类似用户原始格式）
-    # 字段名列：最小20字符，确保最长字段名右对齐
-    name_width = max(max_name_len, 20)
-    # 类型列：确保类型右对齐在40字符位置
-    type_align_pos = 40  # COMMENT 的起始位置
-    type_width = type_align_pos - name_width - 1  # 减1是因为前面的空格
+    # 计算理想的列宽（增加一些填充，让COMMENT对齐）
+    name_width = max(max_name_len + 4, 12)  # 至少12个字符
+    type_width = max(max_type_len + 4, 12)  # 至少12个字符
 
     # 生成对齐的行
     result = []
@@ -1605,25 +1350,18 @@ def _align_columns_smartly(column_lines: List[str]) -> List[str]:
         else:
             prefix = ' '
 
-        # 对齐字段名（左对齐，但在固定宽度内）
+        # 对齐字段名和类型
         name_part = col['name'].ljust(name_width)
+        type_part = col['type'].ljust(type_width)
 
-        # 计算类型部分的起始位置
-        line_start = f"{prefix}{name_part}"
-        current_pos = len(line_start)
+        line = f"{prefix}{name_part}{type_part}"
 
-        # 类型需要右对齐到 type_align_pos 位置
-        type_part = col['type'].rjust(type_align_pos - current_pos)
-
-        line = line_start + type_part
-
-        # 添加 COMMENT（如果有）
+        # 添加 COMMENT（可能是占位符或真实内容）
         if col.get('comment_placeholder'):
-            # 使用占位符
-            line += f"     {col['comment_placeholder']}"
+            # 使用占位符，恢复时会替换回真实 COMMENT
+            line += f"{col['comment_placeholder']}"
         elif col.get('comment'):
-            # 添加 COMMENT 和 5 个空格（类似用户原始格式）
-            line += f"     COMMENT '{col['comment']}'"
+            line += f"COMMENT  '{col['comment']}'"
 
         result.append(line)
 
@@ -1640,13 +1378,6 @@ def _format_create_table(sql: str) -> str:
 
     create_header = header_match.group(0)
     remaining_sql = sql[header_match.end():].strip()
-
-    # 检查是否有 PARTITIONED BY 但没有列定义的情况
-    # 如: CREATE TABLE test PARTITIONED BY (...)
-    if remaining_sql.upper().startswith('PARTITIONED'):
-        # 直接格式化 PARTITIONED BY 部分
-        partition_formatted = _format_partitioned_by(remaining_sql)
-        return create_header + '\n' + '\n'.join(partition_formatted)
 
     # 查找第一个括号（列定义的开始）
     if not remaining_sql.startswith('('):
@@ -1799,25 +1530,13 @@ def _format_partitioned_by(partition_str: str) -> List[str]:
     if current.strip():
         partition_columns.append(current.strip())
 
-    # 格式化分区列（逗号前置风格）
+    # 格式化分区列（使用相同的对齐逻辑）
     result = [partition_header, '(']
 
     if partition_columns:
         # 总是应用智能对齐，确保所有列都对齐
         aligned = _align_columns_smartly(partition_columns)
-        # 处理逗号前置风格
-        for i, col in enumerate(aligned):
-            if i == 0:
-                # 第一个字段：去除前导空格，不添加逗号
-                result.append(col.lstrip())
-            else:
-                # 后续字段：确保逗号在行首，格式为 ', field'
-                if col.startswith(','):
-                    # 已经有逗号，直接使用
-                    result.append(col)
-                else:
-                    # 没有逗号，添加逗号
-                    result.append(', ' + col)
+        result.extend(aligned)
 
     result.append(')')
 
@@ -1887,20 +1606,12 @@ def _format_create_table_as(sql: str) -> str:
     if not match:
         return sql
 
-    create_part = match.group(1).strip()  # 去除尾部空格/换行
+    create_part = match.group(1)
     select_part = match.group(2)
-
-    # 检查 create_part 是否已经包含 AS
-    has_as = re.search(r'\s+AS\s*$', create_part, re.IGNORECASE)
-
-    if has_as:
-        # 已有 AS，去除 AS 后的空白
-        create_part = re.sub(r'\s+AS\s*$', '', create_part, flags=re.IGNORECASE)
 
     # 格式化 SELECT 部分
     select_formatted = _format_sql_structure(select_part)
 
-    # 返回结果（添加 AS）
     return f"{create_part} AS\n{select_formatted}"
 
 
@@ -2006,75 +1717,23 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                     # 递归格式化子查询（增加缩进层级）
                     # 去除外层括号
                     subquery_content = original[1:-1] if original.startswith('(') and original.endswith(')') else original
-                    # 格式化子查询（不增加缩进层级，手动添加缩进）
-                    formatted_subquery = _format_sql_structure(subquery_content, keyword_case, 0)
+                    # 格式化子查询，增加一级缩进
+                    formatted_subquery = _format_sql_structure(subquery_content, keyword_case, indent_level + 1)
                     # 重新添加括号（如果需要）
                     if original.startswith('(') and original.endswith(')'):
                         # 检查子查询是否是简单的 SELECT...FROM...
                         # 如果是单行，保持括号在同一行；如果是多行，换行并添加缩进
                         if '\n' in formatted_subquery:
-                            # 检测子查询前面的模式，确定缩进
-                            placeholder_pos = clause_content.find(placeholder)
-                            before_placeholder = clause_content[:placeholder_pos]
-
-                            # 检测是否在 FROM 子句中
-                            if clause_type == 'FROM' and placeholder_pos == 0:
-                                # FROM 子句中的顶级子查询：缩进 6 个空格（与 FROM ( 中的 ( 对齐）
-                                subquery_indent = '      '  # 6 个空格
-                                close_paren_indent = '     '   # 5 个空格，与 FROM ( 中的 ( 对齐
-                            else:
-                                # 检测是否在 IN/NOT IN 中（嵌套子查询）
-                                # before_placeholder 后面就是子查询占位符，相当于 ( 子查询
-                                # 所以我们只需要检测 before_placeholder 是否以 IN/NOT IN/EXISTS 加空格结尾
-                                in_pattern = re.search(r'\b(IN|NOT IN|EXISTS)\s*$', before_placeholder, re.IGNORECASE)
-                                if in_pattern:
-                                    # 嵌套子查询：需要根据外层子句的基础缩进计算
-                                    # 对于 WHERE 子句中的嵌套子查询
-                                    # 外层 WHERE 有 6 个空格基础缩进
-                                    # "WHERE khzjdm NOT IN (" 中 ( 的位置 = 6 + len("WHERE khzjdm NOT IN (")
-                                    # 但 before_placeholder = "khzjdm NOT IN "
-                                    # 所以我们需要计算：
-                                    # 基础缩进 + 子句关键字长度 + before_placeholder 长度 + 1 (for ()
-                                    if clause_type == 'WHERE':
-                                        # WHERE 子句的基础缩进是 6 个空格
-                                        base_clause_indent = 6
-                                        # "WHERE " 的长度是 6
-                                        # before_placeholder 包含条件内容（如 "khzjdm NOT IN "）
-                                        # 括号位置 = 基础缩进 + "WHERE " 长度 + before_placeholder 长度（包含尾随空格）+ 1 (for ()
-                                        paren_pos = base_clause_indent + 6 + len(before_placeholder) + 1
-                                    elif clause_type in ('JOIN', 'LEFT_JOIN', 'RIGHT_JOIN', 'INNER_JOIN', 'FULL_JOIN', 'CROSS_JOIN'):
-                                        # JOIN 子句的基础缩进是 0 个空格
-                                        base_clause_indent = 0
-                                        # "JOIN ", "LEFT JOIN " 等的长度
-                                        join_keyword = match.group(1).upper() if 'match' in dir() else 'JOIN'
-                                        join_len = len(join_keyword) + 1  # +1 for space
-                                        paren_pos = base_clause_indent + join_len + len(before_placeholder.strip())
-                                    else:
-                                        # 其他情况：使用标准缩进
-                                        base_indent = '    ' * (indent_level + 1)
-                                        subquery_indent = base_indent
-                                        close_paren_indent = '    ' * indent_level
-                                        # 跳过后续计算，直接使用标准缩进
-                                        in_pattern = None
-
-                                    if in_pattern:
-                                        subquery_indent = ' ' * paren_pos
-                                        close_paren_indent = ' ' * (paren_pos - 1)
-                                else:
-                                    # 其他情况：使用标准缩进
-                                    base_indent = '    ' * (indent_level + 1)
-                                    subquery_indent = base_indent
-                                    close_paren_indent = '    ' * indent_level
-
-                            # 为子查询的每一行添加缩进
+                            # 为子查询的每一行添加当前层级的缩进
+                            base_indent = '    ' * (indent_level + 1)  # indent_level=0 时是 4 个空格
                             indented_lines = []
                             for line in formatted_subquery.split('\n'):
                                 if line.strip():  # 非空行添加缩进
-                                    indented_lines.append(subquery_indent + line)
+                                    indented_lines.append(base_indent + line)
                                 else:  # 空行保持空行
                                     indented_lines.append('')
                             indented_subquery = '\n'.join(indented_lines)
-                            clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + close_paren_indent + ')')
+                            clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + '    ' * indent_level + ')')
                         else:
                             clause_content = clause_content.replace(placeholder, '(' + formatted_subquery + ')')
                     else:
@@ -2253,13 +1912,11 @@ def _parse_select_field_parts(field: str) -> dict:
     返回: {
         'expression': 'field1 或 CONCAT(a,b) 或 CASE...END',
         'alias': 'alias1' 或 None,
-        'comment': '__COMMENT_X__' 或 '-- comment' 或 None,
-        'had_as': True/False,  # 原始字段是否已经有 AS 别名
-        'original_expression': '原始字段（包含 AS）'  # 用于保留已有 AS 的字段
+        'comment': '__COMMENT_X__' 或 '-- comment' 或 None
     }
     """
     field = field.strip()
-    result = {'expression': field, 'alias': None, 'comment': None, 'had_as': False, 'original_expression': None}
+    result = {'expression': field, 'alias': None, 'comment': None}
 
     # 如果字段包含换行（如 CASE 表达式），不进行解析，保持原样
     if '\n' in field:
@@ -2283,236 +1940,33 @@ def _parse_select_field_parts(field: str) -> dict:
 
     # 检查是否有 AS 别名
     # AS 别名格式: AS alias 或直接 alias（在表达式后面）
-    # 首先检测重复的AS（如: expr AS alias AS 或 expr AS alias AS alias2）
-    # 模式: 表达式 AS 别名 AS [可能的其他内容]
-    duplicate_as_pattern = re.compile(r'^(.+?)\s+AS\s+(\w+)\s+AS\s*$', re.IGNORECASE)
-    duplicate_match = duplicate_as_pattern.search(field)
-    if duplicate_match:
-        # 发现重复AS，格式：expr AS alias AS
-        # 这种情况下，alias 被重复了，只保留一个
-        result['alias'] = duplicate_match.group(2)
-        result['expression'] = duplicate_match.group(1)
-        result['had_as'] = True
-        # 保存包含 AS 的完整表达式（去除重复AS）
-        result['original_expression'] = duplicate_match.group(1) + ' AS ' + duplicate_match.group(2)
+    as_pattern = re.compile(r'\s+AS\s+(\w+)(?:\s*)$', re.IGNORECASE)
+    as_match = as_pattern.search(field)
+    if as_match:
+        result['alias'] = as_match.group(1)
+        result['expression'] = field[:as_match.start()].strip()
     else:
-        # 正常的AS检测
-        as_pattern = re.compile(r'\s+AS\s+(\w+)(?:\s*)$', re.IGNORECASE)
-        as_match = as_pattern.search(field)
-        if as_match:
-            result['alias'] = as_match.group(1)
-            result['expression'] = field[:as_match.start()].strip()
-            result['had_as'] = True  # 标记原始字段已有 AS
-            # 保存包含 AS 的完整表达式
-            result['original_expression'] = field  # 包含 AS 的完整表达式
-        else:
-            # 检查是否有无 AS 的别名（表达式后直接跟标识符）
-            # 这种情况比较复杂，需要排除函数调用等情况
-            # 首先检查第一个单词是否是 DISTINCT
-            words = field.split()
-            if len(words) > 1 and words[0].upper() == 'DISTINCT':
-                # DISTINCT 后面的字段不是别名，直接返回
-                result['expression'] = field
-            elif len(words) > 1:
-                last_word = words[-1]
-                # 检查是否可能是别名（不包含特殊字符，不是关键字）
-                if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word):
-                    # 确保不是函数或关键字
-                    keywords = {'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL',
-                               'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AS', 'JOIN', 'ON', 'DISTINCT'}
-                    if last_word.upper() not in keywords:
-                        # 检查前面是否有逗号或运算符，如果有则不是别名
-                        if len(words) >= 2 and words[-2] not in {',', '+', '-', '*', '/', '(', ')'}:
-                            result['alias'] = last_word
-                            result['expression'] = ' '.join(words[:-1])
-            # 如果没有别名，确保 expression 是处理后的 field（已去除注释）
-            if result['alias'] is None:
-                result['expression'] = field
+        # 检查是否有无 AS 的别名（表达式后直接跟标识符）
+        # 这种情况比较复杂，需要排除函数调用等情况
+        # 简化处理：如果最后一个单词是标识符且不是函数关键字，可能是别名
+        words = field.split()
+        if len(words) > 1:
+            last_word = words[-1]
+            # 检查是否可能是别名（不包含特殊字符，不是关键字）
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_word):
+                # 确保不是函数或关键字
+                keywords = {'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL',
+                           'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'AS', 'JOIN', 'ON'}
+                if last_word.upper() not in keywords:
+                    # 检查前面是否有逗号或运算符，如果有则不是别名
+                    if len(words) >= 2 and words[-2] not in {',', '+', '-', '*', '/', '(', ')'}:
+                        result['alias'] = last_word
+                        result['expression'] = ' '.join(words[:-1])
+        # 如果没有别名，确保 expression 是处理后的 field（已去除注释）
+        if result['alias'] is None:
+            result['expression'] = field
 
     return result
-
-
-def _calculate_line_length_excluding_comments(expression: str) -> int:
-    """计算表达式长度，排除注释部分
-
-    支持 -- 行注释 和 /* 块注释 */
-
-    Args:
-        expression: 表达式字符串
-
-    Returns:
-        排除注释后的长度
-    """
-    # 移除行注释
-    result = re.sub(r'--[^\n]*', '', expression)
-    # 移除块注释
-    result = re.sub(r'/\*.*?\*/', '', result, flags=re.DOTALL)
-    # 移除多余空格
-    result = ' '.join(result.split())
-    return len(result)
-
-
-def _format_function_call_intelligently(expression: str, max_line_length: int = 250, field_start_pos: int = 0) -> str:
-    """智能格式化函数调用
-
-    根据函数参数数量、长度和嵌套深度判断是否需要换行
-    - 单参数或整行短：保持单行
-    - 单个参数过长或整行过长：每个参数一行
-    - 嵌套函数：递归格式化
-
-    Args:
-        expression: 函数调用表达式，如 "CONCAT('a', 'b', 'c')"
-        max_line_length: 最大单行长度（默认250字符）
-        field_start_pos: 函数在字段中的起始列位置，用于计算缩进
-
-    Returns:
-        格式化后的表达式
-    """
-    # 常见的 SQL 函数名
-    COMMON_FUNCTIONS = {
-        'CONCAT', 'LPAD', 'RPAD', 'SUBSTRING', 'SUBSTR', 'TRIM', 'UPPER', 'LOWER',
-        'COALESCE', 'IFNULL', 'NULLIF', 'ISNULL', 'CAST', 'CONVERT',
-        'DATE_FORMAT', 'DATE_ADD', 'DATE_SUB', 'DATEDIFF',
-        'ROUND', 'CEIL', 'FLOOR', 'ABS', 'MOD', 'POWER', 'SQRT',
-        'MAX', 'MIN', 'AVG', 'SUM', 'COUNT', 'STDDEV', 'VARIANCE',
-        'ROW_NUMBER', 'RANK', 'DENSE_RANK', 'LEAD', 'LAG', 'FIRST_VALUE', 'LAST_VALUE',
-        'REGEXP_REPLACE', 'REGEXP_EXTRACT', 'SPLIT', 'EXPLODE',
-        'GET_JSON_OBJECT', 'FROM_JSON', 'TO_JSON',
-        'HASH', 'MD5', 'SHA', 'SHA1', 'SHA2'
-    }
-
-    # 检测函数调用：IDENTIFIER(...)
-    func_match = re.match(r'^([A-Z_][A-Z0-9_]*)\s*\((.*)\)\s*$', expression.strip(), re.IGNORECASE | re.DOTALL)
-
-    if not func_match:
-        # 不是函数调用，返回原表达式
-        return expression
-
-    func_name = func_match.group(1).upper()
-
-    # 如果不是已知函数，可能不是函数调用（如列名），保持原样
-    if func_name not in COMMON_FUNCTIONS:
-        return expression
-
-    params_str = func_match.group(2).strip()
-
-    # 如果参数为空，返回原表达式
-    if not params_str:
-        return expression
-
-    # 解析参数（考虑嵌套括号和字符串）
-    params = _split_function_params(params_str)
-
-    # 判断是否需要换行（新逻辑）
-    # 1. 单个参数长度超过100字符
-    # 2. 整行长度（排除注释）超过250字符
-    needs_multiline = (
-        any(len(p.strip()) > 100 for p in params) or  # 单个参数超过100字符
-        _calculate_line_length_excluding_comments(expression) > max_line_length  # 整行超过限制
-    )
-
-    if not needs_multiline:
-        # 保持单行，但递归处理嵌套函数
-        formatted_params = []
-        for param in params:
-            formatted_param = _format_function_call_intelligently(param.strip(), max_line_length, field_start_pos)
-            formatted_params.append(formatted_param)
-        return f"{func_name}({', '.join(formatted_params)})"
-
-    # 多行格式化：每个参数一行，统一缩进
-    # 检查是否有嵌套函数（参数中包含换行）
-    has_nested = any('\n' in _format_function_call_intelligently(p.strip(), max_line_length, field_start_pos) for p in params)
-
-    # 计算缩进：参数缩进 = 字段起始位置 + 函数名长度 + 1（左括号） + 4（基础缩进）
-    param_indent = field_start_pos + len(func_name) + 1 + 4
-
-    result = [f"{func_name}("]
-    for i, param in enumerate(params):
-        param = param.strip()
-        # 递归格式化参数（嵌套函数的起始位置累加）
-        nested_start_pos = field_start_pos + len(func_name) + 1 + param_indent
-        formatted_param = _format_function_call_intelligently(param, max_line_length, nested_start_pos)
-
-        if '\n' in formatted_param:
-            # 嵌套函数，保持其多行结构，统一缩进
-            lines = formatted_param.split('\n')
-            if i == 0:
-                result.append(f"{' ' * param_indent}{lines[0]}")
-            else:
-                # 逗号前置，逗号缩进少一个空格，参数内容与第一个参数对齐
-                result.append(f"{' ' * (param_indent - 1)}, {lines[0]}")
-            for line in lines[1:]:
-                result.append(f"{' ' * param_indent}{line}")
-        else:
-            # 单行参数
-            if i == 0:
-                result.append(f"{' ' * param_indent}{formatted_param}")
-            else:
-                # 逗号前置，逗号缩进少一个空格，参数内容与第一个参数对齐
-                result.append(f"{' ' * (param_indent - 1)}, {formatted_param}")
-    # 闭括号与函数名对齐
-    result.append(f"{' ' * field_start_pos})")
-
-    return '\n'.join(result)
-
-
-def _split_function_params(params_str: str) -> List[str]:
-    """分割函数参数，考虑嵌套括号和字符串
-
-    Args:
-        params_str: 参数字符串，如 "'a', 'b', CONCAT('c', 'd')"
-
-    Returns:
-        参数列表
-    """
-    params = []
-    current_param = []
-    depth = 0
-    in_string = False
-    string_char = None
-
-    i = 0
-    while i < len(params_str):
-        char = params_str[i]
-
-        # 处理字符串
-        if not in_string and char in ('"', "'"):
-            in_string = True
-            string_char = char
-            current_param.append(char)
-        elif in_string and char == string_char:
-            # 检查是否是转义
-            if i > 0 and params_str[i-1] == '\\':
-                current_param.append(char)
-            else:
-                in_string = False
-                current_param.append(char)
-        elif in_string:
-            current_param.append(char)
-        # 处理括号
-        elif char == '(':
-            depth += 1
-            current_param.append(char)
-        elif char == ')':
-            depth -= 1
-            current_param.append(char)
-        # 处理逗号分隔符（仅在顶层）
-        elif char == ',' and depth == 0 and not in_string:
-            param = ''.join(current_param).strip()
-            if param:
-                params.append(param)
-            current_param = []
-        else:
-            current_param.append(char)
-
-        i += 1
-
-    # 添加最后一个参数
-    last_param = ''.join(current_param).strip()
-    if last_param:
-        params.append(last_param)
-
-    return params
 
 
 def _align_select_fields_smartly(fields: List[str]) -> List[str]:
@@ -2520,7 +1974,6 @@ def _align_select_fields_smartly(fields: List[str]) -> List[str]:
 
     根据字段表达式的最大宽度，对齐 AS 别名和注释
     注意：多行字段（如 CASE 表达式）不参与对齐计算
-    现在支持智能函数换行格式化
     """
     if not fields:
         return fields
@@ -2555,184 +2008,47 @@ def _align_select_fields_smartly(fields: List[str]) -> List[str]:
         if expr_len > max_expr_len:
             max_expr_len = expr_len
 
-    # 对于多行字段（如 CASE WHEN），需要检查其"原始"表达式的长度
-    # 在格式化之前，CASE WHEN 是单行的，所以我们需要从格式化后的多行中提取原始长度
-    for i, p in multi_line_fields:
-        # 检查是否是 CASE 表达式
-        expr = p['expression']
-        if expr.strip().startswith('CASE'):
-            # CASE 表达式的最后一行是 "END AS alias"
-            # 我们需要计算 CASE 到 END 的长度（不包括缩进）
-            lines = expr.split('\n')
-            if lines:
-                first_line = lines[0].strip()  # "CASE"
-                last_line = lines[-1].strip()  # "END AS alias" 或 "END"
-                # CASE 表达式的"核心"长度 = CASE + WHEN...THEN...ELSE...END 的长度
-                # 由于我们无法准确还原，这里使用一个近似值
-                # 检查最后一行是否有 AS
-                as_match = re.search(r'\bEND\s+AS\s+(\w+)', last_line, re.IGNORECASE)
-                if as_match:
-                    # 有 AS，CASE 表达式的长度是 CASE...END 的长度
-                    # 粗略估计：第一行长度 + WHEN...THEN...ELSE...END 的长度
-                    # 实际上，更准确的方法是使用原始 SQL 的长度
-                    # 让我们使用整个多行表达式中最长的一行作为参考
-                    # CASE WHEN 表达式不参与对齐计算，跳过
-                    pass
-
-    # 计算别名的最大宽度（用于对齐没有别名的字段）
-    # 注意：需要同时考虑单行和多行字段的别名
-    max_alias_len = 0
-    for _, p in single_line_fields:
-        if p['alias']:
-            alias_len = len(p['alias'])
-            if alias_len > max_alias_len:
-                max_alias_len = alias_len
-    for _, p in multi_line_fields:
-        # 对于多行字段，需要从表达式中提取 AS 别名
-        expr = p['expression']
-        lines = expr.split('\n')
-        if lines:
-            last_line = lines[-1].strip()
-            as_match = re.search(r'\bEND\s+AS\s+(\w+)(?:\s+(__COMMENT_\d+__)\s*)?$', last_line, re.IGNORECASE)
-            if as_match:
-                alias_len = len(as_match.group(1))
-                if alias_len > max_alias_len:
-                    max_alias_len = alias_len
-
-    # 计算注释对齐的基准位置
-    # 需要找出所有字段中"表达式 + AS + 别名"（或"表达式"）的最大长度
-    # 注意：不包含 CASE WHEN 字段
-    max_full_field_len = 0
-    for _, p in single_line_fields:
-        # 计算完整字段长度：表达式 + AS + 别名
-        field_len = len(p['expression'])
-        if p['alias']:
-            field_len += 4 + len(p['alias'])  # " AS " + 别名
-        if field_len > max_full_field_len:
-            max_full_field_len = field_len
-    # 跳过多行字段（CASE WHEN）在注释对齐中的计算
-    # CASE WHEN 字段不参与注释对齐
-
     # 如果没有单行字段，直接返回原始字段
     if not single_line_fields:
-        result = []
-        for p in parsed_fields:
-            if p.get('had_as', False) and p.get('original_expression'):
-                # 原始字段已有 AS，使用完整表达式
-                field_str = p['original_expression']
-            else:
-                field_str = p['expression']
-            # 添加 AS（如果需要）
-            if p['alias'] and not p.get('had_as', False):
-                field_str += f" AS {p['alias']}"
-            # 添加注释
-            if p['comment']:
-                field_str += f"  {p['comment']}"
-            result.append(field_str)
-        return result
+        return [p['expression'] + (f" AS {p['alias']}" if p['alias'] else '') + (f"  {p['comment']}" if p['comment'] else '') for p in parsed_fields]
 
     # 生成对齐的字段字符串
     result = [None] * len(parsed_fields)
 
-    # 处理单行字段（应用对齐和智能函数格式化）
+    # 处理单行字段（应用对齐）
     for i, p in single_line_fields:
-        # 如果原始字段已有 AS，使用包含 AS 的完整表达式
-        if p.get('had_as', False) and p.get('original_expression'):
-            field_str = p['original_expression']  # 包含 AS 的完整表达式
-        else:
-            field_str = p['expression']  # 只有表达式部分
-
-        # 智能格式化函数调用（在提取 AS 别名之前）
-        # 注意：field_str 可能包含 AS 别名，需要先分离
-        expression_part = field_str
-        alias_part = None
-
-        # 检查是否有 AS 别名（在已有 AS 的情况下）
-        if p.get('had_as', False):
-            as_match = re.search(r'\s+AS\s+(\w+)$', field_str, re.IGNORECASE)
-            if as_match:
-                expression_part = field_str[:as_match.start()].strip()
-                alias_part = as_match.group(1)
-
-        # 应用智能函数格式化
-        formatted_expr = _format_function_call_intelligently(expression_part)
-
-        # 检查格式化后是否变成多行
-        is_multiline = '\n' in formatted_expr
-
-        if is_multiline:
-            # 多行字段，不参与对齐
-            field_str = formatted_expr
-            # 添加 AS 别名（如果有）
-            if alias_part:
-                field_str += f" AS {alias_part}"
-            elif p['alias'] and not p.get('had_as', False):
-                field_str += f" AS {p['alias']}"
-            # 添加注释（如果有）
-            if p['comment']:
-                field_str += f"  {p['comment']}"
-            result[i] = field_str
-            continue
-
-        # 单行字段，应用对齐
-        field_str = formatted_expr
-
-        # 如果有 AS 别名，恢复它
-        if alias_part:
-            field_str += f" AS {alias_part}"
+        field_str = p['expression']
 
         # 添加 AS 别名（如果有）
-        if p['alias'] and not p.get('had_as', False):
-            # 新对齐逻辑：表达式对齐到 max_expr_len，然后 AS，然后别名
-            field_str = field_str.ljust(max_expr_len)
-            field_str += f" AS {p['alias']}"
-        elif p.get('had_as', False):
-            # 原始字段已有 AS，也应用新对齐逻辑
-            # 需要重新分离表达式和别名
-            as_match = re.search(r'\s+AS\s+(\w+)$', field_str, re.IGNORECASE)
-            if as_match:
-                expr_only = field_str[:as_match.start()].strip()
-                alias_only = as_match.group(1)
-                field_str = expr_only.ljust(max_expr_len)
-                field_str += f" AS {alias_only}"
-        else:
-            # 没有 AS 别名：对齐到 max_expr_len + 4 + max_alias_len
-            # 这样可以与有别名 + 最长别名的字段对齐
-            align_pos = max_expr_len + 4 + max_alias_len
+        if p['alias']:
+            # 计算对齐位置
+            align_pos = max_expr_len + 2
             field_str = field_str.ljust(align_pos)
+            field_str += f"AS {p['alias']}"
 
-        # 添加注释（对齐到 max_full_field_len + 2）
+        # 添加注释（如果有）
         if p['comment']:
-            # 计算当前字段的完整长度
-            current_len = len(field_str)
-            # 注释对齐位置 = max_full_field_len + 2（两个空格）
-            align_pos = max_full_field_len + 2
-            if current_len < align_pos:
+            if p['alias']:
+                field_str += f"  {p['comment']}"
+            else:
+                # 没有别名时，注释也要对齐
+                align_pos = max_expr_len + 2
                 field_str = field_str.ljust(align_pos)
-            field_str += p['comment']  # 注释前不需要额外空格
+                field_str += f"  {p['comment']}"
 
         result[i] = field_str
 
-    # 处理多行字段（CASE WHEN 不参与对齐，保持原样）
+    # 处理多行字段（不参与对齐）
     for i, p in multi_line_fields:
-        # 对于多行字段，检查是否是 CASE WHEN 表达式
         field_str = p['expression']
 
-        # CASE WHEN 表达式保持原样，不参与对齐
-        if field_str.strip().startswith('CASE'):
-            # 已经被格式化好了，直接使用
-            # 如果有独立的注释需要添加
-            if p['comment'] and '__COMMENT_' not in field_str:
-                lines = field_str.split('\n')
-                # 将注释添加到最后一行
-                lines[-1] += f"  {p['comment']}"
-                field_str = '\n'.join(lines)
-        else:
-            # 其他多行字段，保持原样
-            if p['comment']:
-                lines = field_str.split('\n')
-                lines[-1] += f"  {p['comment']}"
-                field_str = '\n'.join(lines)
+        # 添加 AS 别名（如果有）
+        if p['alias']:
+            field_str += f" AS {p['alias']}"
+
+        # 添加注释（如果有）
+        if p['comment']:
+            field_str += f"  {p['comment']}"
 
         result[i] = field_str
 
@@ -2787,94 +2103,11 @@ def _format_case_expression(case_sql: str, base_indent: int = 0) -> str:
     return formatted
 
 
-def _unwrap_parentheses(s: str) -> tuple:
-    """递归去除外层括号，直到遇到 CASE 关键字或没有括号
-
-    Args:
-        s: 输入字符串
-
-    Returns:
-        (unwrapped_string, paren_count) - 去除括号后的字符串和去除的括号层数
-    """
-    original = s
-    paren_count = 0
-
-    while True:
-        s = s.strip()
-
-        # 临时移除末尾的注释占位符，以便检查括号
-        s_no_comments = re.sub(r'\s*__COMMENT_\d+__\s*$', '', s).strip()
-
-        # 检查是否被括号包裹（需要正确匹配括号）
-        if s.startswith('(') and (s.endswith(')') or s_no_comments.endswith(')')):
-            # 检查括号是否正确匹配（最外层的左右括号）
-            depth = 0
-            matched = False
-            # 使用原始字符串 s 进行括号匹配
-            for i, char in enumerate(s):
-                if char == '(':
-                    depth += 1
-                elif char == ')':
-                    depth -= 1
-                    # 检查是否到达最后一个有意义的字符（忽略注释占位符）
-                    if depth == 0:
-                        # 检查从 i 位置往后是否只有注释占位符和空格
-                        remaining = s[i+1:].strip()
-                        is_meaningful_end = remaining == '' or re.match(r'^__COMMENT_\d+__$', remaining)
-                        if is_meaningful_end:
-                            # 找到匹配的最外层括号
-                            s = s[1:i].strip()
-                            paren_count += 1
-                            matched = True
-                            break
-                        else:
-                            # 括号不匹配，停止
-                            break
-
-            if not matched:
-                break
-
-            # 检查是否包含 CASE（用于决定是否继续去除）
-            contains_case = re.search(r'\bCASE\b', s, re.IGNORECASE)
-
-            # 如果去除括号后以 CASE 开头，停止去除（已找到 CASE）
-            if re.search(r'^CASE\b', s, re.IGNORECASE):
-                break
-
-            # 如果包含 CASE 但不以 CASE 开头（说明还有括号），继续去除
-            if contains_case and s.startswith('('):
-                continue
-
-            # 如果去除括号后包含 CASE，停止
-            if contains_case:
-                break
-
-            # 不包含 CASE，继续去除括号（处理普通表达式）
-        else:
-            # 没有外层括号
-            break
-
-    return s, paren_count
-
-
-def _format_case_recursive(case_sql: str, base_indent: int = 0, compact_mode: bool = False, paren_indent: int = None) -> str:
-    """Recursively format CASE expressions including nested ones
-
-    Args:
-        case_sql: CASE 表达式字符串
-        base_indent: 基础缩进（空格数）
-        compact_mode: 紧凑模式 - WHEN 和 THEN 在同一行（用于嵌套 CASE）
-        paren_indent: 括号对齐位置（用于嵌套 CASE 的括号对齐）
-    """
+def _format_case_recursive(case_sql: str, base_indent: int = 0) -> str:
+    """Recursively format CASE expressions including nested ones - V4 原有逻辑"""
     indent = ' ' * base_indent
 
-    if paren_indent is not None:
-        # 括号包裹的嵌套 CASE：使用括号对齐
-        # CASE/END 与括号后 1 个空格对齐（paren_indent + 1）
-        # WHEN 再缩进 5 空格
-        inner_indent = ' ' * (paren_indent + 1 + 5)
-        end_indent = ' ' * (paren_indent + 1)  # END 与 CASE 对齐
-    elif base_indent == 0:
+    if base_indent == 0:
         inner_indent = ' ' * 11
         end_indent = ' ' * 7
     else:
@@ -2910,214 +2143,66 @@ def _format_case_recursive(case_sql: str, base_indent: int = 0, compact_mode: bo
 
     parts = _parse_case_parts(inner_content)
 
-    # CASE 的缩进：当有括号对齐时，CASE 比括号多 1 个空格
-    if paren_indent is not None:
-        case_indent = ' ' * (paren_indent + 1)
-    else:
-        case_indent = indent
-
-    lines = [f'{case_indent}CASE']
+    lines = [f'{indent}CASE']
 
     for when_cond, then_val in parts['whens']:
-        when_stripped = when_cond.strip()
-        then_stripped = then_val.strip()
+        when_formatted = _format_when_condition(when_cond.strip(), inner_indent)
+        lines.append(f'{inner_indent}WHEN {when_formatted}')
 
-        # 检查是否包含嵌套 CASE
-        has_nested_case = re.search(r'\bCASE\b', then_stripped, re.IGNORECASE)
+        then_stripped = then_val.strip()
         has_paren_wrapper = False
         inner_then = then_stripped
+        if then_stripped.startswith('(') and then_stripped.endswith(')'):
+            inner_then = then_stripped[1:-1].strip()
+            if re.search(r'^CASE\b', inner_then, re.IGNORECASE):
+                has_paren_wrapper = True
 
-        # 使用新的括号去除函数，递归去除所有外层括号
-        inner_then, paren_count = _unwrap_parentheses(then_stripped)
-        if paren_count > 0 and re.search(r'^CASE\b', inner_then, re.IGNORECASE):
-            has_paren_wrapper = True
-            has_nested_case = True
-
-        if has_nested_case:
-            # 嵌套 CASE - 使用紧凑模式递归格式化
+        if re.search(r'\bCASE\b', then_stripped, re.IGNORECASE):
+            nested_base = 15 if base_indent == 0 else base_indent + 8
             nested_content = inner_then if has_paren_wrapper else then_stripped
+            nested_formatted = _format_case_recursive(nested_content, nested_base)
 
-            # 计算括号位置（用于对齐）
             if has_paren_wrapper:
-                # THEN ( 应该与 WHEN 对齐（使用相同的缩进）
-                then_line_indent = len(inner_indent)
-                # paren_indent 是 THEN ( 中 ( 的位置，用于内层 CASE 的缩进对齐
-                # 紧凑模式: THEN ( 行的格式: [then_line_indent]WHEN [when] THEN (
-                # ( 的位置 = then_line_indent + len("WHEN ") + len(when_stripped) + len(" THEN (")
-                paren_indent_compact = then_line_indent + len("WHEN ") + len(when_stripped) + len(" THEN (")
-                # 非紧凑模式: THEN ( 行的格式: [then_line_indent]THEN (
-                # ( 的位置 = then_line_indent + len("THEN (")
-                paren_indent_normal = then_line_indent + len("THEN (")
-                # paren_pos 是 ( 在 THEN ( 行中的位置（不再使用，保留用于兼容）
-                paren_pos = then_line_indent + len('THEN (') - 1
+                lines.append(f'{inner_indent}THEN (')
+                for nested_line in nested_formatted.split('\n'):
+                    lines.append(nested_line)
+                lines.append(f'{inner_indent}    )')
             else:
-                # 没有括号包裹的嵌套 CASE
-                # 仍然需要计算 paren_indent，让内层 CASE 正确缩进
-                # 假设格式是: [inner_indent]THEN CASE
-                # 内层 CASE 应该缩进到 THEN 后 6 个字符的位置（与 "THEN (" 的括号位置一致）
-                then_line_indent = len(inner_indent)
-                paren_indent_compact = then_line_indent + len("THEN (")
-                paren_indent_normal = then_line_indent + len("THEN (")
-                paren_pos = None
-
-            # 检查 WHEN 条件是否需要格式化（包含 OR/AND）
-            when_needs_format = _needs_when_condition_formatting(when_stripped)
-
-            if compact_mode and not when_needs_format:
-                # 紧凑模式：WHEN 条件简单时，THEN [content] 在同一行
-                # 使用紧凑模式的括号位置
-                nested_formatted = _format_case_recursive(nested_content, base_indent=0, compact_mode=True, paren_indent=paren_indent_compact)
-                if has_paren_wrapper:
-                    lines.append(f'{" " * then_line_indent}WHEN {when_stripped} THEN (')
-                else:
-                    # 原始 SQL 没有括号，保持原样：WHEN ... THEN CASE
-                    lines.append(f'{inner_indent}WHEN {when_stripped} THEN')
+                lines.append(f'{inner_indent}THEN')
                 for nested_line in nested_formatted.split('\n'):
                     lines.append(nested_line)
-                if has_paren_wrapper:
-                    # ) 应该与 ( 在 THEN ( 中的位置对齐
-                    # THEN ( 行的格式: [then_line_indent spaces]WHEN [when] THEN (
-                    # ( 的位置 = then_line_indent + len("WHEN ") + len(when_stripped) + len(" THEN (")
-                    close_paren_pos = then_line_indent + len("WHEN ") + len(when_stripped) + len(" THEN (")
-                    lines.append(f'{" " * close_paren_pos})')
-                # else: 没有括号，不需要闭合括号
-            elif when_needs_format:
-                # WHEN 条件需要格式化（多行）
-                # 使用非紧凑模式的括号位置
-                nested_formatted = _format_case_recursive(nested_content, base_indent=0, compact_mode=True, paren_indent=paren_indent_normal)
-                when_formatted = _format_when_condition(when_stripped, inner_indent)
-                lines.append(f'{inner_indent}WHEN {when_formatted}')
-                if has_paren_wrapper:
-                    lines.append(f'{" " * then_line_indent}THEN (')
-                else:
-                    # 原始 SQL 没有括号，保持原样：THEN CASE
-                    lines.append(f'{" " * then_line_indent}THEN')
-                for nested_line in nested_formatted.split('\n'):
-                    lines.append(nested_line)
-                if has_paren_wrapper:
-                    # ) 应该与 ( 在 THEN ( 中的位置对齐
-                    # THEN ( 行的格式: [then_line_indent spaces]THEN (
-                    # ( 的位置 = then_line_indent + len("THEN (")
-                    close_paren_pos = then_line_indent + len("THEN (")
-                    lines.append(f'{" " * close_paren_pos})')
-                # else: 没有括号，不需要闭合括号
-            else:
-                # 非紧凑模式：WHEN、THEN 分行
-                # 使用非紧凑模式的括号位置
-                nested_formatted = _format_case_recursive(nested_content, base_indent=0, compact_mode=True, paren_indent=paren_indent_normal)
-                when_formatted = _format_when_condition(when_stripped, inner_indent)
-                lines.append(f'{inner_indent}WHEN {when_formatted}')
-                if has_paren_wrapper:
-                    lines.append(f'{" " * then_line_indent}THEN (')
-                else:
-                    # 原始 SQL 没有括号，保持原样：THEN CASE
-                    lines.append(f'{" " * then_line_indent}THEN')
-                for nested_line in nested_formatted.split('\n'):
-                    lines.append(nested_line)
-                if has_paren_wrapper:
-                    # ) 应该与 ( 在 THEN ( 中的位置对齐
-                    # THEN ( 行的格式: [then_line_indent spaces]THEN (
-                    # ( 的位置 = then_line_indent + len("THEN (")
-                    close_paren_pos = then_line_indent + len("THEN (")
-                    lines.append(f'{" " * close_paren_pos})')
-                # else: 没有括号，不需要闭合括号
         else:
-            # 非 CASE 值
-            if compact_mode:
-                # 紧凑模式：WHEN condition THEN value 在同一行
-                lines.append(f'{inner_indent}WHEN {when_stripped} THEN {then_stripped}')
-            else:
-                # 标准模式
-                when_formatted = _format_when_condition(when_stripped, inner_indent)
-                lines.append(f'{inner_indent}WHEN {when_formatted}')
-                lines.append(f'{inner_indent}THEN {then_stripped}')
+            lines.append(f'{inner_indent}THEN {then_stripped}')
 
     if parts['else']:
         else_val = parts['else'].strip()
-        has_nested_case = re.search(r'\bCASE\b', else_val, re.IGNORECASE)
         has_paren_wrapper = False
         inner_else = else_val
+        if else_val.startswith('(') and else_val.endswith(')'):
+            inner_else = else_val[1:-1].strip()
+            if re.search(r'^CASE\b', inner_else, re.IGNORECASE):
+                has_paren_wrapper = True
 
-        # 使用新的括号去除函数，递归去除所有外层括号
-        inner_else, paren_count = _unwrap_parentheses(else_val)
-        if paren_count > 0 and re.search(r'^CASE\b', inner_else, re.IGNORECASE):
-            has_paren_wrapper = True
-            has_nested_case = True
-
-        if has_nested_case:
-            # ELSE 分支的嵌套 CASE
+        if re.search(r'\bCASE\b', else_val, re.IGNORECASE):
+            nested_base = 15 if base_indent == 0 else base_indent + 8
             nested_content = inner_else if has_paren_wrapper else else_val
-
-            # 计算括号位置（用于对齐）
-            if has_paren_wrapper:
-                # ELSE ( 应该与 WHEN 的 THEN ( 对齐
-                # 所以使用与 THEN ( 相同的缩进
-                else_line_indent = len(inner_indent)
-                # paren_indent 是 ELSE ( 中 ( 的位置，用于内层 CASE 的缩进对齐
-                # ELSE ( 行的格式: [else_line_indent spaces]ELSE (
-                # ( 的位置 = else_line_indent + len("ELSE") + 1 (空格) = else_line_indent + 5
-                paren_indent = else_line_indent + len("ELSE") + 1
-                # paren_pos 是 ( 在 ELSE ( 行中的位置（不再使用，保留用于兼容）
-                paren_pos = else_line_indent + len('ELSE (') - 1
-            else:
-                # 没有括号包裹的嵌套 CASE
-                # 仍然需要计算 paren_indent，让内层 CASE 正确缩进
-                # 假设格式是: [inner_indent]ELSE CASE
-                # 内层 CASE 应该缩进到 ELSE 后 6 个字符的位置（与 "ELSE (" 的括号位置一致）
-                else_line_indent = len(inner_indent)
-                paren_indent = else_line_indent + len("ELSE") + 1
-                paren_pos = None
-
-            nested_formatted = _format_case_recursive(nested_content, base_indent=0, compact_mode=True, paren_indent=paren_indent)
+            nested_formatted = _format_case_recursive(nested_content, nested_base)
 
             if has_paren_wrapper:
-                lines.append(f'{" " * else_line_indent}ELSE (')
+                lines.append(f'{inner_indent}ELSE (')
                 for nested_line in nested_formatted.split('\n'):
                     lines.append(nested_line)
-                # ) 应该与 ELSE ( 中的 ( 对齐
-                # ELSE ( 行的格式: [else_line_indent spaces]ELSE (
-                # ( 的位置 = else_line_indent + len("ELSE (") - 1
-                lines.append(f'{" " * (else_line_indent + len("ELSE (") - 1)})')
+                lines.append(f'{inner_indent}    )')
             else:
                 lines.append(f'{inner_indent}ELSE')
                 for nested_line in nested_formatted.split('\n'):
                     lines.append(nested_line)
         else:
-            # ELSE 分支的非 CASE 值
             lines.append(f'{inner_indent}ELSE {else_val}')
 
     lines.append(f'{end_indent}END')
 
     return '\n'.join(lines)
-
-
-def _needs_when_condition_formatting(condition: str) -> bool:
-    """检查 WHEN 条件是否需要格式化（包含多个 OR/AND 需要换行）"""
-    # 移除注释占位符和字符串内容
-    temp = re.sub(r'__COMMENT_\d+__', '', condition)
-    temp = re.sub(r"'[^']*'", "''", temp)  # 替换字符串为空串
-
-    # 检查是否包含需要换行的 OR/AND
-    # 1. 检查括号内的 OR/AND
-    paren_or_pattern = r'\([^)]*\bOR\b[^)]*\)'
-    paren_and_pattern = r'\([^)]*\bAND\b[^)]*\)'
-    if re.search(paren_or_pattern, temp, re.IGNORECASE):
-        return True
-    if re.search(paren_and_pattern, temp, re.IGNORECASE):
-        # 需要至少 2 个 AND 才需要换行
-        and_count = len(re.findall(r'\bAND\b', temp, re.IGNORECASE))
-        if and_count >= 2:
-            return True
-
-    # 2. 检查顶层多个 OR/AND（不在括号内的）
-    or_parts = _split_by_logical_op(condition, 'OR')
-    if len(or_parts) > 1:
-        return True
-    and_parts = _split_by_logical_op(condition, 'AND')
-    if len(and_parts) > 1:
-        return True
-
-    return False
 
 
 def _format_when_condition(condition: str, base_indent: str) -> str:
@@ -3624,10 +2709,7 @@ def _parse_case_parts(content: str) -> Dict:
 
 
 def _format_join_clause(join: Dict) -> List[str]:
-    """Format JOIN clause
-
-    JOIN 与 FROM 对齐（无缩进），ON 条件缩进 4 个空格
-    """
+    """Format JOIN clause - V4 原有逻辑"""
     lines = []
     join_type = join['type']
     content = join['content']
@@ -3677,13 +2759,12 @@ def _format_join_clause(join: Dict) -> List[str]:
 
             alias_part = alias_part + trailing_comment
 
-            # JOIN 与 FROM 对齐（无缩进）
-            lines.append(f'{join_type}')
-            lines.append(f'    (')
+            lines.append(f'    {join_type}')
+            lines.append(f'        (')
             lines.append(f'{subquery_formatted}')
-            lines.append(f'    ) {alias_part}')
+            lines.append(f'        ) {alias_part}')
             if on_condition:
-                lines.append(f'    ON {on_condition}')
+                lines.append(f'        ON {on_condition}')
             return lines
 
     on_match = re.search(r'\bON\b\s+(.+)$', content, re.IGNORECASE | re.DOTALL)
@@ -3692,28 +2773,24 @@ def _format_join_clause(join: Dict) -> List[str]:
         table = content[:on_match.start()].strip()
         on_condition = on_match.group(1).strip()
 
-        # JOIN 与 FROM 对齐（无缩进）
-        lines.append(f'{join_type} {table}')
+        lines.append(f'    {join_type} {table}')
         # 格式化ON条件，按AND分割并换行
         on_lines = _format_on_condition(on_condition)
         lines.extend(on_lines)
     else:
-        lines.append(f'{join_type} {content}')
+        lines.append(f'    {join_type} {content}')
 
     return lines
 
 
 def _format_on_condition(on_condition: str) -> List[str]:
-    """Format ON condition with AND on new lines
-
-    ON 缩进 4 个空格，AND/OR 也缩进 4 个空格（与 ON 对齐）
-    """
+    """Format ON condition with AND on new lines, handling nested functions"""
     lines = []
 
     conditions = _split_by_logical_op(on_condition, 'AND')
 
     if not conditions:
-        return [f'    ON {on_condition}']
+        return [f'        ON {on_condition}']
 
     # 第一个条件
     first_cond = conditions[0].strip()
@@ -3721,11 +2798,11 @@ def _format_on_condition(on_condition: str) -> List[str]:
     # 检查第一个条件是否包含OR
     or_parts = _split_by_logical_op(first_cond, 'OR')
     if len(or_parts) > 1:
-        lines.append(f'    ON {or_parts[0].strip()}')
+        lines.append(f'        ON {or_parts[0].strip()}')
         for op in or_parts[1:]:
-            lines.append(f'    OR {op.strip()}')
+            lines.append(f'            OR {op.strip()}')
     else:
-        lines.append(f'    ON {first_cond}')
+        lines.append(f'        ON {first_cond}')
 
     # 后续条件（按AND换行）
     for cond in conditions[1:]:
@@ -3736,11 +2813,11 @@ def _format_on_condition(on_condition: str) -> List[str]:
         # 检查是否包含OR
         or_parts = _split_by_logical_op(cond, 'OR')
         if len(or_parts) > 1:
-            lines.append(f'    AND {or_parts[0].strip()}')
+            lines.append(f'        AND {or_parts[0].strip()}')
             for op in or_parts[1:]:
-                lines.append(f'    OR {op.strip()}')
+                lines.append(f'            OR {op.strip()}')
         else:
-            lines.append(f'    AND {cond}')
+            lines.append(f'        AND {cond}')
 
     return lines
 
@@ -3795,150 +2872,20 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
 
 
 def _format_where_clause(where: str) -> List[str]:
-    """Format WHERE clause with AND on new lines
-
-    WHERE 与 FROM 对齐（无缩进），AND 缩进 4 个空格
-    """
+    """Format WHERE clause with AND on new lines - V4 原有逻辑"""
     lines = []
 
     conditions = _split_by_logical_op(where, 'AND')
 
     if conditions:
         first_formatted = _format_condition_with_ors(conditions[0].strip(), 4)
-        # WHERE 与 FROM 对齐（无缩进）
-        lines.append(f'WHERE {first_formatted}')
+        lines.append(f'    WHERE {first_formatted}')
 
         for cond in conditions[1:]:
-            cond_formatted = _format_condition_with_ors(cond.strip(), 4)
-            # AND 缩进 4 个空格
-            lines.append(f'    AND {cond_formatted}')
+            cond_formatted = _format_condition_with_ors(cond.strip(), 8)
+            lines.append(f'        AND {cond_formatted}')
 
     return lines
-
-
-def _split_by_union(sql: str) -> List[str]:
-    """分割 UNION/UNION ALL 连接的多个 SELECT 语句
-
-    处理嵌套括号和字符串，避免误分割
-
-    返回格式: [SELECT语句1, 'UNION' 或 'UNION ALL', SELECT语句2, ...]
-    """
-    statements = []
-    current = []
-    paren_depth = 0
-    in_string = False
-    string_char = None
-    i = 0
-
-    while i < len(sql):
-        char = sql[i]
-
-        # 处理字符串
-        if not in_string and char in ('"', "'"):
-            in_string = True
-            string_char = char
-            current.append(char)
-            i += 1
-            continue
-        elif in_string and char == string_char:
-            # 检查是否转义
-            if i > 0 and sql[i - 1] != '\\':
-                in_string = False
-                string_char = None
-            current.append(char)
-            i += 1
-            continue
-
-        if in_string:
-            current.append(char)
-            i += 1
-            continue
-
-        # 处理括号
-        if char == '(':
-            paren_depth += 1
-            current.append(char)
-            i += 1
-            continue
-        elif char == ')':
-            paren_depth -= 1
-            current.append(char)
-            i += 1
-            continue
-
-        # 检查 UNION 关键字（只在括号外检测）
-        if paren_depth == 0 and i + 5 <= len(sql):
-            # 检查 UNION 或 UNION ALL
-            if sql[i:i+5].upper() == 'UNION' and (i + 5 >= len(sql) or not sql[i + 5].isalnum()):
-                # 保存当前语句
-                stmt = ''.join(current).strip()
-                if stmt:
-                    statements.append(stmt)
-
-                # 跳过 UNION 关键字
-                i += 5
-                # 跳过空白
-                while i < len(sql) and sql[i] in ' \t\n':
-                    i += 1
-
-                # 检查是否有 ALL
-                if i + 3 <= len(sql) and sql[i:i+3].upper() == 'ALL' and (i + 3 >= len(sql) or not sql[i + 3].isalnum()):
-                    # 添加 UNION ALL 作为独立的语句部分
-                    statements.append('UNION ALL')
-                    i += 3
-                else:
-                    # 添加 UNION 作为独立的语句部分
-                    statements.append('UNION')
-
-                # 清空 current，准备收集下一个语句
-                current = []
-                # 跳过 UNION 后的空白
-                while i < len(sql) and sql[i] in ' \t\n':
-                    i += 1
-                continue
-
-        current.append(char)
-        i += 1
-
-    # 添加最后一个语句
-    stmt = ''.join(current).strip()
-    if stmt:
-        statements.append(stmt)
-
-    return statements
-
-
-def _format_union_statement(sql: str, keyword_case: str = 'upper') -> str:
-    """格式化包含 UNION 的 SELECT 语句
-
-    每个 SELECT 分别格式化，然后用 UNION 连接
-    """
-    # 检测是否包含 UNION
-    if not re.search(r'\bUNION\b', sql, re.IGNORECASE):
-        # 没有 UNION，使用正常格式化
-        return _format_sql_structure(sql, keyword_case)
-
-    # 分割 UNION
-    union_parts = _split_by_union(sql)
-
-    if len(union_parts) <= 1:
-        # 没有分割出多个部分，使用正常格式化
-        return _format_sql_structure(sql, keyword_case)
-
-    # 格式化每个 SELECT 部分
-    formatted_parts = []
-    for i, part in enumerate(union_parts):
-        part = part.strip()
-        if part.upper() in ('UNION', 'UNION ALL'):
-            # 这是 UNION 关键字，保留（已经是大写）
-            formatted_parts.append(part.upper())
-        else:
-            # 这是 SELECT 语句，格式化它
-            formatted = _format_sql_structure(part, keyword_case)
-            formatted_parts.append(formatted)
-
-    # 用换行连接所有部分（UNION 已经在 formatted_parts 中）
-    return '\n'.join(formatted_parts)
 
 
 def _format_condition_with_ors(condition: str, base_indent: int) -> str:

@@ -19,40 +19,47 @@ body {
 /* Header */
 .app-header {
   background: rgba(255, 255, 255, 0.95);
-  padding: 20px 30px;
+  padding: 8px 15px;
   text-align: center;
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
 }
 
 .app-header h1 {
-  font-size: 28px;
+  font-size: 18px;
   color: #2c3e50;
-  margin-bottom: 5px;
+  margin-bottom: 0px;
 }
 
 .subtitle {
   color: #7f8c8d;
-  font-size: 14px;
+  font-size: 11px;
 }
 
 /* Main */
 .app-main {
   flex: 1;
-  padding: 20px;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 20px;
-  max-width: 1600px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 1800px;
   margin: 0 auto;
   width: 100%;
+}
+
+/* 上半部分：左右布局 */
+.main-editors {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
 }
 
 /* Sections */
 .editor-section,
 .result-section {
   background: white;
-  border-radius: 12px;
-  padding: 20px;
+  border-radius: 6px;
+  padding: 8px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
   overflow: hidden;
 }
@@ -61,13 +68,13 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 15px;
-  padding-bottom: 15px;
-  border-bottom: 2px solid #ecf0f1;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #ecf0f1;
 }
 
 .section-header h2 {
-  font-size: 18px;
+  font-size: 14px;
   color: #2c3e50;
 }
 
@@ -79,11 +86,11 @@ body {
 
 /* Buttons */
 .btn {
-  padding: 10px 20px;
+  padding: 6px 10px;
   border: none;
-  border-radius: 6px;
-  font-size: 14px;
-  font-weight: 600;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
   transition: all 0.2s;
 }
@@ -165,11 +172,11 @@ textarea {
 }
 
 .issue-card {
-  padding: 15px;
-  margin-bottom: 12px;
+  padding: 10px;
+  margin-bottom: 8px;
   border-left: 4px solid;
   background: #f8f9fa;
-  border-radius: 0 8px 8px 0;
+  border-radius: 0 6px 6px 0;
 }
 
 .issue-header {
@@ -196,10 +203,20 @@ textarea {
 .issue-line {
   margin-left: auto;
   font-size: 11px;
-  color: #95a5a6;
+  color: #667eea;
   background: #f1f2f6;
-  padding: 2px 6px;
+  padding: 4px 10px;
   border-radius: 4px;
+  border: 1px solid #667eea;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 500;
+}
+
+.issue-line:hover {
+  background: #667eea;
+  color: white;
+  transform: translateY(-1px);
 }
 
 .issue-message {
@@ -263,10 +280,10 @@ textarea {
 /* Footer */
 .app-footer {
   background: rgba(255, 255, 255, 0.95);
-  padding: 15px;
+  padding: 8px;
   text-align: center;
   color: #7f8c8d;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 /* Responsive */
@@ -293,4 +310,49 @@ textarea {
 
 .issues-list::-webkit-scrollbar-thumb:hover {
   background: #a8a8a8;
+}
+
+/* Analysis Section */
+.analysis-section {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.analysis-section.collapsed {
+  max-height: 60px;
+  overflow: hidden;
+}
+
+.analysis-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #f8f9fa;
+  border-bottom: 1px solid #ecf0f1;
+  cursor: pointer;
+  user-select: none;
+}
+
+.analysis-header:hover {
+  background: #f1f2f6;
+}
+
+.analysis-header h2 {
+  font-size: 13px;
+  color: #2c3e50;
+  margin: 0;
+}
+
+.analysis-content {
+  padding: 12px;
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.analysis-section.collapsed .analysis-content {
+  display: none;
 }

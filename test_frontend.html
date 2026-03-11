@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test</title></head>
+<body>
+<h1>Test Formatting</h1>
+<textarea id="input" rows="10" cols="80">INSERT INTO TABLE test
+SELECT CASE WHEN NVL(xd.YYED,0)-0<0 OR (NVL(xd.YYED,0)-0>NVL(xd.SXED,0)-0 AND NVL(xd.SXED,0)-0>=NVL(b.dkye,0)-0) THEN b.dkye WHEN NVL(xd.YYED,0)-0<0 OR (NVL(xd.YYED,0)-0>NVL(xd.SXED,0)-0 AND NVL(xd.SXED,0)-0<NVL(b.dkye,0)-0) THEN xd.sxed ELSE xd.YYED END FROM test;</textarea>
+<button onclick="format()">Format</button>
+<pre id="output"></pre>
+<script>
+async function format() {
+    const sql = document.getElementById('input').value;
+    const res = await fetch('http://localhost:8888/format/v4fixed', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({sql})
+    });
+    const data = await res.json();
+    document.getElementById('output').textContent = data.formatted;
+}
+</script>
+</body>
+</html>

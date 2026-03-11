@@ -44,16 +44,13 @@ function App() {
     setLoading(true);
     setEditorError(null);
     try {
-      // 调用后端API格式化SQL
-      const response = await fetch('http://localhost:5000/api/format', {
+      // 调用后端API格式化SQL (使用 v4fixed 端点)
+      const response = await fetch('http://localhost:8888/format/v4fixed', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sql: sql,
-          options: {
-            keyword_case: 'upper',
-            semicolon_newline: true
-          }
+          keyword_case: 'upper'
         })
       });
 
@@ -79,7 +76,7 @@ function App() {
       });
     } catch (error) {
       console.error('格式化失败:', error);
-      alert(`格式化失败: ${error}\n请确保后端服务已启动 (http://localhost:5000)`);
+      alert(`格式化失败: ${error}\n请确保后端服务已启动 (http://localhost:8888)`);
     } finally {
       setLoading(false);
     }
@@ -119,7 +116,7 @@ function App() {
                 清空
               </button>
               <button className="btn btn-primary" onClick={analyzeSQL} disabled={loading}>
-                {loading ? '分析中...' : '分析SQL'}
+                {loading ? '格式化中...' : '格式化SQL'}
               </button>
             </div>
           </div>
@@ -165,7 +162,7 @@ function App() {
         {result && (
           <div className="result-section">
             <div className="section-header">
-              <h2>分析结果</h2>
+              <h2>格式化结果</h2>
               <div className="stats">
                 <span className="stat high">高: {result.high_priority}</span>
                 <span className="stat medium">中: {result.medium_priority}</span>
@@ -200,7 +197,7 @@ function App() {
 
             {result.optimized_sql && result.optimized_sql !== result.original_sql && (
               <div className="optimized-section">
-                <h3>优化后的SQL</h3>
+                <h3>格式化后的SQL</h3>
                 {editorError ? (
                   <textarea
                     value={result.optimized_sql}
@@ -238,7 +235,7 @@ function App() {
                     alert('已复制到剪贴板');
                   }}
                 >
-                  复制优化后的SQL
+                  复制格式化后的SQL
                 </button>
               </div>
             )}

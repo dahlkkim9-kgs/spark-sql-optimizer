@@ -1,0 +1,1 @@
+{"sql": "INSERT INTO RA03.T_GJDG_JRZF_D01_TMP_CWKJB PARTITION(data_dt='{DATA_DT}')\nSELECT 'A' ACTIONTYPE, --操作类型\n       ACTIONDESC, --删除原因\nFROM table1;"}

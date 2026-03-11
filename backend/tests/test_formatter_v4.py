@@ -2,13 +2,13 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'core'))
 
-from core.formatter_v4 import format_sql_v4
+from formatter_v4_fixed import format_sql_v4_fixed
 
 def test_format_preserves_field_comments():
     """Test that formatter v4 preserves field-level comments"""
     sql = "SELECT id -- primary key\nFROM table1"
 
-    result = format_sql_v4(sql)
+    result = format_sql_v4_fixed(sql)
 
     assert "-- primary key" in result
     assert "SELECT id" in result
@@ -18,7 +18,7 @@ def test_format_preserves_table_comments():
     """Test that formatter v4 preserves table-level comments"""
     sql = "SELECT id\nFROM table1 -- main table"
 
-    result = format_sql_v4(sql)
+    result = format_sql_v4_fixed(sql)
 
     assert "-- main table" in result
 
@@ -30,7 +30,7 @@ def test_format_preserves_case_comments():
     ELSE 'B'
 END"""
 
-    result = format_sql_v4(sql)
+    result = format_sql_v4_fixed(sql)
 
     assert "-- condition A" in result
 
@@ -49,7 +49,7 @@ FROM users -- user table
 WHERE users.active = 1 -- only active users
 ;"""
 
-    result = format_sql_v4(sql)
+    result = format_sql_v4_fixed(sql)
 
     # All comments should be preserved
     assert "-- primary key" in result
@@ -64,7 +64,7 @@ def test_format_block_comments():
     """Test preserving block comments"""
     sql = "SELECT id /* primary key */, name FROM users"
 
-    result = format_sql_v4(sql)
+    result = format_sql_v4_fixed(sql)
 
     assert "/* primary key */" in result
 
@@ -77,7 +77,7 @@ SELECT id, name
 FROM users
 WHERE active = 1"""
 
-    result = format_sql_v4(sql)
+    result = format_sql_v4_fixed(sql)
 
     assert "-- This is a header comment" in result
     assert "-- Filter active users" in result

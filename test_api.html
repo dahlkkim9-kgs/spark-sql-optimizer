@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test API</title></head>
+<body>
+<h2>Direct API Test</h2>
+<textarea id="input" rows="5" cols="100">SELECT CASE WHEN NVL(xd.YYED,0)-0<0 OR (NVL(xd.YYED,0)-0>NVL(xd.SXED,0)-0) THEN b.dkye END FROM test;</textarea>
+<button onclick="testAPI()">Test API</button>
+<pre id="output"></pre>
+<script>
+async function testAPI() {
+    const sql = document.getElementById('input').value;
+    const res = await fetch('http://localhost:8888/format/v4fixed', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({sql})
+    });
+    const data = await res.json();
+    document.getElementById('output').textContent = data.formatted;
+    console.log('Success:', data.success);
+    console.log('Formatted:', data.formatted);
+}
+</script>
+</body>
+</html>

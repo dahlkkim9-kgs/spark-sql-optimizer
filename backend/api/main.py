@@ -181,11 +181,56 @@ def format_sql(request: FormatRequest):
 
 @app.post("/format/v4")
 async def format_sql_v4_endpoint(request: FormatRequest):
-    """Format SQL with comment preservation"""
+    """Format SQL with comment preservation and multi-statement support"""
     try:
-        result = format_sql_v4(request.sql)
+        from core.formatter_v4 import _split_by_semicolon
+
+        # 按分号分割SQL语句（保留括号和字符串）
+        statements = _split_by_semicolon(request.sql)
+
+        # 格式化每个语句
+        formatted_statements = []
+        for stmt in statements:
+            stmt = stmt.strip()
+            if stmt:  # 忽略空语句
+                formatted = format_sql_v4(stmt)
+                formatted_statements.append(formatted)
+
+        # 合并所有格式化结果，用空行分隔
+        result = '\n\n'.join(formatted_statements)
         return {"formatted": result, "success": True}
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "success": False}
+
+
+@app.post("/format/v4fixed")
+async def format_sql_v4fixed_endpoint(request: FormatRequest):
+    """Format SQL with v4_fixed - 修复注释中分号导致内容丢失的问题"""
+    try:
+        import re
+        import sys
+
+        # 强制重新加载模块
+        for mod in list(sys.modules.keys()):
+            if 'formatter' in mod:
+                del sys.modules[mod]
+
+        from core.formatter_v4_fixed import format_sql_v4_fixed
+
+        # 使用 v4_fixed 版本格式化
+        result = format_sql_v4_fixed(request.sql, keyword_case=request.keyword_case)
+
+        # 后处理已移除 - formatter_v4_fixed 内部已正确处理 FROM 换行
+        # 之前的后处理逻辑存在 bug，会导致 FROM 和表名连接在一起
+        # 问题：parts[1] 包含了 FROM 前的缩进空格，但代码只保留了 FROM 关键字
+        # 修复：依赖 formatter_v4_fixed 内部的 _protect_from_newline 和 _restore_from_newline
+
+        return {"formatted": result, "success": True}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {"error": str(e), "success": False}
 
 
