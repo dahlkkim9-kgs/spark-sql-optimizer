@@ -376,6 +376,11 @@ def _normalize_select_fields(sql: str) -> str:
     """
     import re
 
+    # 跳过 WITH AS 和 CACHE TABLE 语句，避免破坏结构
+    sql_upper = sql.strip().upper()
+    if sql_upper.startswith('WITH') or sql_upper.startswith('CACHE TABLE'):
+        return sql
+
     # ============ 新增：跳过 CACHE TABLE/WITH 子查询的 normalize ============
     # 检测并保护 CACHE TABLE ... AS (SELECT ...) 和 WITH ... AS (SELECT ...) 中的子查询
     # 避免破坏这些子查询的结构，导致后续正则无法匹配
@@ -1404,11 +1409,79 @@ def _format_merge_statement(sql: str) -> str:
     return sql
 
 
+def _parse_cte_definitions(cte_part: str) -> list[tuple[str, str]]:
+    """
+    解析 CTE 定义部分
+
+    Args:
+        cte_part: "WITH" 之后，主查询之前的内容（如 "A AS (...), B AS (...)"）
+
+    Returns:
+        [(cte_name, subquery_sql), ...]
+    """
+    ctes = []
+    rest = cte_part.strip()
+
+    # 去掉开头的 "WITH"
+    if rest.upper().startswith('WITH'):
+        rest = rest[4:].strip()
+
+    depth = 0
+    current = ''
+    i = 0
+
+    while i < len(rest):
+        char = rest[i]
+
+        if char == '(':
+            if depth == 0:
+                # 找到 CTE 名称和 AS 之前的部分
+                current = current.strip()
+                if current:
+                    # 提取 CTE 名称（格式如 "A AS"）
+                    parts = current.split()
+                    if len(parts) >= 2 and parts[1].upper() == 'AS':
+                        cte_name = parts[0]
+                        current = cte_name
+                current += char
+                depth += 1
+            else:
+                current += char
+                depth += 1
+        elif char == ')':
+            current += char
+            depth -= 1
+            if depth == 0:
+                # CTE 定义结束
+                # 格式: "cte_name AS (subquery)"
+                match = re.match(r'(\w+)\s+AS\s*\((.*)\)', current, re.IGNORECASE | re.DOTALL)
+                if match:
+                    cte_name = match.group(1)
+                    subquery = match.group(2).strip()
+                    ctes.append((cte_name, subquery))
+                current = ''
+        elif depth == 0 and char == ',':
+            # 逗号分隔多个 CTE
+            current = ''
+        else:
+            current += char
+
+        i += 1
+
+    # 处理最后一个
+    if current.strip():
+        match = re.match(r'(\w+)\s+AS\s*\((.*)\)', current, re.IGNORECASE | re.DOTALL)
+        if match:
+            cte_name = match.group(1)
+            subquery = match.group(2).strip()
+            ctes.append((cte_name, subquery))
+
+    return ctes
+
+
 def _format_with_statement(sql: str) -> str:
     """格式化 WITH ... AS ... SELECT 语句 (CTE)"""
-    # WITH cte1 AS (SELECT ...), cte2 AS (SELECT ...) SELECT ...
 
-    # 去除 WITH 关键字后的内容
     upper_sql = sql.upper()
     if not upper_sql.startswith('WITH'):
         return _format_sql_structure(sql)
@@ -1416,6 +1489,8 @@ def _format_with_statement(sql: str) -> str:
     # 查找主 SELECT 的位置（不在括号内的）
     paren_count = 0
     main_select_pos = -1
+    in_string = False
+    string_char = None
 
     i = 0
     while i < len(sql):
@@ -1423,40 +1498,72 @@ def _format_with_statement(sql: str) -> str:
 
         # 处理字符串
         if char in ("'", '"') and (i == 0 or sql[i-1] != '\\'):
-            string_char = char
-            i += 1
-            while i < len(sql) and sql[i] != string_char:
-                i += 1
+            if not in_string:
+                in_string = True
+                string_char = char
+            elif char == string_char:
+                in_string = False
 
-        if char == '(':
-            paren_count += 1
-        elif char == ')':
-            paren_count -= 1
+        if not in_string:
+            if char == '(':
+                paren_count += 1
+            elif char == ')':
+                paren_count -= 1
 
-        # 查找 SELECT 关键字
-        if sql[i:i+6].upper() == 'SELECT' and (i + 6 >= len(sql) or not sql[i+6].isalnum()):
-            if paren_count == 0:
-                # 不在括号内的 SELECT，这是主查询
-                main_select_pos = i
-                break
+            # 查找 SELECT 关键字
+            if sql[i:i+6].upper() == 'SELECT' and (i + 6 >= len(sql) or not sql[i+6].isalnum()):
+                if paren_count == 0:
+                    main_select_pos = i
+                    break
         i += 1
 
     if main_select_pos == -1:
         # 没有找到主 SELECT，只有 CTE 定义
-        # 格式化每个 CTE 中的内容
         return _format_cte_only(sql)
 
     # 分离 CTE 部分和主查询
     cte_part = sql[:main_select_pos].strip()
     main_query = sql[main_select_pos:].strip()
 
+    # 解析 CTE 定义
+    ctes = _parse_cte_definitions(cte_part)
+
+    # 格式化每个 CTE
+    formatted_ctes = []
+    for idx, (cte_name, subquery) in enumerate(ctes):
+        # 格式化子查询
+        formatted_subquery = _format_sql_structure(subquery, keyword_case='upper', indent_level=0)
+
+        # 计算缩进
+        # 第一个 CTE: "WITH cte_name AS ("
+        # 后续 CTE: ",\ncte_name AS ("
+        if idx == 0:
+            header = f"WITH {cte_name} AS ("
+            paren_pos = len(header)
+        else:
+            # 需要考虑换行符
+            header = f",\n{cte_name} AS ("
+            # 缩进到 CTE 名称位置（2 个空格 + 名称长度 + " AS ("）
+            paren_pos = 2 + len(cte_name) + 5
+
+        subquery_indent = ' ' * (paren_pos + 1)
+        close_paren_indent = ' ' * paren_pos
+
+        # 为每一行添加缩进
+        lines = []
+        for line in formatted_subquery.split('\n'):
+            if line.strip():
+                lines.append(subquery_indent + line)
+            else:
+                lines.append('')
+
+        formatted_cte = header + '\n' + '\n'.join(lines) + f'\n{close_paren_indent})'
+        formatted_ctes.append(formatted_cte)
+
     # 格式化主查询
     main_formatted = _format_sql_structure(main_query)
 
-    # 格式化 CTE 部分
-    cte_formatted = _format_cte_definitions(cte_part)
-
-    return cte_formatted + '\n' + main_formatted
+    return '\n'.join(formatted_ctes) + '\n' + main_formatted
 
 
 def _format_cte_only(sql: str) -> str:
@@ -1523,69 +1630,6 @@ def _format_cte_only(sql: str) -> str:
             result += ',\n'
     if had_semicolon:
         result += ';'
-    return result
-
-
-def _format_cte_definitions(cte_sql: str) -> str:
-    """格式化 CTE 定义部分（WITH AS 语句中的 CTE 部分）"""
-    # WITH cte_name AS (subquery), cte_name2 AS (subquery)
-
-    # 去掉 WITH 关键字
-    if cte_sql.upper().startswith('WITH'):
-        rest = cte_sql[4:].strip()
-    else:
-        rest = cte_sql
-
-    # 按逗号分割 CTE 定义（需要考虑括号）
-    ctes = []
-    current = ''
-    depth = 0
-
-    for char in rest:
-        if char == '(':
-            depth += 1
-            current += char
-        elif char == ')':
-            depth -= 1
-            current += char
-            if depth == 0:
-                # CTE 定义结束
-                ctes.append(current.strip())
-                current = ''
-        elif depth == 0 and char == ',':
-            # 逗号分隔多个 CTE
-            if current.strip():
-                ctes.append(current.strip())
-            current = ''
-        else:
-            current += char
-
-    if current.strip():
-        ctes.append(current.strip())
-
-    # 格式化每个 CTE
-    formatted_ctes = []
-    for i, cte in enumerate(ctes):
-        # cte 格式：cte_name AS (content)
-        match = re.match(r'(\w+)\s+AS\s+\((.*)\)', cte, re.IGNORECASE | re.DOTALL)
-        if match:
-            cte_name = match.group(1)
-            content = match.group(2).strip()
-            # 如果内容包含 SELECT，递归格式化（增加缩进级别）
-            if 'SELECT' in content.upper():
-                content_formatted = _format_sql_structure(content, keyword_case='upper', indent_level=1)
-                formatted_ctes.append(f'{cte_name} AS (\n{content_formatted}\n)')
-            else:
-                formatted_ctes.append(f'{cte_name} AS ({content})')
-        else:
-            formatted_ctes.append(cte)
-
-    # 连接 CTE，每个 CTE（除了最后一个）后面加逗号
-    result = 'WITH '
-    for i, cte in enumerate(formatted_ctes):
-        result += cte
-        if i < len(formatted_ctes) - 1:
-            result += ',\n'
     return result
 
 

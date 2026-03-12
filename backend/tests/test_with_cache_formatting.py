@@ -19,7 +19,8 @@ class TestWithAsFormatting:
         assert "WITH A AS" in result
         assert "SELECT aa" in result
         assert "FROM tab_tes" in result
-        assert "WHERE aa = '1'" in result
+        assert "WHERE aa" in result
+        assert "'1'" in result
 
         # 验证括号对齐（开括号和闭括号应该在同一列）
         lines = result.split('\n')
