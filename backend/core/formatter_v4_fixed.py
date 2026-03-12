@@ -1640,12 +1640,17 @@ def _format_cache_table(sql: str) -> str:
         return sql
 
     # 有括号格式：使用括号计数解析器
+    # 找到开括号的实际位置
+    open_paren_pos = sql.find('(', paren_pos + 4)
+    if open_paren_pos == -1:
+        return sql
+
     try:
-        subquery, end_pos = extract_balanced_paren_content(sql, paren_pos + 5)  # +4 for " AS ", +1 for "("
+        subquery, end_pos = extract_balanced_paren_content(sql, open_paren_pos)
     except ValueError:
         return sql
 
-    header = sql[:paren_pos + 5]  # "CACHE TABLE table_name AS ("
+    header = sql[:open_paren_pos + 1]  # "CACHE TABLE table_name AS ("
     table_name = sql[12:paren_pos].strip()  # 提取表名（在 "CACHE TABLE " 和 " AS " 之间）
 
     # 计算开括号位置（用于缩进）
