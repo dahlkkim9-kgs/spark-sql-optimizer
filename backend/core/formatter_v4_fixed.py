@@ -311,6 +311,7 @@ def _normalize_select_fields(sql: str) -> str:
     处理：
     1. 隐式别名（没有 AS 的别名）-> 添加 AS
     2. 紧贴的注释 -> 添加空格分隔
+    3. 跳过 CACHE TABLE ... AS 和 WITH ... AS 后面的子查询
 
     Args:
         sql: 注释保护后的 SQL
@@ -318,8 +319,74 @@ def _normalize_select_fields(sql: str) -> str:
     Returns:
         修复后的 SQL
     """
-    # 找到所有 SELECT ... FROM 结构并修复字段格式
     import re
+
+    # ============ 新增：跳过 CACHE TABLE/WITH 子查询的 normalize ============
+    # 检测并保护 CACHE TABLE ... AS (SELECT ...) 和 WITH ... AS (SELECT ...) 中的子查询
+    # 避免破坏这些子查询的结构，导致后续正则无法匹配
+
+    def protect_special_subqueries(sql_text):
+        """保护 CACHE TABLE 和 WITH 语句中的子查询，避免被 normalize 破坏"""
+        protected = sql_text
+        subquery_map = {}
+        counter = [0]
+
+        def protect_subquery(match):
+            """保护一个子查询"""
+            placeholder = f"__PROTECTED_SUBQUERY_{counter[0]}__"
+            counter[0] += 1
+            subquery_map[placeholder] = match.group(0)
+            return placeholder
+
+        # 保护 CACHE TABLE ... AS (SELECT ...)
+        # 只有在 SQL 中包含 CACHE TABLE 时才执行
+        if re.search(r'\bCACHE\s+TABLE\b', protected, re.IGNORECASE):
+            protected = re.sub(
+                r'(CACHE\s+TABLE\s+\S+\s+AS\s*\()([^)]+(?:\([^)]*\))*\))',
+                lambda m: m.group(1) + protect_subquery(m) if m.group(1) else m.group(0),
+                protected,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
+        # 保护 WITH ... AS (SELECT ...)
+        # 只有在 SQL 中包含 WITH 时才执行
+        if re.search(r'\bWITH\b', protected, re.IGNORECASE):
+            # 定义 protect_with_ctes 辅助函数（内部函数，可以访问 subquery_map）
+            def protect_with_ctes_repl(match):
+                """WITH 子句的替换函数 - 返回处理后的字符串"""
+                with_clause = match.group(0)
+                # 对 WITH 子句中的每个 CTE 进行保护
+                cte_counter = [0]
+
+                def protect_cte_subquery(cte_match):
+                    """保护单个 CTE 中的子查询"""
+                    placeholder = f"__PROTECTED_SUBQUERY_{counter[0]}__"
+                    counter[0] += 1
+                    subquery_map[placeholder] = cte_match.group(2)
+                    return cte_match.group(1) + placeholder + cte_match.group(3)
+
+                # 匹配 cte_name AS (subquery) 模式
+                result = re.sub(
+                    r'(\w+\s+AS\s*\()([^)]+(?:\([^)]*\))*\))',
+                    protect_cte_subquery,
+                    with_clause,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                return result
+
+            protected = re.sub(
+                r'(WITH\s+(?:\w+\s+AS\s*\([^)]+(?:\([^)]*\))*\)\s*,?\s*)+',
+                protect_with_ctes_repl,
+                protected,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+
+        return protected, subquery_map
+
+    # 保护特殊子查询
+    sql_protected, protected_map = protect_special_subqueries(sql)
+
+    # ============ 原有的 normalize 逻辑 ============
 
     def normalize_fields_in_select(match):
         """修复单个 SELECT 语句中的字段格式"""
@@ -438,12 +505,19 @@ def _normalize_select_fields(sql: str) -> str:
 
         return result
 
-    return re.sub(
+    # 使用保护的 SQL 进行 normalize
+    normalized = re.sub(
         r'\bSELECT\b([\s\S]+?)(\bFROM\b)([\s\S]+?)(?=;|\Z)',
         normalize_fields_in_select,
-        sql,
+        sql_protected,
         flags=re.IGNORECASE
     )
+
+    # 恢复保护的子查询
+    for placeholder, original in protected_map.items():
+        normalized = normalized.replace(placeholder, original)
+
+    return normalized
 
 
 def _normalize_single_field(field: str) -> str:
@@ -625,6 +699,9 @@ def format_sql_v4_fixed(sql: str, **options) -> str:
     # Step 6: Restore comments from placeholders
     result = _restore_protected_comments(result, comment_map)
 
+    # Step 6.5: 对齐独立注释行（与上一行代码对齐）
+    result = _align_standalone_comments(result)
+
     # Step 7: Clean up empty lines within SQL statements (keep only one empty line between statements)
     result = _cleanup_empty_lines(result)
 
@@ -653,6 +730,47 @@ def _cleanup_empty_lines(sql: str) -> str:
             result_lines.append('')
 
     return '\n'.join(result_lines)
+
+
+def _align_standalone_comments(sql: str) -> str:
+    """
+    对齐独立注释行：将注释缩进与上一行代码对齐
+
+    规则：
+    1. 识别独立注释行（以 -- 开头，前面是换行符或行首）
+    2. 查找上一行非空代码行的缩进
+    3. 将注释行缩进调整为相同值
+
+    适用场景：
+    - CASE WHEN 中的独立注释
+    - WHERE 子句中的独立注释
+    - JOIN 子句中的独立注释
+    - SELECT 字段列表中的独立注释
+    """
+    lines = sql.split('\n')
+    result = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # 检查是否是独立注释行（以 -- 开头）
+        if stripped.startswith('--'):
+            # 查找上一行非空代码行的缩进
+            indent = 0
+            for j in range(i - 1, -1, -1):
+                if j >= 0:
+                    prev_line = lines[j]
+                    # 跳过空行和其他注释行
+                    if prev_line.strip() and not prev_line.strip().startswith('--'):
+                        indent = len(prev_line) - len(prev_line.lstrip())
+                        break
+
+            # 应用缩进
+            result.append(' ' * indent + stripped)
+        else:
+            result.append(line)
+
+    return '\n'.join(result)
 
 
 def _split_by_semicolon(sql: str) -> List[str]:
@@ -1329,9 +1447,9 @@ def _format_cte_only(sql: str) -> str:
         if match:
             cte_name = match.group(1)
             content = match.group(2).strip()
-            # 如果内容包含 SELECT，递归格式化
+            # 如果内容包含 SELECT，递归格式化（增加缩进级别）
             if 'SELECT' in content.upper():
-                content_formatted = _format_sql_structure(content)
+                content_formatted = _format_sql_structure(content, keyword_case='upper', indent_level=1)
                 formatted_ctes.append(f'{cte_name} AS (\n{content_formatted}\n)')
             else:
                 formatted_ctes.append(f'{cte_name} AS ({content})')
@@ -1394,9 +1512,9 @@ def _format_cte_definitions(cte_sql: str) -> str:
         if match:
             cte_name = match.group(1)
             content = match.group(2).strip()
-            # 如果内容包含 SELECT，递归格式化
+            # 如果内容包含 SELECT，递归格式化（增加缩进级别）
             if 'SELECT' in content.upper():
-                content_formatted = _format_sql_structure(content)
+                content_formatted = _format_sql_structure(content, keyword_case='upper', indent_level=1)
                 formatted_ctes.append(f'{cte_name} AS (\n{content_formatted}\n)')
             else:
                 formatted_ctes.append(f'{cte_name} AS ({content})')
@@ -1431,9 +1549,9 @@ def _format_cache_table(sql: str) -> str:
         select_part = rest_part
         has_parens = False
 
-    # 如果包含 SELECT，递归格式化
+    # 如果包含 SELECT，递归格式化（增加缩进级别）
     if 'SELECT' in select_part.upper():
-        select_formatted = _format_sql_structure(select_part)
+        select_formatted = _format_sql_structure(select_part, keyword_case='upper', indent_level=1)
         if has_parens:
             return f"{cache_header} AS (\n{select_formatted}\n)"
         else:
