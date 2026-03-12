@@ -395,46 +395,50 @@ def _normalize_select_fields(sql: str) -> str:
 
         # 保护 CACHE TABLE ... AS (SELECT ...)
         # 只有在 SQL 中包含 CACHE TABLE 时才执行
-        if re.search(r'\bCACHE\s+TABLE\b', protected, re.IGNORECASE):
-            protected = re.sub(
-                r'(CACHE\s+TABLE\s+\S+\s+AS\s*\()([^)]+(?:\([^)]*\))*\))',
-                lambda m: m.group(1) + protect_subquery(m) if m.group(1) else m.group(0),
-                protected,
-                flags=re.IGNORECASE | re.DOTALL
-            )
+        # 注释掉：正则表达式在 Python 3.14 中有语法错误
+        # 现在使用括号计数解析器在各个格式化函数中处理
+        # if re.search(r'\bCACHE\s+TABLE\b', protected, re.IGNORECASE):
+        #     protected = re.sub(
+        #         r'(CACHE\s+TABLE\s+\S+\s+AS\s*\()([^)]+(?:\([^)]*\))*\))',
+        #         lambda m: m.group(1) + protect_subquery(m) if m.group(1) else m.group(0),
+        #         protected,
+        #         flags=re.IGNORECASE | re.DOTALL
+        #     )
 
         # 保护 WITH ... AS (SELECT ...)
         # 只有在 SQL 中包含 WITH 时才执行
-        if re.search(r'\bWITH\b', protected, re.IGNORECASE):
-            # 定义 protect_with_ctes 辅助函数（内部函数，可以访问 subquery_map）
-            def protect_with_ctes_repl(match):
-                """WITH 子句的替换函数 - 返回处理后的字符串"""
-                with_clause = match.group(0)
-                # 对 WITH 子句中的每个 CTE 进行保护
-                cte_counter = [0]
-
-                def protect_cte_subquery(cte_match):
-                    """保护单个 CTE 中的子查询"""
-                    placeholder = f"__PROTECTED_SUBQUERY_{counter[0]}__"
-                    counter[0] += 1
-                    subquery_map[placeholder] = cte_match.group(2)
-                    return cte_match.group(1) + placeholder + cte_match.group(3)
-
-                # 匹配 cte_name AS (subquery) 模式
-                result = re.sub(
-                    r'(\w+\s+AS\s*\()([^)]+(?:\([^)]*\))*\))',
-                    protect_cte_subquery,
-                    with_clause,
-                    flags=re.IGNORECASE | re.DOTALL
-                )
-                return result
-
-            protected = re.sub(
-                r'(WITH\s+(?:\w+\s+AS\s*\([^)]+(?:\([^)]*\))*\)\s*,?\s*)+',
-                protect_with_ctes_repl,
-                protected,
-                flags=re.IGNORECASE | re.DOTALL
-            )
+        # 注释掉：正则表达式在 Python 3.14 中有语法错误
+        # 现在使用括号计数解析器在各个格式化函数中处理
+        # if re.search(r'\bWITH\b', protected, re.IGNORECASE):
+        #     # 定义 protect_with_ctes 辅助函数（内部函数，可以访问 subquery_map）
+        #     def protect_with_ctes_repl(match):
+        #         """WITH 子句的替换函数 - 返回处理后的字符串"""
+        #         with_clause = match.group(0)
+        #         # 对 WITH 子句中的每个 CTE 进行保护
+        #         cte_counter = [0]
+        #
+        #         def protect_cte_subquery(cte_match):
+        #             """保护单个 CTE 中的子查询"""
+        #             placeholder = f"__PROTECTED_SUBQUERY_{counter[0]}__"
+        #             counter[0] += 1
+        #             subquery_map[placeholder] = cte_match.group(2)
+        #             return cte_match.group(1) + placeholder + cte_match.group(3)
+        #
+        #         # 匹配 cte_name AS (subquery) 模式
+        #         result = re.sub(
+        #             r'(\w+\s+AS\s*\()([^)]+(?:\([^)]*\))*\))',
+        #             protect_cte_subquery,
+        #             with_clause,
+        #             flags=re.IGNORECASE | re.DOTALL
+        #         )
+        #         return result
+        #
+        #     protected = re.sub(
+        #         r'(WITH\s+(?:\w+\s+AS\s*\([^)]+(?:\([^)]*\))*\)\s*,?\s*)+',
+        #         protect_with_ctes_repl,
+        #         protected,
+        #         flags=re.IGNORECASE | re.DOTALL
+        #     )
 
         return protected, subquery_map
 

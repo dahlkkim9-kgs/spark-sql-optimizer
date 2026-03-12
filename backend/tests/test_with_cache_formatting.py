@@ -12,7 +12,36 @@ class TestWithAsFormatting:
 
     def test_simple_with_as(self):
         """测试简单 WITH AS"""
-        pass
+        sql = "WITH A AS (select aa,bb,cc from tab_tes where aa='1')"
+        result = format_sql_v4_fixed(sql)
+
+        # 验证基本结构
+        assert "WITH A AS" in result
+        assert "SELECT aa" in result
+        assert "FROM tab_tes" in result
+        assert "WHERE aa = '1'" in result
+
+        # 验证括号对齐（开括号和闭括号应该在同一列）
+        lines = result.split('\n')
+        open_paren_line = None
+        close_paren_line = None
+
+        for i, line in enumerate(lines):
+            if '(' in line:
+                open_paren_line = (i, line.index('('))
+            if line.strip() == ')' or line.rstrip().endswith(')'):
+                # 找到闭括号位置
+                stripped = line.rstrip()
+                close_paren_pos = len(line) - len(stripped) + stripped.rfind(')')
+                close_paren_line = (i, close_paren_pos)
+                break
+
+        assert open_paren_line is not None, "找不到开括号"
+        assert close_paren_line is not None, "找不到闭括号"
+
+        # 验证缩进对齐
+        assert open_paren_line[1] == close_paren_line[1], \
+            f"开括号在第 {open_paren_line[1]} 列，闭括号在第 {close_paren_line[1]} 列，应该对齐"
 
     def test_complex_with_as_with_parens(self):
         """测试包含嵌套括号的 WITH AS"""
