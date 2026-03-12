@@ -383,6 +383,13 @@ def _normalize_select_fields(sql: str) -> str:
     sql_without_comments = COMMENT_PREFIX_PATTERN.sub('', sql).strip()
     sql_upper_without_comments = sql_without_comments.upper()
 
+    # 检查是否包含分号（多语句）
+    # 如果有多个分号，说明这是多语句，不应该 normalize
+    semicolon_count = sql.count(';')
+    if semicolon_count > 1:
+        # 多语句：直接返回原 SQL，避免破坏结构
+        return sql
+
     if sql_upper_without_comments.startswith('WITH') or sql_upper_without_comments.startswith('CACHE TABLE'):
         return sql
 
