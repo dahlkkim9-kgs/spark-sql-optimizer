@@ -29,12 +29,24 @@ const LineNumberEditor = forwardRef<LineNumberEditorRef, { value: string; onChan
   ({ value, onChange, readOnly = false }, ref) => {
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const linesRef = useRef<HTMLDivElement>(null);
+    const editorContainerRef = useRef<HTMLDivElement>(null);
     const [lineCount, setLineCount] = useState(1);
+    const [highlightLine, setHighlightLine] = useState<number | null>(null);
+    const highlightTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
     useEffect(() => {
       const count = value.split('\n').length;
       setLineCount(count);
     }, [value]);
+
+    // 清理高亮定时器
+    useEffect(() => {
+      return () => {
+        if (highlightTimeoutRef.current) {
+          clearTimeout(highlightTimeoutRef.current);
+        }
+      };
+    }, []);
 
     const handleScroll = () => {
       if (textareaRef.current && linesRef.current) {
@@ -45,28 +57,47 @@ const LineNumberEditor = forwardRef<LineNumberEditorRef, { value: string; onChan
     // 暴露scrollToLine方法给父组件
     useImperativeHandle(ref, () => ({
       scrollToLine: (lineNumber: number) => {
-        if (textareaRef.current) {
-          const lines = value.split('\n');
-          const targetLine = Math.max(1, Math.min(lineNumber, lines.length));
-          const lineHeight = 21; // 与CSS中的lineHeight * fontSize一致
-          const padding = 15; // 与CSS中的padding一致
-          const scrollTop = (targetLine - 1) * lineHeight;
+        if (!textareaRef.current) return;
 
-          textareaRef.current.scrollTop = scrollTop;
-          // 添加高亮效果
-          const highlightId = `line-highlight-${Date.now()}`;
-          const existingHighlight = textareaRef.current.parentElement?.querySelector('.line-highlight');
-          if (existingHighlight) {
-            existingHighlight.remove();
-          }
+        // 清除之前的高亮定时器
+        if (highlightTimeoutRef.current) {
+          clearTimeout(highlightTimeoutRef.current);
         }
+
+        // 计算目标行号（边界检查）
+        const lines = value.split('\n');
+        const targetLine = Math.max(1, Math.min(lineNumber, lines.length));
+
+        // 计算居中位置
+        const lineHeight = 21; // 14px * 1.5，与 CSS 一致
+        const editorHeight = textareaRef.current.clientHeight;
+        const targetLineTop = (targetLine - 1) * lineHeight;
+        const scrollTop = Math.max(0, targetLineTop - editorHeight / 2 + lineHeight / 2);
+
+        textareaRef.current.scrollTop = scrollTop;
+
+        // 将编辑器容器滚动到视口中央
+        if (editorContainerRef.current) {
+          editorContainerRef.current.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center'
+          });
+        }
+
+        // 触发高亮效果
+        setHighlightLine(targetLine);
+
+        // 3 秒后清除高亮（动画持续10次×0.3秒=3秒）
+        highlightTimeoutRef.current = setTimeout(() => {
+          setHighlightLine(null);
+        }, 3000);
       }
     }));
 
     const lineNumbers = Array.from({ length: lineCount }, (_, i) => i + 1);
 
     return (
-      <div style={{ position: 'relative', display: 'flex', height: '100%' }}>
+      <div ref={editorContainerRef} style={{ position: 'relative', display: 'flex', height: '100%' }}>
         {/* 行号 */}
         <div
           ref={linesRef}
@@ -85,36 +116,59 @@ const LineNumberEditor = forwardRef<LineNumberEditorRef, { value: string; onChan
           }}
         >
           {lineNumbers.map((num) => (
-            <div key={num} style={{ height: '21px' }}>{num}</div>
+            <div
+              key={num}
+              className={num === highlightLine ? 'line-highlight' : ''}
+              style={{ height: '21px' }}
+            >
+              {num}
+            </div>
           ))}
         </div>
         {/* 文本编辑区 */}
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onScroll={handleScroll}
-          readOnly={readOnly}
-          style={{
-            flex: 1,
-            height: '100%',
-            minHeight: '400px',
-            fontFamily: 'Consolas, Monaco, "Courier New", monospace',
-            fontSize: '14px',
-            lineHeight: '1.5',
-            padding: '15px',
-            border: 'none',
-            resize: 'none',
-            backgroundColor: '#1e1e1e',
-            color: '#d4d4d4',
-            outline: 'none',
-            whiteSpace: 'pre',
-            overflowWrap: 'normal',
-            overflowX: 'auto',
-            overflowY: 'auto'
-          }}
-          spellCheck={false}
+        <div style={{ position: 'relative', flex: 1, height: '100%' }}>
+          {/* 代码高亮覆盖层 */}
+          {highlightLine !== null && (
+            <div
+              className="code-line-highlight"
+              style={{
+                position: 'absolute',
+                left: '15px',
+                right: '15px',
+                top: `${(highlightLine - 1) * 21 + 15}px`,
+                height: '21px',
+                pointerEvents: 'none',
+                zIndex: 10
+              }}
+            />
+          )}
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onScroll={handleScroll}
+            readOnly={readOnly}
+            style={{
+              width: '100%',
+              height: '100%',
+              minHeight: '400px',
+              fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+              fontSize: '14px',
+              lineHeight: '1.5',
+              padding: '15px',
+              border: 'none',
+              resize: 'none',
+              backgroundColor: '#1e1e1e',
+              color: '#d4d4d4',
+              outline: 'none',
+              whiteSpace: 'pre',
+              overflowWrap: 'normal',
+              overflowX: 'auto',
+              overflowY: 'auto'
+            }}
+            spellCheck={false}
         />
+        </div>
       </div>
     );
   }
