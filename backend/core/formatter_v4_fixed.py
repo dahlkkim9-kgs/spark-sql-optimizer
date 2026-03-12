@@ -1435,14 +1435,9 @@ def _parse_cte_definitions(cte_part: str) -> list[tuple[str, str]]:
 
         if char == '(':
             if depth == 0:
-                # 找到 CTE 名称和 AS 之前的部分
+                # 找到 CTE 名称和 AS 之前的部分，保留 "cte_name AS " 格式
                 current = current.strip()
-                if current:
-                    # 提取 CTE 名称（格式如 "A AS"）
-                    parts = current.split()
-                    if len(parts) >= 2 and parts[1].upper() == 'AS':
-                        cte_name = parts[0]
-                        current = cte_name
+                # 不需要修改 current，直接添加 (
                 current += char
                 depth += 1
             else:
@@ -1546,8 +1541,11 @@ def _format_with_statement(sql: str) -> str:
             # 缩进到 CTE 名称位置（2 个空格 + 名称长度 + " AS ("）
             paren_pos = 2 + len(cte_name) + 5
 
-        subquery_indent = ' ' * (paren_pos + 1)
-        close_paren_indent = ' ' * paren_pos
+        # paren_pos 是 header 的长度，开括号在 paren_pos - 1 位置
+        # SELECT 应该在开括号位置（paren_pos - 1）开始，不对齐到开括号后面
+        # 闭括号应该对齐到开括号位置
+        subquery_indent = ' ' * (paren_pos - 1)
+        close_paren_indent = ' ' * (paren_pos - 1)
 
         # 为每一行添加缩进
         lines = []
@@ -1569,7 +1567,6 @@ def _format_with_statement(sql: str) -> str:
 def _format_cte_only(sql: str) -> str:
     """格式化只有 CTE 定义的 WITH 语句（没有主查询）"""
     # WITH cte_name AS (subquery)
-    # 提取每个 CTE 并格式化其内容
 
     # 去掉 WITH 和末尾的分号
     rest = sql[4:].strip()  # 去掉 'WITH'
@@ -1578,58 +1575,44 @@ def _format_cte_only(sql: str) -> str:
         rest = rest[:-1].strip()
         had_semicolon = True
 
-    # 按逗号分割 CTE 定义（需要考虑括号）
-    ctes = []
-    current = ''
-    depth = 0
-
-    for char in rest:
-        if char == '(':
-            depth += 1
-            current += char
-        elif char == ')':
-            depth -= 1
-            current += char
-            if depth == 0:
-                # CTE 定义结束
-                ctes.append(current.strip())
-                current = ''
-        elif depth == 0 and char == ',':
-            # 逗号分隔多个 CTE
-            if current.strip():
-                ctes.append(current.strip())
-            current = ''
-        else:
-            current += char
-
-    if current.strip():
-        ctes.append(current.strip())
+    # 使用新的解析函数
+    ctes = _parse_cte_definitions("WITH " + rest)
 
     # 格式化每个 CTE
     formatted_ctes = []
-    for i, cte in enumerate(ctes):
-        # cte 格式：cte_name AS (content)
-        match = re.match(r'(\w+)\s+AS\s+\((.*)\)', cte, re.IGNORECASE | re.DOTALL)
-        if match:
-            cte_name = match.group(1)
-            content = match.group(2).strip()
-            # 如果内容包含 SELECT，递归格式化（增加缩进级别）
-            if 'SELECT' in content.upper():
-                content_formatted = _format_sql_structure(content, keyword_case='upper', indent_level=1)
-                formatted_ctes.append(f'{cte_name} AS (\n{content_formatted}\n)')
-            else:
-                formatted_ctes.append(f'{cte_name} AS ({content})')
-        else:
-            formatted_ctes.append(cte)
+    for idx, (cte_name, subquery) in enumerate(ctes):
+        # 格式化子查询
+        formatted_subquery = _format_sql_structure(subquery, keyword_case='upper', indent_level=0)
 
-    # 连接 CTE，每个 CTE（除了最后一个）后面加逗号
-    result = 'WITH '
-    for i, cte in enumerate(formatted_ctes):
-        result += cte
-        if i < len(formatted_ctes) - 1:
-            result += ',\n'
+        # 计算缩进
+        if idx == 0:
+            header = f"WITH {cte_name} AS ("
+            paren_pos = len(header)
+        else:
+            header = f",\n{cte_name} AS ("
+            paren_pos = 2 + len(cte_name) + 5
+
+        # paren_pos 是 header 的长度，开括号在 paren_pos - 1 位置
+        # SELECT 应该在开括号位置（paren_pos - 1）开始，不对齐到开括号后面
+        # 闭括号应该对齐到开括号位置
+        subquery_indent = ' ' * (paren_pos - 1)
+        close_paren_indent = ' ' * (paren_pos - 1)
+
+        # 为每一行添加缩进
+        lines = []
+        for line in formatted_subquery.split('\n'):
+            if line.strip():
+                lines.append(subquery_indent + line)
+            else:
+                lines.append('')
+
+        formatted_cte = header + '\n' + '\n'.join(lines) + f'\n{close_paren_indent})'
+        formatted_ctes.append(formatted_cte)
+
+    result = '\n'.join(formatted_ctes)
     if had_semicolon:
         result += ';'
+
     return result
 
 
