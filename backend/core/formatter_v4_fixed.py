@@ -3980,6 +3980,9 @@ def _format_join_clause(join: Dict) -> List[str]:
             after_subquery = content[subquery_end+1:].strip()
             subquery_formatted = _format_subquery(subquery_full)
 
+            # 给子查询内容添加 4 个空格缩进
+            subquery_indented = '\n'.join('    ' + line for line in subquery_formatted.split('\n'))
+
             trailing_comment_match = re.search(r'(__COMMENT_\d+__)\s*$', after_subquery)
             trailing_comment = ''
             after_subquery_clean = after_subquery
@@ -4000,7 +4003,7 @@ def _format_join_clause(join: Dict) -> List[str]:
             # JOIN 与 FROM 对齐（无缩进）
             lines.append(f'{join_type}')
             lines.append(f'    (')
-            lines.append(f'{subquery_formatted}')
+            lines.append(f'{subquery_indented}')
             lines.append(f'    ) {alias_part}')
             if on_condition:
                 lines.append(f'    ON {on_condition}')
@@ -4066,7 +4069,7 @@ def _format_on_condition(on_condition: str) -> List[str]:
 
 
 def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: int = 0) -> str:
-    """Format a subquery with proper indentation - V4 原有逻辑"""
+    """Format a subquery - 返回不带缩进的内容，由调用代码添加缩进"""
     parts = _parse_sql_parts(subquery, keyword_case, indent_level)
 
     lines = []
@@ -4074,10 +4077,10 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
     if parts['select']:
         select_lines = _format_select_clause(parts['select'])
         for sl in select_lines:
-            lines.append('            ' + sl)
+            lines.append(sl)  # 不添加缩进，由调用代码处理
 
     if parts['from']:
-        lines.append(f'            FROM {parts["from"]}')
+        lines.append(f'FROM {parts["from"]}')
 
     if parts['where']:
         where_conditions = _split_by_logical_op(parts['where'], 'AND')
@@ -4085,11 +4088,11 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
 
         or_parts = _split_by_logical_op(first_cond, 'OR')
         if len(or_parts) > 1:
-            lines.append(f'            WHERE {or_parts[0].strip()}')
+            lines.append(f'WHERE {or_parts[0].strip()}')
             for op in or_parts[1:]:
-                lines.append(f'                OR {op.strip()}')
+                lines.append(f'    OR {op.strip()}')
         else:
-            lines.append(f'            WHERE {first_cond}')
+            lines.append(f'WHERE {first_cond}')
 
         for cond in where_conditions[1:]:
             cond = cond.strip()
@@ -4097,19 +4100,19 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
                 inner = cond[1:-1].strip()
                 or_parts = _split_by_logical_op(inner, 'OR')
                 if len(or_parts) > 1:
-                    lines.append(f'                AND (')
-                    lines.append(f'                    {or_parts[0].strip()}')
+                    lines.append(f'    AND (')
+                    lines.append(f'        {or_parts[0].strip()}')
                     for op in or_parts[1:]:
-                        lines.append(f'                    OR {op.strip()}')
-                    lines.append(f'                )')
+                        lines.append(f'        OR {op.strip()}')
+                    lines.append(f'    )')
                     continue
             or_parts = _split_by_logical_op(cond, 'OR')
             if len(or_parts) > 1:
-                lines.append(f'                AND {or_parts[0].strip()}')
+                lines.append(f'    AND {or_parts[0].strip()}')
                 for op in or_parts[1:]:
-                    lines.append(f'                OR {op.strip()}')
+                    lines.append(f'    OR {op.strip()}')
             else:
-                lines.append(f'                AND {cond}')
+                lines.append(f'    AND {cond}')
 
     return '\n'.join(lines)
 
