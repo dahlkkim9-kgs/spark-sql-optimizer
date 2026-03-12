@@ -1591,32 +1591,56 @@ def _format_cte_definitions(cte_sql: str) -> str:
 
 def _format_cache_table(sql: str) -> str:
     """格式化 CACHE TABLE 语句"""
-    # CACHE TABLE xxx AS SELECT ... 或 CACHE TABLE xxx AS (SELECT ...)
-    # 匹配 CACHE TABLE table_name AS 后面的内容
-    match = CACHE_TABLE_PATTERN.match(sql)
-    if not match:
+    # CACHE TABLE table_name AS (subquery) 或 CACHE TABLE table_name AS subquery
+
+    # 检查是否有括号
+    paren_pos = sql.find(' AS ')
+    if paren_pos == -1:
         return sql
 
-    cache_header = match.group(1)
-    rest_part = match.group(2).strip()
+    # 查找 AS 之后的开括号
+    after_as = sql[paren_pos + 4:].strip()
+    if not after_as.startswith('('):
+        # 无括号格式：CACHE TABLE table_name AS SELECT ...
+        # 尝试直接格式化
+        if 'SELECT' in after_as.upper():
+            select_match = re.match(r'(SELECT\s+.*)', after_as, re.IGNORECASE | re.DOTALL)
+            if select_match:
+                header = sql[:paren_pos + 4]  # "CACHE TABLE table_name AS "
+                subquery = select_match.group(1)
+                formatted_subquery = _format_sql_structure(subquery, keyword_case='upper', indent_level=0)
+                return f"{header}\n{formatted_subquery}"
+        return sql
 
-    # 去除可能的括号
-    if rest_part.startswith('(') and rest_part.endswith(')'):
-        select_part = rest_part[1:-1].strip()
-        has_parens = True
-    else:
-        select_part = rest_part
-        has_parens = False
+    # 有括号格式：使用括号计数解析器
+    try:
+        subquery, end_pos = extract_balanced_paren_content(sql, paren_pos + 5)  # +4 for " AS ", +1 for "("
+    except ValueError:
+        return sql
 
-    # 如果包含 SELECT，递归格式化（增加缩进级别）
-    if 'SELECT' in select_part.upper():
-        select_formatted = _format_sql_structure(select_part, keyword_case='upper', indent_level=1)
-        if has_parens:
-            return f"{cache_header} AS (\n{select_formatted}\n)"
+    header = sql[:paren_pos + 5]  # "CACHE TABLE table_name AS ("
+    table_name = sql[12:paren_pos].strip()  # 提取表名（在 "CACHE TABLE " 和 " AS " 之间）
+
+    # 计算开括号位置（用于缩进）
+    # 格式: "CACHE TABLE table_name AS ("
+    paren_pos_in_header = len(header) - 1
+
+    # 格式化子查询内容
+    formatted_subquery = _format_sql_structure(subquery, keyword_case='upper', indent_level=0)
+
+    # 为每一行添加缩进（缩进到开括号位置 + 1）
+    subquery_indent = ' ' * (paren_pos_in_header + 1)
+    lines = []
+    for line in formatted_subquery.split('\n'):
+        if line.strip():
+            lines.append(subquery_indent + line)
         else:
-            return f"{cache_header} AS\n{select_formatted}"
+            lines.append('')
 
-    return sql
+    # 闭括号对齐到开括号位置
+    close_paren_indent = ' ' * paren_pos_in_header
+
+    return f"{header}\n" + '\n'.join(lines) + f"\n{close_paren_indent})"
 
 
 def _format_explain(sql: str) -> str:
