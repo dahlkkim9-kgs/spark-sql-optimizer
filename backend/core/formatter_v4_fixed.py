@@ -305,6 +305,61 @@ def _restore_multiline_in_lists(sql: str, in_list_map: Dict[str, str]) -> str:
     return result
 
 
+def extract_balanced_paren_content(sql: str, start_pos: int) -> tuple[str, int]:
+    """
+    从 start_pos 开始，提取匹配的括号内容
+
+    正确处理：
+    - 嵌套括号 (如 (SELECT * FROM (SELECT ...)))
+    - 字符串（单引号、双引号）
+    - 转义字符（如 \\'）
+
+    Args:
+        sql: 完整 SQL 语句
+        start_pos: 左括号 ( 的位置
+
+    Returns:
+        (括号内内容, 结束位置)
+        结束位置是右括号 ) 之后的位置
+
+    Raises:
+        ValueError: 如果括号不匹配
+    """
+    if sql[start_pos] != '(':
+        raise ValueError(f"start_pos {start_pos} 不是左括号位置")
+
+    depth = 1
+    i = start_pos + 1
+    in_string = False
+    string_char = None
+
+    while i < len(sql) and depth > 0:
+        ch = sql[i]
+
+        # 处理字符串
+        if ch in ("'", '"') and (i == 0 or sql[i-1] != '\\'):
+            if not in_string:
+                in_string = True
+                string_char = ch
+            elif ch == string_char:
+                in_string = False
+
+        # 只在非字符串中计数括号
+        if not in_string:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+
+        i += 1
+
+    if depth != 0:
+        raise ValueError(f"括号不匹配：从位置 {start_pos} 开始")
+
+    # 返回括号内内容（不包含外层括号）和结束位置
+    return sql[start_pos + 1:i - 1], i
+
+
 def _normalize_select_fields(sql: str) -> str:
     """预处理 SELECT 字段，修复不规范的格式
 
