@@ -377,8 +377,13 @@ def _normalize_select_fields(sql: str) -> str:
     import re
 
     # 跳过 WITH AS 和 CACHE TABLE 语句，避免破坏结构
-    sql_upper = sql.strip().upper()
-    if sql_upper.startswith('WITH') or sql_upper.startswith('CACHE TABLE'):
+    # 需要先移除注释占位符前缀来检查
+    import re
+    COMMENT_PREFIX_PATTERN = re.compile(r'^(?:__COMMENT_\d+__\s*\n?\s*)+', re.MULTILINE)
+    sql_without_comments = COMMENT_PREFIX_PATTERN.sub('', sql).strip()
+    sql_upper_without_comments = sql_without_comments.upper()
+
+    if sql_upper_without_comments.startswith('WITH') or sql_upper_without_comments.startswith('CACHE TABLE'):
         return sql
 
     # ============ 新增：跳过 CACHE TABLE/WITH 子查询的 normalize ============
