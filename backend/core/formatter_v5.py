@@ -25,8 +25,7 @@ from backend.core.parser.sql_classifier import SQLClassifier
 from backend.core.processors.set_operations import SetOperationsProcessor
 from backend.core.processors.window_functions import WindowFunctionsProcessor
 from backend.core.processors.data_operations import DataOperationsProcessor
-# Future processors (not yet implemented):
-# from backend.core.processors.advanced_transforms import AdvancedTransformsProcessor
+from backend.core.processors.advanced_transforms import AdvancedTransformsProcessor
 
 # Import fallback formatter for basic SELECT
 from backend.core.formatter_v4_fixed import format_sql_v4_fixed
@@ -101,9 +100,9 @@ def format_sql_v5(
         return processor.process(sql, keyword_case=keyword_case)
 
     elif 'advanced_transforms' in syntax_types:
-        # Future: AdvancedTransformsProcessor will handle PIVOT/UNPIVOT/LATERAL VIEW
-        # For now, fall back to v4_fixed
-        return format_sql_v4_fixed(sql, keyword_case=keyword_case)
+        # Handle PIVOT/UNPIVOT/LATERAL VIEW/CLUSTER BY/DISTRIBUTE BY
+        processor = AdvancedTransformsProcessor()
+        return processor.process(sql, keyword_case=keyword_case)
 
     else:
         # Basic SELECT statement - use formatter_v4_fixed
