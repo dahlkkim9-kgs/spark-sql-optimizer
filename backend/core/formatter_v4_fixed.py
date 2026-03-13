@@ -375,11 +375,11 @@ def _normalize_select_fields(sql: str) -> str:
     Returns:
         修复后的 SQL
     """
-    import re
+    # re already imported at top level
 
     # 跳过 WITH AS 和 CACHE TABLE 语句，避免破坏结构
     # 需要先移除注释占位符前缀来检查
-    import re
+    # re already imported at top level
     COMMENT_PREFIX_PATTERN = re.compile(r'^(?:__COMMENT_\d+__\s*\n?\s*)+', re.MULTILINE)
     sql_without_comments = COMMENT_PREFIX_PATTERN.sub('', sql).strip()
     sql_upper_without_comments = sql_without_comments.upper()
@@ -605,7 +605,7 @@ def _normalize_single_field(field: str) -> str:
     2. 紧贴的注释 -> 添加空格
     注意：保留字段内部的换行符（如 CONCAT 函数）
     """
-    import re
+    # re already imported at top level
 
     # 移除前导逗号（如果有）
     original_field = field
@@ -1361,18 +1361,14 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         else:
             lines.extend(where_lines)
 
-    # GROUP BY clause
+    # GROUP BY clause（不缩进）
     if parts['group_by']:
-        group_by_line = f'    GROUP BY {parts["group_by"]}'
-        if indent_level > 0:
-            group_by_line = f'{base_indent}    GROUP BY {parts["group_by"]}'
+        group_by_line = f'GROUP BY {parts["group_by"]}'
         lines.append('\n' + group_by_line)
 
-    # ORDER BY clause
+    # ORDER BY clause（不缩进）
     if parts['order_by']:
-        order_by_line = f'    ORDER BY {parts["order_by"]}'
-        if indent_level > 0:
-            order_by_line = f'{base_indent}    ORDER BY {parts["order_by"]}'
+        order_by_line = f'ORDER BY {parts["order_by"]}'
         lines.append('\n' + order_by_line)
 
     # DISTRIBUTE BY clause
@@ -1428,7 +1424,7 @@ def _format_merge_statement(sql: str) -> str:
     WHEN NOT MATCHED [AND condition] THEN
         INSERT (columns) VALUES (values)
     """
-    import re
+    # re already imported at top level
 
     # 移除前后空白
     sql = sql.strip()
@@ -2418,7 +2414,7 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                     # 如果有，说明这些占位符是在子查询内部被保护的，需要在这里恢复
                     # 因为子查询已经格式化完成，内部的 OVER 占位符应该被恢复
                     # 但如果占位符还在，说明恢复逻辑有问题，这里手动恢复
-                    import re
+                    # re already imported at top level
                     over_pattern = r'(__OVER_\d+__)'
                     over_placeholders = re.findall(over_pattern, formatted_subquery)
                     if over_placeholders:
@@ -3836,7 +3832,7 @@ def _split_parenthesized_conditions(condition: str, base_indent: int = 0) -> str
     - 闭合括号与开放括号对齐
     - 括号内内容相对缩进 4 空格
     """
-    import re
+    # re already imported at top level
 
     def find_matching_paren(s, start):
         """找到匹配的右括号"""
