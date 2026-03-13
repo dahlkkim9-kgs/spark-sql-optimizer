@@ -171,3 +171,80 @@ class TestDataOperationsProcessor:
 
         # 验证子查询存在
         assert 'SELECT' in result
+
+    def test_merge_with_string_literal(self):
+        """测试 ON 条件中包含字符串字面量"""
+        processor = DataOperationsProcessor()
+        sql = "MERGE INTO target USING src ON target.name = 'WHEN xyz' WHEN MATCHED THEN DELETE"
+        result = processor.process(sql)
+
+        # 验证字符串字面量被保留
+        assert "'WHEN xyz'" in result
+        # 验证 WHEN 关键字仍然存在
+        assert "WHEN MATCHED" in result
+        # 验证基本结构
+        assert "MERGE INTO" in result
+        assert "USING" in result
+        assert "ON" in result
+
+    def test_merge_with_double_quoted_string(self):
+        """测试 ON 条件中包含双引号字符串字面量"""
+        processor = DataOperationsProcessor()
+        sql = 'MERGE INTO target USING src ON target.name = "WHEN xyz" WHEN MATCHED THEN DELETE'
+        result = processor.process(sql)
+
+        # 验证字符串字面量被保留
+        assert '"WHEN xyz"' in result
+        # 验证 WHEN 关键字仍然存在
+        assert "WHEN MATCHED" in result
+
+    def test_merge_with_escaped_quote(self):
+        """测试 ON 条件中包含转义引号"""
+        processor = DataOperationsProcessor()
+        sql = r"MERGE INTO target USING src ON target.name = 'It\'s WHEN time' WHEN MATCHED THEN DELETE"
+        result = processor.process(sql)
+
+        # 验证字符串字面量被保留（转义字符可能被处理）
+        assert "WHEN MATCHED" in result
+        assert "MERGE INTO" in result
+
+    def test_merge_with_single_line_comment(self):
+        """测试 MERGE 语句包含单行注释"""
+        processor = DataOperationsProcessor()
+        sql = """MERGE INTO target
+-- This is a comment
+USING src ON t.id = src.id WHEN MATCHED THEN DELETE"""
+        result = processor.process(sql)
+
+        # 验证基本结构被保留
+        assert "MERGE INTO" in result
+        assert "USING" in result
+        assert "WHEN MATCHED" in result
+
+    def test_merge_with_multi_line_comment(self):
+        """测试 MERGE 语句包含多行注释"""
+        processor = DataOperationsProcessor()
+        sql = """MERGE INTO target
+/* This is a
+multi-line comment */
+USING src ON t.id = src.id WHEN MATCHED THEN DELETE"""
+        result = processor.process(sql)
+
+        # 验证基本结构被保留
+        assert "MERGE INTO" in result
+        assert "USING" in result
+        assert "WHEN MATCHED" in result
+
+    def test_merge_with_comment_in_when(self):
+        """测试 WHEN 子句中包含注释"""
+        processor = DataOperationsProcessor()
+        sql = """MERGE INTO target USING src ON t.id = src.id
+-- Update matched records
+WHEN MATCHED THEN UPDATE SET t.val = src.val"""
+        result = processor.process(sql)
+
+        # 验证基本结构被保留
+        assert "MERGE INTO" in result
+        assert "USING" in result
+        assert "WHEN MATCHED" in result
+        assert "UPDATE" in result

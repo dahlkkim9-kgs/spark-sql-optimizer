@@ -100,9 +100,12 @@ class DataOperationsProcessor(BaseProcessor):
         [ WHEN NOT MATCHED [ AND condition ] THEN
             INSERT ... ]
         """
+        # 临时移除注释以避免干扰解析
+        sql_without_comments, comments = self._remove_and_preserve_comments(sql)
+
         # 使用更健壮的方法解析 MERGE 语句
         # 按关键字分割
-        parts = self._split_merge_statement(sql)
+        parts = self._split_merge_statement(sql_without_comments)
 
         if not parts or 'target' not in parts:
             # 解析失败，返回原样
@@ -296,11 +299,121 @@ class DataOperationsProcessor(BaseProcessor):
         Returns:
             WHEN 关键字位置，如果未找到返回 -1
         """
-        # 使用正则表达式查找 WHEN 关键字（必须是单词边界）
-        when_match = re.search(r'\bWHEN\s+', sql, re.IGNORECASE)
-        if when_match:
-            return when_match.start()
+        # 使用新方法查找 WHEN 关键字，跳过字符串和注释
+        return self._find_keyword_outside_strings(sql, r'\bWHEN\s+')
+
+    def _find_keyword_outside_strings(self, sql: str, pattern: str) -> int:
+        """查找不在字符串字面量中的关键字位置
+
+        此方法跳过单引号和双引号内的内容，正确处理转义字符。
+        例如: "ON col = 'WHEN xyz'" 中的 WHEN 会被跳过。
+
+        Args:
+            sql: SQL 语句
+            pattern: 正则表达式模式（用于匹配关键字）
+
+        Returns:
+            关键字位置，如果未找到返回 -1
+        """
+        i = 0
+        in_single_quote = False
+        in_double_quote = False
+        n = len(sql)
+
+        # 编译正则表达式以提高性能
+        keyword_regex = re.compile(pattern, re.IGNORECASE)
+
+        while i < n:
+            char = sql[i]
+
+            # 处理转义字符
+            if char == '\\' and i + 1 < n:
+                # 跳过转义字符和下一个字符
+                i += 2
+                continue
+
+            # 处理字符串字面量
+            if char == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+                i += 1
+                continue
+            elif char == '"' and not in_single_quote:
+                in_double_quote = not in_double_quote
+                i += 1
+                continue
+
+            # 如果在字符串内，跳过
+            if in_single_quote or in_double_quote:
+                i += 1
+                continue
+
+            # 在字符串外，检查是否匹配关键字
+            remaining = sql[i:]
+            match = keyword_regex.search(remaining)
+            if match:
+                # 确保匹配的起始位置就是当前位置
+                if match.start() == 0:
+                    return i
+                # 匹配不在当前位置，逐个字符处理以正确识别字符串
+                # 不要跳过中间的字符
+
+            # 未找到匹配，继续下一个字符
+            i += 1
+
         return -1
+
+    def _remove_and_preserve_comments(self, sql: str) -> tuple:
+        """移除 SQL 注释并保存它们的位置，以便后续恢复
+
+        处理两种类型的注释:
+        1. 单行注释: -- comment
+        2. 多行注释: /* comment */
+
+        Args:
+            sql: SQL 语句
+
+        Returns:
+            (处理后的 SQL, 注释列表) 其中注释列表格式为:
+            [(position, comment_text), ...]
+        """
+        comments = []
+        result = []
+        i = 0
+        n = len(sql)
+
+        while i < n:
+            # 检查单行注释 (--)
+            if i + 1 < n and sql[i:i+2] == '--':
+                start = i
+                # 找到行尾
+                while i < n and sql[i] != '\n':
+                    i += 1
+                comment_text = sql[start:i]
+                comments.append((start, comment_text))
+                # 跳过换行符
+                if i < n and sql[i] == '\n':
+                    result.append('\n')
+                    i += 1
+                continue
+
+            # 检查多行注释 (/*)
+            if i + 1 < n and sql[i:i+2] == '/*':
+                start = i
+                i += 2
+                # 找到结束的 */
+                while i + 1 < n and sql[i:i+2] != '*/':
+                    i += 1
+                if i + 1 < n:
+                    i += 2  # 跳过 */
+                comment_text = sql[start:i]
+                comments.append((start, comment_text))
+                continue
+
+            # 普通字符，添加到结果
+            result.append(sql[i])
+            i += 1
+
+        return ''.join(result), comments
 
     def _normalize_merge_keywords(
         self,
