@@ -220,6 +220,8 @@ USING src ON t.id = src.id WHEN MATCHED THEN DELETE"""
         assert "MERGE INTO" in result
         assert "USING" in result
         assert "WHEN MATCHED" in result
+        # 验证注释被保留
+        assert "-- This is a comment" in result
 
     def test_merge_with_multi_line_comment(self):
         """测试 MERGE 语句包含多行注释"""
@@ -234,6 +236,10 @@ USING src ON t.id = src.id WHEN MATCHED THEN DELETE"""
         assert "MERGE INTO" in result
         assert "USING" in result
         assert "WHEN MATCHED" in result
+        # 验证注释被保留
+        assert "/*" in result
+        assert "*/" in result
+        assert "multi-line comment" in result
 
     def test_merge_with_comment_in_when(self):
         """测试 WHEN 子句中包含注释"""
@@ -248,3 +254,5 @@ WHEN MATCHED THEN UPDATE SET t.val = src.val"""
         assert "USING" in result
         assert "WHEN MATCHED" in result
         assert "UPDATE" in result
+        # 验证注释被保留
+        assert "-- Update matched records" in result

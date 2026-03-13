@@ -138,7 +138,12 @@ class DataOperationsProcessor(BaseProcessor):
             for action_line in when_clause['actions']:
                 lines.append('    ' + action_line.strip())
 
-        return '\n'.join(lines)
+        result = '\n'.join(lines)
+
+        # 恢复注释
+        result = self._restore_comments(result, comments, sql)
+
+        return result
 
     def _split_merge_statement(self, sql: str) -> dict:
         """分割 MERGE 语句为各个部分
@@ -415,6 +420,66 @@ class DataOperationsProcessor(BaseProcessor):
 
         return ''.join(result), comments
 
+    def _restore_comments(self, formatted_sql: str, comments: List[Tuple[int, str]], original_sql: str) -> str:
+        """将收集的注释恢复到格式化后的 SQL 中
+
+        策略:
+        1. 找到注释在原始 SQL 中的行号
+        2. 计算该行在格式化后 SQL 中的对应位置
+        3. 在对应位置插入注释
+
+        Args:
+            formatted_sql: 格式化后的 SQL
+            comments: 注释列表 [(position, comment_text), ...]
+            original_sql: 原始 SQL（用于确定注释的行位置）
+
+        Returns:
+            恢复注释后的 SQL
+        """
+        if not comments:
+            return formatted_sql
+
+        # 计算原始 SQL 中每行的起始位置
+        original_lines = original_sql.split('\n')
+        line_positions = []
+        pos = 0
+        line_positions.append(0)
+        for line in original_lines:
+            pos += len(line) + 1  # +1 for newline
+            line_positions.append(pos)
+
+        # 按注释位置找到所在行
+        comments_by_line = {}
+        for comment_pos, comment_text in comments:
+            # 二分查找找到注释所在的行
+            line_num = 0
+            for i in range(len(line_positions) - 1):
+                if line_positions[i] <= comment_pos < line_positions[i + 1]:
+                    line_num = i
+                    break
+
+            if line_num not in comments_by_line:
+                comments_by_line[line_num] = []
+            comments_by_line[line_num].append(comment_text)
+
+        # 简单策略：直接在格式化后的 SQL 末尾添加所有注释
+        # 更复杂的策略需要分析 SQL 结构
+        if comments_by_line:
+            # 将注释按行号排序
+            sorted_lines = sorted(comments_by_line.keys())
+
+            # 构建注释块
+            comment_blocks = []
+            for line_num in sorted_lines:
+                for comment_text in comments_by_line[line_num]:
+                    comment_blocks.append(comment_text)
+
+            # 在格式化后的 SQL 前添加注释
+            if comment_blocks:
+                return '\n'.join(comment_blocks) + '\n' + formatted_sql
+
+        return formatted_sql
+
     def _normalize_merge_keywords(
         self,
         part: str,
@@ -623,17 +688,23 @@ class DataOperationsProcessor(BaseProcessor):
         INSERT OVERWRITE [TABLE] table_name
         SELECT ...
         """
+        # 临时移除注释以避免干扰解析
+        sql_without_comments, comments = self._remove_and_preserve_comments(sql)
+
         # 匹配 INSERT OVERWRITE 到 SELECT
         match = re.search(
             r'(INSERT\s+OVERWRITE\s+(?:TABLE\s+)?\S+.*?)\s*(SELECT\s+.*)',
-            sql,
+            sql_without_comments,
             re.IGNORECASE | re.DOTALL
         )
 
         if not match:
             # 如果没有 SELECT，可能只有 INSERT OVERWRITE 部分
             # 直接返回标准化后的语句
-            return self._normalize_insert_overwrite_keywords(sql, keyword_case)
+            result = self._normalize_insert_overwrite_keywords(sql, keyword_case)
+            # 恢复注释
+            result = self._restore_comments(result, comments, sql)
+            return result
 
         insert_part = match.group(1).strip()
         select_part = match.group(2).strip()
@@ -651,6 +722,10 @@ class DataOperationsProcessor(BaseProcessor):
 
         # 组合
         result = f'{insert_part}\n{formatted_select}'
+
+        # 恢复注释
+        result = self._restore_comments(result, comments, sql)
+
         return result
 
     def _normalize_insert_overwrite_keywords(
