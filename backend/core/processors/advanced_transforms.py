@@ -170,7 +170,9 @@ class AdvancedTransformsProcessor(BaseProcessor):
 
         # 添加后续子句（GROUP BY, HAVING 等）
         if remaining_clauses.strip():
-            result += '\n' + remaining_clauses.strip()
+            # 直接格式化后续子句
+            formatted_clauses = self._format_remaining_clauses(remaining_clauses, keyword_case)
+            result += '\n' + formatted_clauses.strip()
 
         # 添加结尾分号
         if trailing_semicolon:
@@ -309,25 +311,81 @@ class AdvancedTransformsProcessor(BaseProcessor):
         规则:
         - LATERAL VIEW [OUTER] EXPLODE(...) table_alias AS column_alias
         - 关键字大写
-        - 函数参数可换行
+        - 函数参数可换行，括号对齐
         """
         # 标准化关键字
         lv = lateral_view.strip()
 
         # 解析 LATERAL VIEW 组件（在大小写转换之前）
         # 模式: LATERAL VIEW [OUTER] function(...) table_alias AS column_aliases
-        pattern = r'(LATERAL\s+VIEW)(\s+OUTER)?(\s+\w+)(\([^)]*\))(\s+\w+)(\s+AS)(\s+.+)'
-        match = re.match(pattern, lv, re.IGNORECASE)
+        # 使用括号计数来匹配跨行的括号内容
+        lateral_view_kw = 'LATERAL VIEW'
+        outer_kw = ''
+        function_name = None
+        function_args = None
+        table_alias = None
+        as_kw = 'AS'
+        column_aliases = None
 
-        if match:
-            lateral_view_kw = match.group(1)  # LATERAL VIEW
-            outer_kw = match.group(2) or ''  # OUTER (可选)
-            function_name = match.group(3)  # EXPLODE/JSON_TUPLE
-            function_args = match.group(4)  # (...)
-            table_alias = match.group(5)  # table_alias
-            as_kw = match.group(6)  # AS
-            column_aliases = match.group(7)  # column_aliases
+        # 解析步骤
+        remaining = lv
+        paren_depth = 0
+        i = 0
 
+        # 1. 提取 LATERAL VIEW [OUTER]
+        lv_upper = remaining.upper()
+        if lv_upper.startswith('LATERAL VIEW'):
+            i = len('LATERAL VIEW')
+            remaining = remaining[i:].lstrip()
+
+            # 检查 OUTER
+            if remaining.upper().startswith('OUTER'):
+                outer_kw = 'OUTER'
+                # 提取实际的大小写
+                outer_match = re.match(r'\s*(OUTER|outer|Outer)\s*', remaining)
+                if outer_match:
+                    outer_kw = outer_match.group(1)
+                remaining = remaining[len(outer_kw):].lstrip()
+
+        # 2. 提取函数名 (EXPLODE/JSON_TUPLE/等)
+        func_match = re.match(r'(\w+)', remaining)
+        if func_match:
+            function_name = func_match.group(1)
+            remaining = remaining[len(function_name):].lstrip()
+
+        # 3. 提取函数参数（使用括号计数）
+        if remaining.startswith('('):
+            paren_depth = 0
+            arg_start = 0
+            for j, char in enumerate(remaining):
+                if char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+                    if paren_depth == 0:
+                        function_args = remaining[:j+1]
+                        remaining = remaining[j+1:].lstrip()
+                        break
+            else:
+                # 没有找到闭合括号，使用整个剩余部分
+                function_args = remaining
+                remaining = ''
+
+        # 4. 提取表别名
+        alias_match = re.match(r'(\w+)', remaining)
+        if alias_match:
+            table_alias = alias_match.group(1)
+            remaining = remaining[len(table_alias):].lstrip()
+
+        # 5. 提取 AS 和列别名
+        if remaining.upper().startswith('AS'):
+            as_match = re.match(r'(AS|as|As)\s+(.+)', remaining, re.IGNORECASE)
+            if as_match:
+                as_kw = as_match.group(1)
+                column_aliases = as_match.group(2).strip()
+
+        # 如果解析成功，组装结果
+        if function_name and function_args and table_alias:
             # 转换为统一大小写
             if keyword_case == 'upper':
                 lateral_view_kw = lateral_view_kw.upper()
@@ -348,11 +406,11 @@ class AdvancedTransformsProcessor(BaseProcessor):
                 function_name = function_name.capitalize()
                 as_kw = as_kw.capitalize()
 
-            # 格式化函数参数（如果很长）
+            # 格式化函数参数（处理多行和缩进）
             formatted_args = self._format_function_args(function_args)
 
             # 组装
-            result = f"{lateral_view_kw}{outer_kw}{function_name}{formatted_args}{table_alias}{as_kw}{column_aliases}"
+            result = f"{lateral_view_kw}{outer_kw} {function_name}{formatted_args} {table_alias} {as_kw} {column_aliases}"
             return result.strip()
         else:
             # 如果解析失败，应用全局大小写转换
@@ -380,40 +438,126 @@ class AdvancedTransformsProcessor(BaseProcessor):
 
             return lv
 
-        if match:
-            lateral_view_kw = match.group(1)  # LATERAL VIEW
-            outer_kw = match.group(2) or ''  # OUTER (可选)
-            function_name = match.group(3)  # EXPLODE/JSON_TUPLE
-            function_args = match.group(4)  # (...)
-            table_alias = match.group(5)  # table_alias
-            as_kw = match.group(6)  # AS
-            column_aliases = match.group(7)  # column_aliases
-
-            # 格式化函数参数（如果很长）
-            formatted_args = self._format_function_args(function_args)
-
-            # 组装
-            result = f"{lateral_view_kw}{outer_kw}{function_name}{formatted_args}{table_alias}{as_kw}{column_aliases}"
-            return result.strip()
-        else:
-            # 如果解析失败，返回原始内容
-            return lv
-
     def _format_function_args(self, args: str) -> str:
         """
-        格式化函数参数
+        格式化函数参数，确保括号对齐
 
-        如果参数过长，可以考虑换行
+        规则:
+        - 如果参数简单（单行且较短），保持原样
+        - 如果参数跨行，确保闭合括号与开括号对齐
         """
         args = args.strip()
-        # 移除外层括号
-        if args.startswith('(') and args.endswith(')'):
+
+        # 如果没有括号，直接返回
+        if not (args.startswith('(') and args.endswith(')')):
+            return args
+
+        # 检查参数是否跨行
+        if '\n' not in args:
+            # 单行参数，检查长度
             inner = args[1:-1].strip()
-            # 如果参数简单，直接返回
-            if len(inner) < 50:
-                return args
-            # TODO: 可以实现更复杂的参数换行逻辑
-        return args
+            if len(inner) < 60:
+                return args  # 短参数保持单行
+
+        # 多行参数或长参数，需要格式化
+        lines = args.split('\n')
+        if len(lines) == 1:
+            # 单行但很长的参数，考虑换行
+            inner = args[1:-1].strip()
+            return f'(\n    {inner}\n)'
+        else:
+            # 多行参数，确保括号对齐
+            # 第一行是开括号
+            result = [lines[0]]
+            # 中间行保持原样（但去除每行的前导空格，然后添加统一缩进）
+            for line in lines[1:-1]:
+                stripped = line.strip()
+                if stripped:
+                    result.append(f'    {stripped}')
+                else:
+                    result.append('')
+            # 最后一行是闭括号，与开括号对齐
+            last_line = lines[-1].strip()
+            if last_line == ')':
+                result.append(')')
+            else:
+                result.append(f'    {last_line}')
+            return '\n'.join(result)
+
+    def _format_remaining_clauses(self, clauses: str, keyword_case: str) -> str:
+        """
+        格式化后续子句（GROUP BY, HAVING, ORDER BY, LIMIT 等）
+
+        简单的格式化规则：
+        - 关键字独占一行或与第一列同行（取决于长度）
+        - 多列时，每列独占一行并使用逗号前缀
+        """
+        clauses = clauses.strip()
+
+        # 转换关键字大小写
+        if keyword_case == 'upper':
+            clauses = re.sub(r'\bGROUP\s+BY\b', 'GROUP BY', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bHAVING\b', 'HAVING', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bORDER\s+BY\b', 'ORDER BY', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bLIMIT\b', 'LIMIT', clauses, flags=re.IGNORECASE)
+        elif keyword_case == 'lower':
+            clauses = re.sub(r'\bGROUP\s+BY\b', 'group by', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bHAVING\b', 'having', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bORDER\s+BY\b', 'order by', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bLIMIT\b', 'limit', clauses, flags=re.IGNORECASE)
+        else:  # capitalize
+            clauses = re.sub(r'\bGROUP\s+BY\b', 'Group By', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bHAVING\b', 'Having', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bORDER\s+BY\b', 'Order By', clauses, flags=re.IGNORECASE)
+            clauses = re.sub(r'\bLIMIT\b', 'Limit', clauses, flags=re.IGNORECASE)
+
+        # 分解各个子句（GROUP BY, HAVING, ORDER BY, LIMIT）
+        # 使用正则来分割子句
+        pattern = r'\b(GROUP BY|HAVING|ORDER BY|LIMIT)\b'
+        parts = re.split(pattern, clauses, flags=re.IGNORECASE)
+
+        formatted = []
+        i = 1
+        while i < len(parts):
+            keyword = parts[i].upper()
+            # 转换关键字大小写
+            if keyword_case == 'upper':
+                pass  # 已经是大写
+            elif keyword_case == 'lower':
+                keyword = keyword.lower()
+            else:  # capitalize
+                keyword = keyword.capitalize()
+                if keyword == 'GROUP BY':
+                    keyword = 'Group By'
+                elif keyword == 'ORDER BY':
+                    keyword = 'Order By'
+
+            # 获取内容（直到下一个关键字或结尾）
+            content = ''
+            if i + 1 < len(parts):
+                content = parts[i + 1].strip()
+
+            # 格式化这个子句
+            if keyword in ('GROUP BY', 'ORDER BY'):
+                # 处理 GROUP BY / ORDER BY（多列可能换行）
+                if ',' in content:
+                    columns = [c.strip() for c in content.split(',')]
+                    formatted.append(keyword)
+                    for j, col in enumerate(columns):
+                        if j == 0:
+                            formatted.append(f'    {col}')
+                        else:
+                            formatted.append(f'     , {col}')
+                else:
+                    formatted.append(f'{keyword} {content}')
+            elif keyword == 'HAVING':
+                formatted.append(f'{keyword} {content}')
+            elif keyword == 'LIMIT':
+                formatted.append(f'{keyword} {content}')
+
+            i += 2
+
+        return '\n'.join(formatted)
 
     def _process_cluster_distribute(self, sql: str, keyword_case: str) -> str:
         """
