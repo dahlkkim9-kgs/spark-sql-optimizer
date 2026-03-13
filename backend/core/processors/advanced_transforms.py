@@ -118,15 +118,32 @@ class AdvancedTransformsProcessor(BaseProcessor):
         - LATERAL VIEW 与 FROM 对齐（无缩进）
         - 每个 LATERAL VIEW 独立一行
         - EXPLODE 函数参数可换行
+        - 保留后续的 GROUP BY, HAVING 等子句
+        - 保留开头和结尾的注释
         """
+        # 提取开头的注释（单行 -- 或多行 /* */）
+        leading_comment = ''
+        sql_without_leading_comment = sql
+
+        # 匹配开头的单行注释
+        comment_match = re.match(r'^(\s*--[^\n]*\n)*', sql)
+        if comment_match:
+            leading_comment = comment_match.group(0)
+            sql_without_leading_comment = sql[comment_match.end():]
+
+        # 提取结尾的分号和注释
+        trailing_semicolon = ''
+        if sql_without_leading_comment.rstrip().endswith(';'):
+            trailing_semicolon = ';'
+
         # 提取 SELECT 和 FROM 子句之间的部分
-        select_match = re.match(r'(\s*SELECT\s+.*?\s+FROM\s+.*?)(?=\s*LATERAL\s+VIEW)', sql, re.IGNORECASE | re.DOTALL)
+        select_match = re.match(r'(\s*SELECT\s+.*?\s+FROM\s+.*?)(?=\s*LATERAL\s+VIEW)', sql_without_leading_comment, re.IGNORECASE | re.DOTALL)
         if not select_match:
             # 如果没有匹配到，使用基础格式化
             return _call_formatter(sql, keyword_case)
 
         select_from_part = select_match.group(1)
-        lateral_part = sql[select_match.end():].strip()
+        lateral_part = sql_without_leading_comment[select_match.end():].strip()
 
         # 格式化 SELECT ... FROM 部分
         formatted_select = _call_formatter(select_from_part, keyword_case)
@@ -137,18 +154,31 @@ class AdvancedTransformsProcessor(BaseProcessor):
             lines.pop()
         formatted_select = '\n'.join(lines)
 
-        # 解析 LATERAL VIEW 语句
-        lateral_views = self._parse_lateral_views(lateral_part)
+        # 解析 LATERAL VIEW 语句和后续子句
+        lateral_views, remaining_clauses = self._parse_lateral_views_and_clauses(lateral_part)
 
         # 格式化每个 LATERAL VIEW
         formatted_lateral = []
         for lv in lateral_views:
-            formatted_lateral.append(self._format_single_lateral_view(lv, keyword_case))
+            formatted_lv = self._format_single_lateral_view(lv, keyword_case)
+            formatted_lateral.append(formatted_lv)
 
         # 组合结果
         result = formatted_select
         if formatted_lateral:
             result += '\n' + '\n'.join(formatted_lateral)
+
+        # 添加后续子句（GROUP BY, HAVING 等）
+        if remaining_clauses.strip():
+            result += '\n' + remaining_clauses.strip()
+
+        # 添加结尾分号
+        if trailing_semicolon:
+            result += '\n' + trailing_semicolon
+
+        # 添加开头注释
+        if leading_comment:
+            result = leading_comment + result
 
         return result
 
@@ -198,6 +228,79 @@ class AdvancedTransformsProcessor(BaseProcessor):
             lateral_views.append(current.strip())
 
         return lateral_views
+
+    def _parse_lateral_views_and_clauses(self, lateral_sql: str) -> tuple[List[str], str]:
+        """
+        解析 LATERAL VIEW 语句和后续子句
+
+        返回: (LATERAL_VIEW 语句列表, 剩余子句字符串)
+
+        后续子句包括: GROUP BY, HAVING, ORDER BY, LIMIT, etc.
+        """
+        lateral_views = []
+        current = ""
+        i = 0
+        paren_depth = 0
+
+        # 后续子句的关键字（必须独立成词）
+        clause_keywords = [
+            r'\bGROUP\s+BY\b',
+            r'\bHAVING\b',
+            r'\bORDER\s+BY\b',
+            r'\bLIMIT\b',
+            r'\bOFFSET\b',
+            r'\bQUALIFY\b'
+        ]
+
+        while i < len(lateral_sql):
+            char = lateral_sql[i]
+
+            # 跟踪括号深度
+            if char == '(':
+                paren_depth += 1
+                current += char
+                i += 1
+                continue
+            elif char == ')':
+                paren_depth -= 1
+                current += char
+                i += 1
+                continue
+
+            # 只在顶层（括号外）检查
+            if paren_depth == 0:
+                # 检查是否遇到后续子句
+                for clause_pattern in clause_keywords:
+                    clause_match = re.match(clause_pattern, lateral_sql[i:], re.IGNORECASE)
+                    if clause_match:
+                        # 保存当前的 LATERAL VIEW
+                        if current.strip():
+                            lateral_views.append(current.strip())
+                        # 返回剩余的子句（移除结尾的分号）
+                        remaining = lateral_sql[i:].strip()
+                        if remaining.endswith(';'):
+                            remaining = remaining[:-1].strip()
+                        return lateral_views, remaining
+
+                # 检查 LATERAL VIEW
+                match = re.match(r'\bLATERAL\s+VIEW\b', lateral_sql[i:], re.IGNORECASE)
+                if match:
+                    # 如果有累积的内容，先保存
+                    if current.strip():
+                        lateral_views.append(current.strip())
+                    # 开始新的 LATERAL VIEW
+                    i += match.end()
+                    current = "LATERAL VIEW"
+                    continue
+
+            current += char
+            i += 1
+
+        # 添加最后一个 LATERAL VIEW
+        if current.strip():
+            lateral_views.append(current.strip())
+
+        return lateral_views, ""
 
     def _format_single_lateral_view(self, lateral_view: str, keyword_case: str) -> str:
         """
