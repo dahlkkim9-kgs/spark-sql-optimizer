@@ -16,8 +16,9 @@ import re
 from typing import List, Literal, Tuple, Optional
 from .base_processor import BaseProcessor
 
-# Import existing formatter for base SQL formatting
-from backend.core.formatter_v4_fixed import format_sql_v4_fixed
+# Indentation constants
+OVER_INDENT = 4  # OVER clause content indentation
+WINDOW_FRAME_INDENT = 8  # Window frame indentation
 
 
 class WindowFunctionsProcessor(BaseProcessor):
@@ -195,7 +196,7 @@ class WindowFunctionsProcessor(BaseProcessor):
         # Build the formatted OVER clause
         result = [f'{over_keyword} (']
         result.extend(formatted_lines)
-        result.append('                         )')  # Align with OVER
+        result.append(')')  # Closing paren
 
         return '\n'.join(result)
 
@@ -369,18 +370,19 @@ class WindowFunctionsProcessor(BaseProcessor):
             re.IGNORECASE
         )
 
+        indent = ' ' * OVER_INDENT
         if match:
             columns_str = match.group(1).strip()
             # Parse columns (handle commas)
             columns = self._parse_column_list(columns_str)
             # Format column list with alignment
             formatted_columns = self._format_column_list(columns)
-            return f'                          {partition_by} {formatted_columns}'
+            return f'{indent}{partition_by} {formatted_columns}'
         else:
             # Fallback: just add keyword and indent
             result = re.sub(
                 r'PARTITION\s+BY',
-                f'                          {partition_by}',
+                f'{indent}{partition_by}',
                 clause,
                 flags=re.IGNORECASE
             )
@@ -397,18 +399,19 @@ class WindowFunctionsProcessor(BaseProcessor):
             re.IGNORECASE
         )
 
+        indent = ' ' * OVER_INDENT
         if match:
             columns_str = match.group(1).strip()
             # Parse columns (handle commas)
             columns = self._parse_column_list(columns_str)
             # Format column list with alignment
             formatted_columns = self._format_column_list(columns)
-            return f'                          {order_by} {formatted_columns}'
+            return f'{indent}{order_by} {formatted_columns}'
         else:
             # Fallback
             result = re.sub(
                 r'ORDER\s+BY',
-                f'                          {order_by}',
+                f'{indent}{order_by}',
                 clause,
                 flags=re.IGNORECASE
             )
@@ -470,7 +473,8 @@ class WindowFunctionsProcessor(BaseProcessor):
             flags=re.IGNORECASE
         )
 
-        return f'                          {result.strip()}'
+        indent = ' ' * WINDOW_FRAME_INDENT
+        return f'{indent}{result.strip()}'
 
     def _format_column_list(self, columns: List[str]) -> str:
         """Format a column list with proper alignment"""

@@ -4,9 +4,6 @@ import re
 from typing import List, Literal
 from .base_processor import BaseProcessor
 
-# 导入现有格式化器用于格式化子查询
-from backend.core.formatter_v4_fixed import format_sql_v4_fixed
-
 
 class SetOperationsProcessor(BaseProcessor):
     """集合操作处理器 - 支持 UNION/INTERSECT/EXCEPT/MINUS"""
