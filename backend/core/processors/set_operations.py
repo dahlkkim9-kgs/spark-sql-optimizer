@@ -1,8 +1,43 @@
 # backend/core/processors/set_operations.py
 """集合操作处理器 - 支持 UNION/INTERSECT/EXCEPT/MINUS"""
 import re
+import sys
+import os
 from typing import List, Literal
 from .base_processor import BaseProcessor
+
+
+def _get_formatter():
+    """动态导入 formatter_v4_fixed，兼容不同运行环境"""
+    try:
+        # 尝试从 backend.core 导入（API 环境）
+        from backend.core.formatter_v4_fixed import format_sql_v4_fixed
+        return format_sql_v4_fixed
+    except ImportError:
+        # 尝试从 core 导入（测试环境）
+        try:
+            # 确保 core 路径在 sys.path 中
+            core_path = os.path.join(os.path.dirname(__file__), '..')
+            if core_path not in sys.path:
+                sys.path.insert(0, core_path)
+            from core.formatter_v4_fixed import format_sql_v4_fixed
+            return format_sql_v4_fixed
+        except ImportError:
+            # 最后尝试直接导入
+            from formatter_v4_fixed import format_sql_v4_fixed
+            return format_sql_v4_fixed
+
+
+# 缓存导入的函数
+_formatter_func = None
+
+
+def _call_formatter(sql: str, keyword_case: str = 'upper') -> str:
+    """调用 formatter_v4_fixed.format_sql_v4_fixed"""
+    global _formatter_func
+    if _formatter_func is None:
+        _formatter_func = _get_formatter()
+    return _formatter_func(sql, keyword_case=keyword_case)
 
 
 class SetOperationsProcessor(BaseProcessor):
@@ -62,16 +97,16 @@ class SetOperationsProcessor(BaseProcessor):
                 return f'({inner_formatted})'
             else:
                 # 普通子查询，直接格式化
-                formatted = format_sql_v4_fixed(inner, keyword_case=keyword_case)
+                formatted = _call_formatter(inner, keyword_case=keyword_case)
                 formatted = self._clean_formatted_select(formatted)
                 return f'({formatted})'
         else:
             # 普通 SELECT 语句
-            formatted = format_sql_v4_fixed(segment, keyword_case=keyword_case)
+            formatted = _call_formatter(segment, keyword_case=keyword_case)
             return self._clean_formatted_select(formatted)
 
     def _clean_formatted_select(self, formatted: str) -> str:
-        """清理 format_sql_v4_fixed 的输出，移除分号和多余空行"""
+        """清理 _call_formatter 的输出，移除分号和多余空行"""
         # 移除末尾的分号和周围空行
         lines = formatted.split('\n')
         # 移除最后的空行和分号行
