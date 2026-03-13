@@ -1,27 +1,15 @@
 # backend/core/processors/set_operations.py
 """集合操作处理器 - 支持 UNION/INTERSECT/EXCEPT/MINUS"""
 import re
-from typing import List, Tuple
+from typing import List, Literal
 from .base_processor import BaseProcessor
 
 # 导入现有格式化器用于格式化子查询
-import sys
-import os
-sys.path.insert(0, os.path.dirname(__file__))
-from formatter_v4_fixed import format_sql_v4_fixed
+from backend.core.formatter_v4_fixed import format_sql_v4_fixed
 
 
 class SetOperationsProcessor(BaseProcessor):
     """集合操作处理器 - 支持 UNION/INTERSECT/EXCEPT/MINUS"""
-
-    # 集合操作符正则模式
-    SET_OPERATIONS = {
-        'UNION ALL': r'\bUNION\s+ALL\b',
-        'UNION': r'\bUNION\b(?!\s+ALL)',
-        'INTERSECT': r'\bINTERSECT\b',
-        'EXCEPT': r'\bEXCEPT\b',
-        'MINUS': r'\bMINUS\b'
-    }
 
     def __init__(self):
         super().__init__()
@@ -41,7 +29,7 @@ class SetOperationsProcessor(BaseProcessor):
                 return True
         return False
 
-    def process(self, sql: str, keyword_case: str = 'upper') -> str:
+    def process(self, sql: str, keyword_case: Literal['upper', 'lower', 'capitalize'] = 'upper') -> str:
         """处理包含集合操作的 SQL"""
         # 去除首尾空白
         sql = sql.strip()
