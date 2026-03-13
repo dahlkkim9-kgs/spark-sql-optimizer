@@ -24,8 +24,8 @@ from typing import Literal, List
 from backend.core.parser.sql_classifier import SQLClassifier
 from backend.core.processors.set_operations import SetOperationsProcessor
 from backend.core.processors.window_functions import WindowFunctionsProcessor
+from backend.core.processors.data_operations import DataOperationsProcessor
 # Future processors (not yet implemented):
-# from backend.core.processors.data_operations import DataOperationsProcessor
 # from backend.core.processors.advanced_transforms import AdvancedTransformsProcessor
 
 # Import fallback formatter for basic SELECT
@@ -86,9 +86,9 @@ def format_sql_v5(
     # 5. basic (default)
 
     if 'data_operations' in syntax_types:
-        # Future: DataOperationsProcessor will handle MERGE, INSERT OVERWRITE
-        # For now, fall back to v4_fixed
-        return format_sql_v4_fixed(sql, keyword_case=keyword_case)
+        # Handle MERGE, INSERT OVERWRITE
+        processor = DataOperationsProcessor()
+        return processor.process(sql, keyword_case=keyword_case)
 
     elif 'set_operations' in syntax_types:
         # Handle UNION/INTERSECT/EXCEPT/MINUS

@@ -141,3 +141,52 @@ class TestFormatterV5:
         # 验证括号存在
         assert '(' in result
         assert ')' in result
+
+    def test_format_merge(self):
+        """测试 MERGE 格式化"""
+        sql = "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET target.val = source.val"
+        result = format_sql_v5(sql)
+
+        # 验证关键字存在
+        assert 'MERGE INTO' in result
+        assert 'USING' in result
+        assert 'ON' in result
+        assert 'WHEN MATCHED THEN' in result
+
+        # 验证换行
+        lines = result.split('\n')
+        assert len(lines) >= 4
+
+    def test_format_insert_overwrite(self):
+        """测试 INSERT OVERWRITE 格式化"""
+        sql = "INSERT OVERWRITE TABLE target SELECT a, b, c FROM source"
+        result = format_sql_v5(sql)
+
+        # 验证关键字存在
+        assert 'INSERT OVERWRITE' in result
+        assert 'SELECT' in result
+        assert 'FROM' in result
+
+        # 验证换行
+        lines = result.split('\n')
+        assert len(lines) >= 2
+
+    def test_merge_with_insert_overwrite_priority(self):
+        """测试 MERGE 优先级高于 INSERT OVERWRITE（单个 SQL）"""
+        # MERGE 语句应该被正确处理
+        sql = "MERGE INTO target USING source ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.val = s.val"
+        result = format_sql_v5(sql)
+
+        assert 'MERGE INTO' in result
+        assert 'USING' in result
+
+    def test_data_operations_case_sensitivity(self):
+        """测试数据操作关键字大小写"""
+        sql = "merge into target using source on t.id = s.id when matched then update set t.val = s.val"
+        result = format_sql_v5(sql, keyword_case='upper')
+
+        # 验证输出是大写
+        assert 'MERGE INTO' in result
+        assert 'USING' in result
+        assert 'ON' in result
+        assert 'WHEN MATCHED THEN' in result
