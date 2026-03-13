@@ -151,7 +151,7 @@ const LineNumberEditor = forwardRef<LineNumberEditorRef, { value: string; onChan
             style={{
               width: '100%',
               height: '100%',
-              minHeight: '400px',
+              minHeight: '200px',
               fontFamily: 'Consolas, Monaco, "Courier New", monospace',
               fontSize: '14px',
               lineHeight: '1.5',
@@ -236,7 +236,7 @@ WHERE name LIKE '%john%'
     setFormattedSql('');
 
     try {
-      const response = await fetch('http://127.0.0.1:8888/format/v4fixed', {
+      const response = await fetch('http://127.0.0.1:8888/format/v5', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -400,7 +400,7 @@ WHERE name LIKE '%john%'
                 </button>
               </div>
             </div>
-            <div className="editor-container" style={{ height: 'calc(100vh - 165px)', minHeight: '500px' }}>
+            <div className="editor-container" style={{ height: 'calc(100vh - 165px)', minHeight: '600px', maxHeight: 'none' }}>
               <LineNumberEditor
                 value={formattedSql || '-- 格式化结果将显示在这里\n-- 点击"✨ 格式化"按钮开始'}
                 onChange={() => {}}

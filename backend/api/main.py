@@ -234,6 +234,60 @@ async def format_sql_v4fixed_endpoint(request: FormatRequest):
         return {"error": str(e), "success": False}
 
 
+@app.post("/format/v5")
+async def format_sql_v5_endpoint(request: FormatRequest):
+    """Format SQL with v5 - 支持高级语法（集合操作、窗口函数、MERGE、LATERAL VIEW等）"""
+    try:
+        import sys
+        import os
+        import re
+
+        # 确保 core 目录在路径中
+        core_path = os.path.join(os.path.dirname(__file__), '..', 'core')
+        if core_path not in sys.path:
+            sys.path.insert(0, core_path)
+
+        # 清除所有 formatter 相关模块缓存
+        modules_to_remove = [k for k in sys.modules.keys()
+                              if 'formatter' in k or 'parser' in k or 'processor' in k]
+        for mod in modules_to_remove:
+            del sys.modules[mod]
+
+        # 直接导入各个组件
+        from parser.sql_classifier import SQLClassifier
+        from processors.set_operations import SetOperationsProcessor
+        from processors.window_functions import WindowFunctionsProcessor
+        from processors.data_operations import DataOperationsProcessor
+        from processors.advanced_transforms import AdvancedTransformsProcessor
+        from formatter_v4_fixed import format_sql_v4_fixed
+
+        # 分类 SQL
+        syntax_types = SQLClassifier.classify(request.sql)
+
+        # 根据类型选择处理器
+        if 'data_operations' in syntax_types:
+            processor = DataOperationsProcessor()
+            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
+        elif 'set_operations' in syntax_types:
+            processor = SetOperationsProcessor()
+            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
+        elif 'window_functions' in syntax_types:
+            processor = WindowFunctionsProcessor()
+            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
+        elif 'advanced_transforms' in syntax_types:
+            processor = AdvancedTransformsProcessor()
+            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
+        else:
+            # 使用 v4_fixed 作为默认
+            result = format_sql_v4_fixed(request.sql, keyword_case=request.keyword_case or 'upper')
+
+        return {"formatted": result, "success": True}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "success": False}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8888)

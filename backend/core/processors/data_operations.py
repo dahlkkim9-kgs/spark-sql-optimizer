@@ -171,9 +171,10 @@ class DataOperationsProcessor(BaseProcessor):
 
         remaining = sql.strip()
 
-        # 1. 提取 MERGE INTO
+        # 1. 提取 MERGE INTO (包括可选的别名)
+        # 匹配: MERGE INTO table_name [alias]
         merge_into_match = re.match(
-            r'(MERGE\s+INTO)\s+(\S+)',
+            r'(MERGE\s+INTO)\s+(\S+(?:\s+\S+)?)',
             remaining,
             re.IGNORECASE
         )
@@ -263,13 +264,17 @@ class DataOperationsProcessor(BaseProcessor):
             else:
                 return {'content': subquery, 'remaining': remaining}
         else:
-            # 普通表名
-            # 提取第一个词（表名）
-            table_match = re.match(r'(\S+)\s*', sql)
+            # 普通表名（可能带别名）
+            # 提取表名和可选的别名: table_name [alias]
+            table_match = re.match(r'(\S+)\s+(\S+)?\s*', sql)
             if table_match:
                 table_name = table_match.group(1)
+                alias = table_match.group(2) if table_match.lastindex >= 2 and table_match.group(2) else None
                 remaining = sql[table_match.end():].strip()
-                return {'content': table_name, 'remaining': remaining}
+                if alias:
+                    return {'content': f'{table_name} {alias}', 'remaining': remaining}
+                else:
+                    return {'content': table_name, 'remaining': remaining}
             else:
                 return {'content': sql, 'remaining': ''}
 

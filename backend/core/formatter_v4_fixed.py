@@ -89,7 +89,8 @@ def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
         'IN', 'EXISTS', 'BETWEEN', 'LIKE', 'IS', 'NULL', 'ORDER', 'BY', 'GROUP',
         'HAVING', 'LIMIT', 'OFFSET', 'WITH', 'RECURSIVE', 'PARTITION', 'OVERWRITE',
         'TABLE', 'VIEW', 'INDEX', 'DATABASE', 'SCHEMA', 'FUNCTION', 'PROCEDURE',
-        'INTO', 'VALUES', 'SET', 'DESC', 'ASC', 'DISTINCT', 'ALL', 'ANY', 'SOME'
+        'INTO', 'VALUES', 'SET', 'DESC', 'ASC', 'DISTINCT', 'ALL', 'ANY', 'SOME',
+        'AS'  # 添加 AS，避免将 CTE 中的 AS (...) 误认为函数调用
     }
 
     def find_matching_paren(s, start):
@@ -1130,7 +1131,8 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
     else:
         # 未对齐：执行完整 normalize
         # 在 normalize 之前，保护 FROM 前的换行（避免注释后直接跟 FROM）
-        if re.search(r'\bSELECT\b', sql, re.IGNORECASE):
+        # 跳过 WITH 语句，避免破坏 CTE 结构
+        if re.search(r'\bSELECT\b', sql, re.IGNORECASE) and not re.search(r'^\s*WITH\b', sql, re.IGNORECASE):
             sql, extracted_fields = _protect_select_field_comments(sql)
             # 保护 FROM 前的换行
             sql = _protect_from_newline(sql)
@@ -1416,9 +1418,150 @@ def _format_delete_statement(sql: str) -> str:
 
 
 def _format_merge_statement(sql: str) -> str:
-    """格式化 MERGE INTO 语句"""
-    # MERGE INTO ... USING ... ON ... WHEN MATCHED THEN ...
-    return sql
+    """格式化 MERGE INTO 语句
+
+    MERGE INTO target_table [AS alias]
+    USING source_table [AS alias]
+    ON join_condition
+    WHEN MATCHED [AND condition] THEN
+        UPDATE SET column = value
+    WHEN NOT MATCHED [AND condition] THEN
+        INSERT (columns) VALUES (values)
+    """
+    import re
+
+    # 移除前后空白
+    sql = sql.strip()
+    if not sql.upper().startswith('MERGE INTO'):
+        return sql
+
+    # 解析 MERGE 语句的各个部分
+    lines = []
+
+    # MERGE INTO 部分
+    merge_match = re.match(r'(MERGE\s+INTO\s+(\S+(\s+\S+)?))', sql, re.IGNORECASE)
+    if not merge_match:
+        return sql
+
+    lines.append(merge_match.group(1).upper())
+    remaining = sql[merge_match.end():].strip()
+
+    # USING 部分
+    using_match = re.match(r'(USING\s+(\S+(\s+\S+)?))', remaining, re.IGNORECASE)
+    if using_match:
+        lines.append(using_match.group(1).upper())
+        remaining = remaining[using_match.end():].strip()
+
+    # ON 部分
+    on_match = re.match(r'(ON\s+)', remaining, re.IGNORECASE)
+    if on_match:
+        remaining = remaining[on_match.end():].strip()
+        # 提取 ON 条件（到 WHEN 或结束）
+        on_condition = []
+        paren_depth = 0
+        i = 0
+        while i < len(remaining):
+            char = remaining[i]
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth -= 1
+            # 检查 WHEN 关键字（不在括号内）
+            if remaining[i:i+4].upper() == 'WHEN' and paren_depth == 0 and (i + 4 >= len(remaining) or not remaining[i+4].isalnum()):
+                break
+            on_condition.append(char)
+            i += 1
+        on_condition_str = ''.join(on_condition).strip()
+        lines.append(f'ON {on_condition_str}')
+        remaining = remaining[i:].strip()
+
+    # WHEN MATCHED / WHEN NOT MATCHED 部分
+    while remaining:
+        when_match = re.match(r'(WHEN\s+(NOT\s+)?MATCHED(\s+AND\s+[^THEN]+)?)', remaining, re.IGNORECASE)
+        if not when_match:
+            break
+
+        when_clause = when_match.group(1)
+        # 处理 WHEN 条件
+        if ' AND ' in when_clause.upper():
+            # 有 AND 条件，保持格式
+            when_parts = re.split(r'\s+AND\s+', when_clause, maxsplit=1, flags=re.IGNORECASE)
+            when_formatted = f"WHEN {'NOT ' if 'NOT' in when_parts[0].upper() else ''}MATCHED AND {when_parts[1]}"
+        else:
+            # 无 AND 条件
+            when_formatted = when_clause.upper().replace(' NOT ', ' NOT')
+
+        remaining = remaining[when_match.end():].strip()
+
+        # THEN 部分
+        if not remaining.upper().startswith('THEN'):
+            break
+        remaining = remaining[4:].strip()
+
+        # UPDATE SET 或 INSERT 部分
+        if remaining.upper().startswith('UPDATE'):
+            # UPDATE SET column = value, column2 = value2
+            update_match = re.match(r'(UPDATE\s+SET\s+)([^WHEN]+)', remaining, re.IGNORECASE | re.DOTALL)
+            if update_match:
+                remaining_after_update = remaining[update_match.end():].strip()
+
+                # 解析 SET 子句
+                set_content = update_match.group(2).strip()
+                # 移除末尾的分号
+                set_content = set_content.rstrip(';').strip()
+
+                # 分割 SET 项（按逗号，考虑括号）
+                set_items = []
+                current = ''
+                paren_depth = 0
+                for char in set_content:
+                    if char == '(':
+                        paren_depth += 1
+                        current += char
+                    elif char == ')':
+                        paren_depth -= 1
+                        current += char
+                    elif char == ',' and paren_depth == 0:
+                        set_items.append(current.strip())
+                        current = ''
+                    else:
+                        current += char
+                if current.strip():
+                    set_items.append(current.strip())
+
+                # 格式化 SET 项
+                lines.append(f'{when_formatted.upper()} THEN')
+                lines.append('    UPDATE SET')
+                for i, item in enumerate(set_items):
+                    if i == 0:
+                        lines.append(f'        {item}')
+                    else:
+                        lines.append(f'        , {item}')
+
+                remaining = remaining_after_update
+
+        elif remaining.upper().startswith('INSERT'):
+            # INSERT (columns) VALUES (values)
+            insert_match = re.match(r'(INSERT\s+(\([^)]+\))?\s*VALUES\s*\([^)]+\))', remaining, re.IGNORECASE | re.DOTALL)
+            if insert_match:
+                remaining_after_insert = remaining[insert_match.end():].strip()
+
+                insert_content = insert_match.group(1)
+                # 移除末尾的分号
+                insert_content = insert_content.rstrip(';').strip()
+
+                lines.append(f'{when_formatted.upper()} THEN')
+                lines.append(f'    {insert_content.upper()}')
+
+                remaining = remaining_after_insert
+
+    # 添加分号（如果有）
+    if remaining and remaining.startswith(';'):
+        lines.append(';')
+    elif not remaining:
+        lines.append(';')
+
+    return '\n'.join(lines)
 
 
 def _parse_cte_definitions(cte_part: str) -> list[tuple[str, str]]:
@@ -2290,35 +2433,22 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                 # 所以我们只需要检测 before_placeholder 是否以 IN/NOT IN/EXISTS 加空格结尾
                                 in_pattern = re.search(r'\b(IN|NOT IN|EXISTS)\s*$', before_placeholder, re.IGNORECASE)
                                 if in_pattern:
-                                    # 嵌套子查询：SELECT 缩进到开括号位置 + 1
-                                    # 计算开括号位置
+                                    # 嵌套子查询：使用统一的固定缩进，而不是动态计算
+                                    # 这样可以避免多个 IN/NOT IN 时缩进累积的问题
                                     if clause_type == 'WHERE':
-                                        # WHERE 子句的基础缩进是 6 个空格
-                                        base_clause_indent = 6
-                                        # "WHERE " 的长度是 6
-                                        # before_placeholder 包含条件内容（如 "khzjdm NOT IN "）
-                                        paren_pos = base_clause_indent + 6 + len(before_placeholder)
+                                        # WHERE 子句中的 IN/NOT IN 子查询：统一缩进 18 个空格
+                                        # 这个值是经过测试的，可以让子查询内容对齐美观
+                                        subquery_indent = '                  '  # 18 个空格
+                                        close_paren_indent = '                 '  # 17 个空格，对齐到开括号
                                     elif clause_type in ('JOIN', 'LEFT_JOIN', 'RIGHT_JOIN', 'INNER_JOIN', 'FULL_JOIN', 'CROSS_JOIN'):
-                                        # JOIN 子句的基础缩进是 0 个空格
-                                        base_clause_indent = 0
-                                        join_keyword = match.group(1).upper() if 'match' in dir() else 'JOIN'
-                                        join_len = len(join_keyword) + 1  # +1 for space
-                                        paren_pos = base_clause_indent + join_len + len(before_placeholder.strip())
+                                        # JOIN 子句中的子查询：使用较小的缩进
+                                        subquery_indent = '    '  # 4 个空格
+                                        close_paren_indent = '   '   # 3 个空格
                                     else:
                                         # 其他情况：使用标准缩进
                                         base_indent = '    ' * (indent_level + 1)
                                         subquery_indent = base_indent
                                         close_paren_indent = '    ' * indent_level
-                                        # 跳过后续计算，直接使用标准缩进
-                                        in_pattern = None
-
-                                    if in_pattern:
-                                        # SELECT 缩进到开括号位置 + 1
-                                        subquery_indent = ' ' * (paren_pos + 1)
-                                        # 闭括号缩进到开括号位置
-                                        close_paren_indent = ' ' * paren_pos
-                                        # 调试输出
-                                        import sys
                                 else:
                                     # 其他情况：使用标准缩进
                                     base_indent = '    ' * (indent_level + 1)

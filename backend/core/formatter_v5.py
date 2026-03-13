@@ -10,25 +10,21 @@ This is the new formatter entry point that:
 Architecture:
 - SQLClassifier: Identifies syntax types (set_operations, data_operations, etc.)
 - SetOperationsProcessor: Handles UNION/INTERSECT/EXCEPT/MINUS
-- DataOperationsProcessor: Handles MERGE/INSERT OVERWRITE (future)
+- WindowFunctionsProcessor: Handles OVER/PARTITION BY/Window Frames
+- DataOperationsProcessor: Handles MERGE/INSERT OVERWRITE
+- AdvancedTransformsProcessor: Handles LATERAL VIEW/CLUSTER BY/DISTRIBUTE BY
 - formatter_v4_fixed: Handles basic SELECT statements (default)
-
-Usage:
-    from backend.core.formatter_v5 import format_sql_v5
-    result = format_sql_v5(sql, keyword_case='upper')
 """
 
 from typing import Literal, List
 
-# Import classifier and processors
-from backend.core.parser.sql_classifier import SQLClassifier
-from backend.core.processors.set_operations import SetOperationsProcessor
-from backend.core.processors.window_functions import WindowFunctionsProcessor
-from backend.core.processors.data_operations import DataOperationsProcessor
-from backend.core.processors.advanced_transforms import AdvancedTransformsProcessor
-
-# Import fallback formatter for basic SELECT
-from backend.core.formatter_v4_fixed import format_sql_v4_fixed
+# 使用相对导入
+from parser.sql_classifier import SQLClassifier
+from processors.set_operations import SetOperationsProcessor
+from processors.window_functions import WindowFunctionsProcessor
+from processors.data_operations import DataOperationsProcessor
+from processors.advanced_transforms import AdvancedTransformsProcessor
+from formatter_v4_fixed import format_sql_v4_fixed
 
 
 def format_sql_v5(
