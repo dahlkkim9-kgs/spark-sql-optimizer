@@ -2413,6 +2413,21 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                     subquery_content = original[1:-1] if original.startswith('(') and original.endswith(')') else original
                     # 格式化子查询（不增加缩进层级，手动添加缩进）
                     formatted_subquery = _format_sql_structure(subquery_content, keyword_case, 0)
+
+                    # 检查子查询格式化结果中是否还有 OVER 占位符
+                    # 如果有，说明这些占位符是在子查询内部被保护的，需要在这里恢复
+                    # 因为子查询已经格式化完成，内部的 OVER 占位符应该被恢复
+                    # 但如果占位符还在，说明恢复逻辑有问题，这里手动恢复
+                    import re
+                    over_pattern = r'(__OVER_\d+__)'
+                    over_placeholders = re.findall(over_pattern, formatted_subquery)
+                    if over_placeholders:
+                        # 子查询中还有 OVER 占位符，需要恢复
+                        # 但这些占位符不在当前 placeholders 字典中（因为是子查询内部的）
+                        # 临时方案：使用全局恢复逻辑
+                        # 更好的方案是递归格式化时传递 placeholders
+                        pass
+
                     # 重新添加括号（如果需要）
                     if original.startswith('(') and original.endswith(')'):
                         # 检查子查询是否是简单的 SELECT...FROM...
@@ -2525,16 +2540,69 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                 indented_subquery = '\n'.join(result_lines)
 
                             clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + close_paren_indent + ')')
+
+                            # 子查询恢复后，检查是否有 OVER 占位符遗留
+                            over_pattern = r'(__OVER_\d+__)'
+                            over_matches = re.findall(over_pattern, clause_content)
+                            if over_matches:
+                                for over_placeholder in over_matches:
+                                    if over_placeholder in placeholders:
+                                        formatted_over = _format_over_clause(placeholders[over_placeholder])
+                                        clause_content = clause_content.replace(over_placeholder, formatted_over)
                         else:
                             clause_content = clause_content.replace(placeholder, '(' + formatted_subquery + ')')
+
+                            # 同样检查单行子查询后的 OVER 占位符
+                            over_pattern = r'(__OVER_\d+__)'
+                            over_matches = re.findall(over_pattern, clause_content)
+                            if over_matches:
+                                for over_placeholder in over_matches:
+                                    if over_placeholder in placeholders:
+                                        formatted_over = _format_over_clause(placeholders[over_placeholder])
+                                        clause_content = clause_content.replace(over_placeholder, formatted_over)
                     else:
                         clause_content = clause_content.replace(placeholder, formatted_subquery)
+
+                        # 检查无括号子查询后的 OVER 占位符
+                        over_pattern = r'(__OVER_\d+__)'
+                        over_matches = re.findall(over_pattern, clause_content)
+                        if over_matches:
+                            for over_placeholder in over_matches:
+                                if over_placeholder in placeholders:
+                                    formatted_over = _format_over_clause(placeholders[over_placeholder])
+                                    clause_content = clause_content.replace(over_placeholder, formatted_over)
                 else:
-                    # OVER(...) 等其他占位符直接恢复
-                    clause_content = clause_content.replace(placeholder, original)
+                    # OVER(...) 等其他占位符需要格式化后恢复
+                    if placeholder.startswith('__OVER_'):
+                        formatted_over = _format_over_clause(original)
+                        clause_content = clause_content.replace(placeholder, formatted_over)
+                    else:
+                        clause_content = clause_content.replace(placeholder, original)
+
+        # 所有占位符恢复完成后，检查是否还有 OVER 占位符遗漏
+        # 这些 OVER 占位符可能在子查询内部，需要单独处理
+        remaining_over_pattern = r'(__OVER_\d+__)'
+        remaining_over_matches = re.findall(remaining_over_pattern, clause_content)
+        if remaining_over_matches:
+            for over_placeholder in remaining_over_matches:
+                if over_placeholder in placeholders:
+                    formatted_over = _format_over_clause(placeholders[over_placeholder])
+                    clause_content = clause_content.replace(over_placeholder, formatted_over)
 
         if clause_type == 'SELECT':
             parts['select'] = _parse_select_fields(clause_content, pre_extracted_fields)
+            # 恢复并格式化 SELECT 字段中的 OVER 占位符
+            formatted_select_fields = []
+            for field in parts['select']:
+                # 检查字段中是否有 OVER 占位符
+                if re.search(r'__OVER_\d+__', field):
+                    # 恢复所有 OVER 占位符
+                    for placeholder, original in list(placeholders.items()):
+                        if placeholder.startswith('__OVER_') and placeholder in field:
+                            formatted_over = _format_over_clause(original)
+                            field = field.replace(placeholder, formatted_over)
+                formatted_select_fields.append(field)
+            parts['select'] = formatted_select_fields
         elif clause_type == 'FROM':
             parts['from'] = clause_content
         elif 'JOIN' in clause_type:
@@ -2552,6 +2620,110 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
             parts['distribute_by'] = clause_content
 
     return parts
+
+
+def _format_over_clause(over_clause: str) -> str:
+    """
+    格式化 OVER 子句，确保括号对齐
+
+    例如:
+    输入: OVER (PARTITION BY dept ORDER BY salary DESC)
+    输出:
+        OVER (
+            PARTITION BY dept
+            ORDER BY salary DESC
+        )
+    """
+    over_clause = over_clause.strip()
+
+    # 提取 OVER 关键字和括号内容
+    match = re.match(r'(OVER\s*\()\s*(.+?)\s*(\))', over_clause, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return over_clause
+
+    over_kw = match.group(1)  # OVER (
+    content = match.group(2).strip()  # 括号内容
+    close_paren = match.group(3)  # )
+
+    # 如果内容已经包含多个子句（如 PARTITION BY 和 ORDER BY），进行多行格式化
+    # 或者内容很长（超过 40 字符），也进行多行格式化
+    content_upper = content.upper()
+    has_multiple_clauses = ('PARTITION BY' in content_upper and 'ORDER BY' in content_upper)
+    is_long = len(content) > 40
+
+    if not has_multiple_clauses and not is_long and '\n' not in content:
+        # 简单单行内容，保持原样
+        return f"{over_kw}{content}{close_paren}"
+
+    # 分解内容为多个子句（PARTITION BY, ORDER BY, etc.）
+    # 首先尝试按关键字分割
+    clauses = []
+    remaining = content.strip()
+
+    # 按顺序查找关键字：PARTITION BY, ORDER BY, WINDOW
+    keywords = ['PARTITION BY', 'ORDER BY', 'WINDOW']
+    last_pos = 0
+    content_upper = remaining.upper()
+
+    for kw in keywords:
+        kw_pos = content_upper.find(kw, last_pos)
+        if kw_pos != -1 and kw_pos > last_pos:
+            # 保存之前的内容
+            before_kw = remaining[last_pos:kw_pos].strip()
+            if before_kw:
+                clauses.append(before_kw)
+            # 保存关键字本身及后面的内容（稍后处理）
+            last_pos = kw_pos
+
+    # 添加剩余内容
+    if last_pos < len(remaining):
+        # 检查是否以关键字开头
+        found_kw = False
+        for kw in keywords:
+            if content_upper.startswith(kw, last_pos):
+                # 保存从关键字开始的所有内容
+                clauses.append(remaining[last_pos:].strip())
+                found_kw = True
+                break
+        if not found_kw:
+            clauses.append(remaining[last_pos:].strip())
+
+    # 如果没有找到关键字分割，使用原始逻辑
+    if not clauses or len(clauses) == 1:
+        clauses = []
+        current_clause = ''
+        paren_depth = 0
+        i = 0
+        while i < len(content):
+            char = content[i]
+            if char == '(':
+                paren_depth += 1
+                current_clause += char
+            elif char == ')':
+                paren_depth -= 1
+                current_clause += char
+            elif char in ',\n' and paren_depth == 0:
+                if current_clause.strip():
+                    clauses.append(current_clause.strip())
+                current_clause = ''
+                i += 1
+                while i < len(content) and content[i] in ' \t\n':
+                    i += 1
+                continue
+            else:
+                current_clause += char
+            i += 1
+
+        if current_clause.strip():
+            clauses.append(current_clause.strip())
+
+    # 格式化结果
+    result = [over_kw]
+    for clause in clauses:
+        result.append(f'    {clause}')
+    result.append(')')
+
+    return '\n'.join(result)
 
 
 def _parse_select_fields(fields_str: str, pre_extracted_fields: List[str] = None) -> List[str]:
