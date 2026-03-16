@@ -2439,38 +2439,19 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                             placeholder_pos = clause_content.find(placeholder)
                             before_placeholder = clause_content[:placeholder_pos]
 
-                            # 检测是否在 FROM 子句中
-                            if clause_type == 'FROM' and placeholder_pos == 0:
-                                # FROM 子句中的顶级子查询：缩进 6 个空格（与 FROM ( 中的 ( 对齐）
-                                subquery_indent = '      '  # 6 个空格
-                                close_paren_indent = '     '   # 5 个空格，与 FROM ( 中的 ( 对齐
-                            else:
-                                # 检测是否在 IN/NOT IN 中（嵌套子查询）
-                                # before_placeholder 后面就是子查询占位符，相当于 ( 子查询
-                                # 所以我们只需要检测 before_placeholder 是否以 IN/NOT IN/EXISTS 加空格结尾
-                                in_pattern = re.search(r'\b(IN|NOT IN|EXISTS)\s*$', before_placeholder, re.IGNORECASE)
-                                if in_pattern:
-                                    # 嵌套子查询：使用统一的固定缩进，而不是动态计算
-                                    # 这样可以避免多个 IN/NOT IN 时缩进累积的问题
-                                    if clause_type == 'WHERE':
-                                        # WHERE 子句中的 IN/NOT IN 子查询：统一缩进 18 个空格
-                                        # 这个值是经过测试的，可以让子查询内容对齐美观
-                                        subquery_indent = '                  '  # 18 个空格
-                                        close_paren_indent = '                 '  # 17 个空格，对齐到开括号
-                                    elif clause_type in ('JOIN', 'LEFT_JOIN', 'RIGHT_JOIN', 'INNER_JOIN', 'FULL_JOIN', 'CROSS_JOIN'):
-                                        # JOIN 子句中的子查询：使用较小的缩进
-                                        subquery_indent = '    '  # 4 个空格
-                                        close_paren_indent = '   '   # 3 个空格
-                                    else:
-                                        # 其他情况：使用标准缩进
-                                        base_indent = '    ' * (indent_level + 1)
-                                        subquery_indent = base_indent
-                                        close_paren_indent = '    ' * indent_level
-                                else:
-                                    # 其他情况：使用标准缩进
-                                    base_indent = '    ' * (indent_level + 1)
-                                    subquery_indent = base_indent
-                                    close_paren_indent = '    ' * indent_level
+                            # 动态计算开括号位置
+                            # 构建完整的上下文行（子句关键字 + 子查询前的内容 + 开括号）
+                            # 例如："FROM (" 或 "WHERE id IN ("
+                            clause_keyword = clause_type.replace('_', ' ')
+                            context_line = clause_keyword + ' ' + before_placeholder + '('
+
+                            # 开括号位置 = 上下文行的长度 - 1
+                            open_paren_pos = len(context_line) - 1
+
+                            # 内容缩进 = 开括号位置 + 1
+                            subquery_indent = ' ' * (open_paren_pos + 1)
+                            # 闭括号缩进 = 开括号位置
+                            close_paren_indent = ' ' * open_paren_pos
 
                             # 为子查询的每一行添加缩进
                             indented_lines = []
@@ -2512,7 +2493,11 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                     if match:
                                         # 找到了 IN ( 模式，下一行应该有嵌套的子查询
                                         # 计算括号位置（与 IN ( 中的 ( 对齐）
-                                        paren_start_pos = len(line.rstrip()) - len(match.group(1)) + len(match.group(1))
+                                        # match.group(1) 是类似 " IN (" 的字符串，在行末尾
+                                        # 开括号位置 = 行长度 - 1
+                                        paren_start_pos = len(line.rstrip()) - 1
+                                        content_indent_pos = paren_start_pos + 1  # 内容缩进 = 开括号 + 1
+                                        close_indent_pos = paren_start_pos  # 闭括号与开括号对齐
                                         # 将子查询内容缩进到括号位置
                                         result_lines.append(line)
                                         i += 1
@@ -2526,10 +2511,10 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                             if i < len(lines) - 1 or paren_depth > 0:
                                                 if nested_line.strip() == ')':
                                                     # 闭括号，对齐到开括号
-                                                    result_lines.append(' ' * (paren_start_pos - 1) + nested_line.strip())
+                                                    result_lines.append(' ' * close_indent_pos + nested_line.strip())
                                                 elif nested_line.strip():
-                                                    # 内容行，缩进到括号位置
-                                                    result_lines.append(' ' * paren_start_pos + nested_line.strip())
+                                                    # 内容行，缩进到开括号 + 1
+                                                    result_lines.append(' ' * content_indent_pos + nested_line.strip())
                                                 else:
                                                     result_lines.append('')
                                             i += 1
@@ -3775,11 +3760,28 @@ def _format_when_condition(condition: str, base_indent: str) -> str:
     支持括号内的连续 OR/AND 条件换行：
     - (a=1 OR b=2 OR c=3) 会被格式化为多行
     - 即使括号嵌套也能处理
+
+    缩进规则：
+    - 括号内内容缩进：开括号位置 + 1
+    - 闭括号与开括号对齐
     """
     # 首先检查并处理括号内的连续 OR/AND
     # base_indent 是字符串，需要转换为整数（空格数）
     base_indent_int = len(base_indent)
-    processed = _split_parenthesized_conditions(condition, base_indent_int)
+
+    # 构建完整的上下文行（包含 WHEN 关键字）用于计算括号位置
+    # 例如："    WHEN (a=1 AND b=2"
+    context_line = base_indent + 'WHEN ' + condition
+
+    # 查找开括号在上下文行中的位置
+    open_paren_pos = context_line.find('(')
+
+    if open_paren_pos != -1:
+        # 有括号，使用括号位置进行格式化
+        processed = _split_parenthesized_conditions(condition, base_indent_int, open_paren_pos)
+    else:
+        # 无括号，使用原有逻辑
+        processed = _split_parenthesized_conditions(condition, base_indent_int)
 
     # 如果处理后没有变化，或处理结果不完整（不包含原始条件的开头），返回原条件使用正常处理
     if processed == condition or not processed.strip().startswith(condition.strip()[:20]):
@@ -3814,54 +3816,24 @@ def _format_when_condition(condition: str, base_indent: str) -> str:
 
         return '\n'.join(lines)
     else:
-        # 已经处理了括号内的 OR/AND，需要添加缩进
-        # 注意：processed 的第一行（开括号）会被添加到 'WHEN ' 后面，所以不需要额外缩进
-        # 后续行需要相对于 WHEN 进行缩进
-        lines = processed.split('\n')
-        if len(lines) > 1:
-            # 计算缩进：闭括号与 ( 对齐，内容缩进6个空格
-            # base_indent 是字符串，需要用整数计算
-            paren_count = len(base_indent) + 5  # 8 + 5 = 13，与 ( 对齐
-            content_count = len(base_indent) + 6  # 8 + 6 = 14
-            paren_indent = ' ' * paren_count
-            content_indent = ' ' * content_count
-
-            result = [lines[0]]  # 第一行（开括号），直接使用，会添加到 WHEN 后面
-            for line in lines[1:]:
-                stripped = line.strip()
-                if stripped.startswith(')'):
-                    # 检查是否包含连接符和第二个括号
-                    if ') AND (' in stripped or ') OR (' in stripped:
-                        # 拆分成三行：闭括号，连接符，开括号
-                        parts = stripped.split(' ', 2)
-                        if len(parts) == 3:
-                            result.append(paren_indent + parts[0])  # )
-                            result.append(paren_indent + parts[1])  # AND
-                            result.append(paren_indent + parts[2])  # (
-                        else:
-                            result.append(paren_indent + stripped)
-                    else:
-                        result.append(paren_indent + stripped)
-                else:
-                    # 内容行，使用 content_indent
-                    result.append(content_indent + stripped)
-            return '\n'.join(result)
-        else:
-            return processed
+        # 已经处理了括号内的 OR/AND
+        # processed 已包含格式化后的括号和缩进，直接返回
+        return processed
 
 
-def _split_parenthesized_conditions(condition: str, base_indent: int = 0) -> str:
+def _split_parenthesized_conditions(condition: str, base_indent: int = 0, open_paren_pos: int = None) -> str:
     """分割括号内的连续 OR/AND 条件
 
     Args:
         condition: 要格式化的条件
         base_indent: 当前上下文的基础缩进（空格数）
+        open_paren_pos: 开括号在完整上下文行中的位置（可选）。
+                        如果提供，将用于计算精确的缩进；
+                        如果不提供，将使用 base_indent + len("WHEN ") 估算
 
-    支持复杂情况，按照相对缩进：
-    - (a=1 OR b=2 OR c=3) - 单组运算符
-    - (a=1 OR b=2) AND (c=3 OR d=4) - 多组运算符
-    - 闭合括号与开放括号对齐
-    - 括号内内容相对缩进 4 空格
+    缩进规则：
+    - 内容缩进：开括号位置 + 1
+    - 闭括号对齐：与开括号对齐
     """
     # re already imported at top level
 
@@ -3934,10 +3906,26 @@ def _split_parenthesized_conditions(condition: str, base_indent: int = 0) -> str
 
         Args:
             paren_content: 括号内的内容
-            content_prefix_len: 开括号前的内容长度（用于闭合括号对齐）
+            content_prefix_len: 开括号前的内容长度（用于兼容）。
+                               如果提供了 open_paren_pos，将优先使用它
+
+        缩进规则：
+        - 内容缩进：开括号位置 + 1
+        - 闭括号对齐：与开括号对齐
         """
-        # 括号内内容缩进 = 开括号前长度 + 6 空格
-        inner_indent = ' ' * (content_prefix_len + 6)
+        # 使用 open_paren_pos（如果提供），否则使用 content_prefix_len
+        if open_paren_pos is not None:
+            actual_paren_pos = open_paren_pos
+        else:
+            # 回退逻辑：使用 content_prefix_len（即开括号在条件字符串中的位置）
+            # content_prefix_len 是开括号在 condition 字符串中的位置
+            # 这对于像 (a=1 OR b=2) 这样的条件是正确的（paren_start=0）
+            actual_paren_pos = content_prefix_len
+
+        # 括号内内容缩进 = 开括号位置 + 1
+        inner_indent = ' ' * (actual_paren_pos + 1)
+        # 闭括号缩进 = 开括号位置
+        close_indent = ' ' * actual_paren_pos
 
         # 保护字符串
         protected, string_markers = protect_strings(paren_content)
@@ -3953,8 +3941,8 @@ def _split_parenthesized_conditions(condition: str, base_indent: int = 0) -> str
                     lines.append(inner_indent + restored)
                 else:
                     lines.append(inner_indent + 'OR ' + restored)
-            # 闭合括号缩进 = 开括号前长度
-            lines.append(' ' * content_prefix_len + ')')
+            # 闭合括号与开括号对齐
+            lines.append(close_indent + ')')
             return '\n'.join(lines)
 
         # 没有OR，检查AND
@@ -3967,8 +3955,8 @@ def _split_parenthesized_conditions(condition: str, base_indent: int = 0) -> str
                     lines.append(inner_indent + restored)
                 else:
                     lines.append(inner_indent + 'AND ' + restored)
-            # 闭合括号缩进 = 开括号前长度
-            lines.append(' ' * content_prefix_len + ')')
+            # 闭合括号与开括号对齐
+            lines.append(close_indent + ')')
             return '\n'.join(lines)
 
         # 如果没有需要分割的，返回原内容
@@ -4482,12 +4470,12 @@ def _format_where_clause(where: str) -> List[str]:
         conditions = _split_by_logical_op(where, 'AND')
 
         if conditions:
-            first_formatted = _format_condition_with_ors(conditions[0].strip(), 4)
+            first_formatted = _format_condition_with_ors(conditions[0].strip(), 0, "WHERE")
             # WHERE 与 FROM 对齐（无缩进）
             lines.append(f'WHERE {first_formatted}')
 
             for cond in conditions[1:]:
-                cond_formatted = _format_condition_with_ors(cond.strip(), 4)
+                cond_formatted = _format_condition_with_ors(cond.strip(), 4, "AND")
                 # AND 缩进 4 个空格
                 lines.append(f'    AND {cond_formatted}')
 
@@ -4619,11 +4607,31 @@ def _format_union_statement(sql: str, keyword_case: str = 'upper') -> str:
     return '\n'.join(formatted_parts)
 
 
-def _format_condition_with_ors(condition: str, base_indent: int) -> str:
-    """Format a condition that may contain multiple ORs - V4 原有逻辑"""
-    # 首先处理括号内的连续 OR/AND 条件
-    condition = _split_parenthesized_conditions(condition, base_indent)
+def _format_condition_with_ors(condition: str, base_indent: int, keyword: str = "") -> str:
+    """Format a condition that may contain multiple ORs
 
+    Args:
+        condition: 条件表达式
+        base_indent: 基础缩进（空格数）
+        keyword: 可选的关键字（如 "WHERE", "WHEN"），用于计算括号位置
+    """
+    # 计算开括号位置（如果有括号）
+    open_paren_pos = None
+    if keyword:
+        # 构建上下文行：基础缩进 + 关键字 + 空格 + 条件
+        context_line = ' ' * base_indent + keyword + ' ' + condition
+        paren_idx = context_line.find('(')
+        if paren_idx != -1:
+            open_paren_pos = paren_idx
+
+    # 首先处理括号内的连续 OR/AND 条件
+    formatted_condition = _split_parenthesized_conditions(condition, base_indent, open_paren_pos)
+
+    # 如果格式化后的结果包含换行，说明已经被处理过（括号内多条件），直接返回
+    if '\n' in formatted_condition:
+        return formatted_condition
+
+    condition = formatted_condition
     trailing_comment = ''
     core_condition = condition
 
@@ -4677,10 +4685,25 @@ def _format_condition_with_ors(condition: str, base_indent: int) -> str:
     return condition
 
 
-def _format_condition_with_ands(condition: str, base_indent: int) -> str:
-    """Format a condition that may contain multiple ANDs - V4 原有逻辑"""
+def _format_condition_with_ands(condition: str, base_indent: int, keyword: str = "") -> str:
+    """Format a condition that may contain multiple ANDs
+
+    Args:
+        condition: 条件表达式
+        base_indent: 基础缩进（空格数）
+        keyword: 可选的关键字（如 "WHERE", "WHEN"），用于计算括号位置
+    """
+    # 计算开括号位置（如果有括号）
+    open_paren_pos = None
+    if keyword:
+        # 构建上下文行：基础缩进 + 关键字 + 空格 + 条件
+        context_line = ' ' * base_indent + keyword + ' ' + condition
+        paren_idx = context_line.find('(')
+        if paren_idx != -1:
+            open_paren_pos = paren_idx
+
     # 首先处理括号内的连续 OR/AND 条件
-    condition = _split_parenthesized_conditions(condition, base_indent)
+    condition = _split_parenthesized_conditions(condition, base_indent, open_paren_pos)
 
     and_parts = _split_by_logical_op(condition, 'AND')
     if len(and_parts) > 1:  # 改为 > 1，2个或更多AND就换行
