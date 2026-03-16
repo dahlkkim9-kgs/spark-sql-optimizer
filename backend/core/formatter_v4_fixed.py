@@ -2530,9 +2530,6 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                     else:
                                         result_lines.append(line)
                                         i += 1
-                                else:
-                                    result_lines.append(line)
-                                    i += 1
                                 indented_subquery = '\n'.join(result_lines)
 
                             clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + close_paren_indent + ')')
