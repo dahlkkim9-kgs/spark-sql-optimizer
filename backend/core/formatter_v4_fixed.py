@@ -1366,6 +1366,11 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         group_by_line = f'GROUP BY {parts["group_by"]}'
         lines.append('\n' + group_by_line)
 
+    # HAVING clause（不缩进）
+    if parts['having']:
+        having_line = f'HAVING {parts["having"]}'
+        lines.append('\n' + having_line)
+
     # ORDER BY clause（不缩进）
     if parts['order_by']:
         order_by_line = f'ORDER BY {parts["order_by"]}'
@@ -2321,6 +2326,7 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
         'joins': [],
         'where': '',
         'group_by': '',
+        'having': '',
         'order_by': '',
         'distribute_by': ''
     }
@@ -2534,6 +2540,32 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
 
                             clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + close_paren_indent + ')')
 
+                            # 子查询恢复后，检查闭括号后是否需要换行（LATERAL VIEW 等关键字）
+                            # 模式: ) alias KEYWORD 或 ) KEYWORD，需要在 KEYWORD 前换行
+                            # 使用正则表达式查找闭括号后的关键字前添加换行
+                            import re as re_module
+                            # 匹配: ) [alias] LATERAL VIEW 或其他需要换行的关键字
+                            # 需要保留别名，但在关键字前换行
+                            lateral_keywords_pattern = r'\)(\s+[^\s\n]+)?\s+(LATERAL\s+VIEW|PIVOT|UNPIVOT)'
+                            def lateral_newline_replacer(match):
+                                closing_paren = match.group(0)[0]  # )
+                                alias = match.group(1) if match.group(1) else ''
+                                keyword = match.group(2)
+                                if alias:
+                                    return f'){alias}\n{keyword}'
+                                else:
+                                    return f')\n{keyword}'
+                            clause_content = re_module.sub(lateral_keywords_pattern, lateral_newline_replacer, clause_content, flags=re_module.IGNORECASE)
+
+                            # 额外处理：同一行中的多个 LATERAL VIEW 需要分离
+                            # 模式: LATERAL VIEW ... LATERAL VIEW，在第二个 LATERAL VIEW 前换行
+                            multiple_lateral_pattern = r'(LATERAL\s+VIEW[^\n]*?)\s+(LATERAL\s+VIEW)'
+                            def multiple_lateral_replacer(match):
+                                first_lateral = match.group(1)
+                                second_lateral = match.group(2)
+                                return f'{first_lateral}\n{second_lateral}'
+                            clause_content = re_module.sub(multiple_lateral_pattern, multiple_lateral_replacer, clause_content, flags=re_module.IGNORECASE)
+
                             # 子查询恢复后，检查是否有 OVER 占位符遗留
                             over_pattern = r'(__OVER_\d+__)'
                             over_matches = re.findall(over_pattern, clause_content)
@@ -2607,6 +2639,8 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
             parts['where'] = clause_content
         elif clause_type == 'GROUP_BY':
             parts['group_by'] = clause_content
+        elif clause_type == 'HAVING':
+            parts['having'] = clause_content
         elif clause_type == 'ORDER_BY':
             parts['order_by'] = clause_content
         elif clause_type == 'DISTRIBUTE_BY':
@@ -4408,6 +4442,22 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
                     lines.append(f'    OR {op.strip()}')
             else:
                 lines.append(f'    AND {cond}')
+
+    # 添加 GROUP BY 子句支持
+    if parts['group_by']:
+        lines.append(f'GROUP BY {parts["group_by"]}')
+
+    # 添加 HAVING 子句支持
+    if parts['having']:
+        lines.append(f'HAVING {parts["having"]}')
+
+    # 添加 ORDER BY 子句支持
+    if parts['order_by']:
+        lines.append(f'ORDER BY {parts["order_by"]}')
+
+    # 添加 DISTRIBUTE BY 子句支持
+    if parts['distribute_by']:
+        lines.append(f'DISTRIBUTE BY {parts["distribute_by"]}')
 
     return '\n'.join(lines)
 

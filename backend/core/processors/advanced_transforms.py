@@ -491,8 +491,11 @@ class AdvancedTransformsProcessor(BaseProcessor):
         简单的格式化规则：
         - 关键字独占一行或与第一列同行（取决于长度）
         - 多列时，每列独占一行并使用逗号前缀
+        - 保留原始的多行格式（如果原始是多行）
         """
         clauses = clauses.strip()
+        # 检查原始是否是多行格式
+        is_multiline = '\n' in clauses
 
         # 转换关键字大小写
         if keyword_case == 'upper':
@@ -540,7 +543,24 @@ class AdvancedTransformsProcessor(BaseProcessor):
             # 格式化这个子句
             if keyword in ('GROUP BY', 'ORDER BY'):
                 # 处理 GROUP BY / ORDER BY（多列可能换行）
-                if ',' in content:
+                # 检查原始内容是否是多行格式
+                original_content_part = None
+                for j in range(i - 1, len(parts) - 1, 2):
+                    if parts[j].upper() == keyword and j + 1 < len(parts):
+                        original_content_part = parts[j + 1]
+                        break
+
+                # 如果原始是多行且有逗号，保留多行格式
+                if original_content_part and '\n' in original_content_part and ',' in content:
+                    columns = [c.strip() for c in content.split(',')]
+                    formatted.append(keyword)
+                    for j, col in enumerate(columns):
+                        if j == 0:
+                            formatted.append(f'    {col}')
+                        else:
+                            formatted.append(f'     , {col}')
+                elif ',' in content:
+                    # 单行格式但有逗号，也分成多行（更易读）
                     columns = [c.strip() for c in content.split(',')]
                     formatted.append(keyword)
                     for j, col in enumerate(columns):
