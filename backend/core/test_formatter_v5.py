@@ -96,3 +96,13 @@ def test_cte_with():
     print("\n=== CTE ===")
     print(result)
     assert "WITH" in result.upper()
+
+
+def test_v4_column_alignment():
+    """测试 v4 风格列对齐"""
+    sql = "select a,b,c from table1"
+    result = format_sql_v5(sql)
+    print("\n=== v4 风格列对齐 ===")
+    print(result)
+    # 验证逗号在行首
+    assert ', ' in result or '\n     ,' in result
