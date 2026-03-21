@@ -24,8 +24,21 @@ class SQLFormatterV5:
         Returns:
             格式化后的 SQL
         """
-        # TODO: 实现
-        return sql
+        try:
+            # 解析为 AST
+            ast = parse(sql, dialect=dialect, read=dialect)
+
+            if not ast:
+                return sql
+
+            # 使用 sqlglot 内置格式化作为起点
+            formatted = ast[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
+
+            return formatted
+
+        except Exception as e:
+            # 解析失败时返回原 SQL
+            return sql
 
 
 def format_sql_v5(sql: str, **options) -> str:
