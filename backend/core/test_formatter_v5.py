@@ -49,3 +49,31 @@ def test_with_join():
     print(result)
     assert "JOIN" in result.upper()
     assert "ON" in result.upper()
+
+
+def test_subquery_in_select():
+    """测试 SELECT 中的子查询"""
+    sql = "select a,(select max(x) from t2 where t2.id=t1.id) as max_x from t1"
+    result = format_sql_v5(sql)
+    print("\n=== 子查询 ===")
+    print(result)
+    # 应该正确处理嵌套
+    assert "SELECT" in result.upper()
+
+
+def test_nested_subquery():
+    """测试深层嵌套子查询"""
+    sql = "select a,(select b from (select c from t1)) as nested from t2"
+    result = format_sql_v5(sql)
+    print("\n=== 深层嵌套 ===")
+    print(result)
+    assert "SELECT" in result.upper()
+
+
+def test_exists_subquery():
+    """测试 EXISTS 子查询"""
+    sql = "select * from t1 where exists (select 1 from t2 where t2.id=t1.id)"
+    result = format_sql_v5(sql)
+    print("\n=== EXISTS ===")
+    print(result)
+    assert "EXISTS" in result.upper()
