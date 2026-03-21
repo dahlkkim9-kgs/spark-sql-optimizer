@@ -29,6 +29,8 @@ class SQLFormatterV5:
                  , b
                  , c
             FROM t1
+
+        注意：只处理最外层 SELECT 的列，子查询保持原样
         """
         lines = sql.split('\n')
         result = []
@@ -42,47 +44,90 @@ class SQLFormatterV5:
             if stripped.startswith('SELECT'):
                 # 获取缩进
                 indent = line[:line.index('SELECT')]
-                result.append(line)  # 先添加 SELECT 行
 
                 # 查找 SELECT 后面的列
                 i += 1
-                first_column = True
-                columns = []
+                columns = []  # 存储列信息 (type, content)
 
                 while i < len(lines):
-                    col_line = lines[i].strip()
+                    col_line = lines[i]
+                    col_stripped = col_line.strip()
+
                     # 检测 FROM/JOIN 等结束列列表
-                    if (col_line.startswith('FROM') or
-                        col_line.startswith('JOIN') or
-                        col_line.startswith('INNER') or
-                        col_line.startswith('LEFT') or
-                        col_line.startswith('RIGHT') or
-                        col_line.startswith('FULL') or
-                        col_line.startswith('CROSS') or
-                        col_line.startswith('WHERE') or
-                        col_line.startswith('GROUP') or
-                        col_line.startswith('HAVING') or
-                        col_line.startswith('ORDER') or
-                        col_line.startswith('LIMIT')):
+                    if (col_stripped.startswith('FROM') or
+                        col_stripped.startswith('JOIN') or
+                        col_stripped.startswith('INNER') or
+                        col_stripped.startswith('LEFT') or
+                        col_stripped.startswith('RIGHT') or
+                        col_stripped.startswith('FULL') or
+                        col_stripped.startswith('CROSS') or
+                        col_stripped.startswith('WHERE') or
+                        col_stripped.startswith('GROUP') or
+                        col_stripped.startswith('HAVING') or
+                        col_stripped.startswith('ORDER') or
+                        col_stripped.startswith('LIMIT')):
                         break
 
                     # 跳过空行
-                    if not col_line:
+                    if not col_stripped:
                         i += 1
                         continue
 
-                    # 提取列名（处理逗号）
-                    col_name = col_line.rstrip(',').strip()
-                    columns.append(col_name)
+                    # 检查是否是子查询开始（括号开头）
+                    if col_stripped.startswith('('):
+                        # 收集子查询的所有行
+                        sub_lines = [col_line]
+                        i += 1
+                        paren_count = col_line.count('(') - col_line.count(')')
+                        while i < len(lines) and paren_count > 0:
+                            sub_lines.append(lines[i])
+                            paren_count += lines[i].count('(') - lines[i].count(')')
+                            i += 1
+                        # 收集子查询后的别名行（如果有）
+                        while i < len(lines):
+                            next_stripped = lines[i].strip()
+                            # 如果是下一个列（以逗号结尾）或子句关键字，停止
+                            if (next_stripped.startswith('FROM') or
+                                next_stripped.startswith('WHERE') or
+                                next_stripped.endswith(',') or
+                                next_stripped.startswith(')')):
+                                break
+                            # 可能是别名行（AS xxx）
+                            if next_stripped.startswith('AS') or ' AS ' in next_stripped:
+                                sub_lines.append(lines[i])
+                                i += 1
+                                break
+                            # 其他情况也作为别名行
+                            sub_lines.append(lines[i])
+                            i += 1
+                        columns.append(('subquery', '\n'.join(sub_lines)))
+                        continue
+
+                    # 普通列
+                    # 移除结尾的逗号
+                    col_name = col_stripped.rstrip(',').strip()
+                    if col_name:
+                        columns.append(('simple', col_name))
                     i += 1
 
                 # 格式化列
                 if columns:
-                    # 第一列合并到 SELECT 行
-                    result[-1] = f"{indent}SELECT {columns[0]}"
-                    # 后续列使用逗号在行首
-                    for col in columns[1:]:
-                        result.append(f"{indent}     , {col}")
+                    # 第一列
+                    if columns[0][0] == 'simple':
+                        result.append(f"{indent}SELECT {columns[0][1]}")
+                    else:  # subquery
+                        result.append(f"{indent}SELECT")
+                        result.append(columns[0][1])
+
+                    # 后续列
+                    for col_type, col_content in columns[1:]:
+                        if col_type == 'simple':
+                            result.append(f"{indent}     , {col_content}")
+                        else:  # subquery
+                            result.append(f"{indent}     ,")
+                            result.append(col_content)
+                else:
+                    result.append(line)
 
                 # 继续处理（i 已经指向下一行）
                 continue
