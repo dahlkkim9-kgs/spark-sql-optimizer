@@ -42,10 +42,17 @@ class SQLFormatterV5:
             line = lines[i]
             stripped = line.strip()
 
-            # 检测 SELECT 子句
+            # 检测 SELECT 子句（包括 SELECT DISTINCT, SELECT ALL 等）
             if stripped.startswith('SELECT'):
                 # 获取缩进
                 indent = line[:line.index('SELECT')]
+
+                # 提取 SELECT 修饰符（DISTINCT, ALL 等）
+                select_modifier = ""
+                if " DISTINCT" in stripped:
+                    select_modifier = " DISTINCT"
+                elif " ALL" in stripped:
+                    select_modifier = " ALL"
 
                 # 查找 SELECT 后面的列
                 i += 1
@@ -119,13 +126,13 @@ class SQLFormatterV5:
                 if columns:
                     # 第一列
                     if columns[0][0] == 'simple' and not columns[0][2]:
-                        result.append(f"{indent}SELECT {columns[0][1]}")
+                        result.append(f"{indent}SELECT{select_modifier} {columns[0][1]}")
                     elif columns[0][0] == 'simple':
                         # 带注释的列，保持原样
-                        result.append(f"{indent}SELECT")
+                        result.append(f"{indent}SELECT{select_modifier}")
                         result.append(lines[1])  # 原始第一列行
                     else:  # subquery
-                        result.append(f"{indent}SELECT")
+                        result.append(f"{indent}SELECT{select_modifier}")
                         result.append(columns[0][1])
 
                     # 后续列
@@ -141,7 +148,7 @@ class SQLFormatterV5:
                             result.append(f"{indent}     ,")
                             result.append(col_content)
                 else:
-                    result.append(line)
+                    result.append(f"{indent}SELECT{select_modifier}")
 
                 # 继续处理（i 已经指向下一行）
                 continue
