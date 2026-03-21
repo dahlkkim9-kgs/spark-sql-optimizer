@@ -106,3 +106,30 @@ def test_v4_column_alignment():
     print(result)
     # 验证逗号在行首
     assert ', ' in result or '\n     ,' in result
+
+
+def test_create_table():
+    """测试 CREATE TABLE"""
+    sql = "create table if not exists t1 (a int comment 'column a',b string,c double) comment 'table t1' partitioned by (dt string)"
+    result = format_sql_v5(sql)
+    print("\n=== CREATE TABLE ===")
+    print(result)
+    assert "CREATE TABLE" in result.upper()
+
+
+def test_insert():
+    """测试 INSERT"""
+    sql = "insert into table t1 partition(dt='2024-01-01') select a,b from t2 where c>0"
+    result = format_sql_v5(sql)
+    print("\n=== INSERT ===")
+    print(result)
+    assert "INSERT" in result.upper()
+
+
+def test_over_window():
+    """测试 OVER 窗口函数"""
+    sql = "select a,row_number() over (partition by b order by c desc) as rn from t1"
+    result = format_sql_v5(sql)
+    print("\n=== OVER 窗口 ===")
+    print(result)
+    assert "OVER" in result.upper()
