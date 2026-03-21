@@ -288,6 +288,34 @@ async def format_sql_v5_endpoint(request: FormatRequest):
         return {"error": str(e), "success": False}
 
 
+@app.post("/api/format-v5")
+async def format_sql_v5_sqlglot_endpoint(request: FormatRequest):
+    """v5 格式化 API (基于 sqlglot AST 解析)"""
+    try:
+        import sys
+        import os
+
+        # 确保 core 目录在路径中
+        core_path = os.path.join(os.path.dirname(__file__), '..', 'core')
+        if core_path not in sys.path:
+            sys.path.insert(0, core_path)
+
+        from core.formatter_v5_sqlglot import format_sql_v5
+
+        # 使用 v5 sqlglot 版本格式化
+        formatted = format_sql_v5(request.sql, indent=request.indent or 4)
+
+        return {
+            "success": True,
+            "formatted": formatted,
+            "version": "v5-sqlglot"
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "success": False}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8888)
