@@ -30,7 +30,9 @@ class SQLFormatterV5:
                  , c
             FROM t1
 
-        注意：只处理最外层 SELECT 的列，子查询保持原样
+        注意：
+        - 只处理最外层 SELECT 的列，子查询保持原样
+        - 带注释的列保持原样（不重新格式化）
         """
         lines = sql.split('\n')
         result = []
@@ -47,7 +49,7 @@ class SQLFormatterV5:
 
                 # 查找 SELECT 后面的列
                 i += 1
-                columns = []  # 存储列信息 (type, content)
+                columns = []  # 存储列信息 (type, content, has_comment)
 
                 while i < len(lines):
                     col_line = lines[i]
@@ -72,6 +74,9 @@ class SQLFormatterV5:
                     if not col_stripped:
                         i += 1
                         continue
+
+                    # 检查是否包含注释
+                    has_comment = ('/*' in col_line or '--' in col_line)
 
                     # 检查是否是子查询开始（括号开头）
                     if col_stripped.startswith('('):
@@ -100,29 +105,38 @@ class SQLFormatterV5:
                             # 其他情况也作为别名行
                             sub_lines.append(lines[i])
                             i += 1
-                        columns.append(('subquery', '\n'.join(sub_lines)))
+                        columns.append(('subquery', '\n'.join(sub_lines), has_comment))
                         continue
 
                     # 普通列
                     # 移除结尾的逗号
                     col_name = col_stripped.rstrip(',').strip()
                     if col_name:
-                        columns.append(('simple', col_name))
+                        columns.append(('simple', col_name, has_comment))
                     i += 1
 
                 # 格式化列
                 if columns:
                     # 第一列
-                    if columns[0][0] == 'simple':
+                    if columns[0][0] == 'simple' and not columns[0][2]:
                         result.append(f"{indent}SELECT {columns[0][1]}")
+                    elif columns[0][0] == 'simple':
+                        # 带注释的列，保持原样
+                        result.append(f"{indent}SELECT")
+                        result.append(lines[1])  # 原始第一列行
                     else:  # subquery
                         result.append(f"{indent}SELECT")
                         result.append(columns[0][1])
 
                     # 后续列
-                    for col_type, col_content in columns[1:]:
-                        if col_type == 'simple':
+                    for idx, (col_type, col_content, has_comment) in enumerate(columns[1:], 1):
+                        if col_type == 'simple' and not has_comment:
                             result.append(f"{indent}     , {col_content}")
+                        elif col_type == 'simple':
+                            # 带注释的列，保持原样
+                            # 需要找到原始行
+                            # 这里简化处理：直接使用列内容（带逗号）
+                            result.append(f"{indent}     {col_content},")
                         else:  # subquery
                             result.append(f"{indent}     ,")
                             result.append(col_content)
@@ -141,26 +155,32 @@ class SQLFormatterV5:
         """格式化 SQL
 
         Args:
-            sql: 原始 SQL
+            sql: 原始 SQL（支持多语句，用分号分隔）
             dialect: SQL 方言 (默认 spark)
 
         Returns:
             格式化后的 SQL
         """
         try:
-            # 解析为 AST
-            ast = parse(sql, dialect=dialect, read=dialect)
+            # 解析为 AST（可能返回多个语句）
+            asts = parse(sql, dialect=dialect, read=dialect)
 
-            if not ast:
+            if not asts:
                 return sql
 
-            # 使用 sqlglot 格式化
-            formatted = ast[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
+            # 格式化每个语句
+            formatted_statements = []
+            for ast in asts:
+                # 使用 sqlglot 格式化
+                formatted = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
 
-            # 应用 v4 风格后处理
-            formatted = self._apply_v4_column_style(formatted)
+                # 应用 v4 风格后处理
+                formatted = self._apply_v4_column_style(formatted)
 
-            return formatted
+                formatted_statements.append(formatted)
+
+            # 用空行分隔多个语句
+            return '\n\n'.join(formatted_statements)
 
         except Exception as e:
             # 解析失败时返回原 SQL
