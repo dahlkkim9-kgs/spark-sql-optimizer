@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import Editor from '@monaco-editor/react';
 import './App.css';
+import { API_URLS, getFormatUrl, FORMATTER_VERSIONS, type FormatterVersion } from './config';
+import { VersionInfo } from './VersionInfo';
 
 interface Issue {
   rule: string;
@@ -21,11 +23,22 @@ interface AnalysisResult {
   low_priority: number;
 }
 
+interface FormatResponse {
+  success: boolean;
+  formatted: string;
+  original: string;
+  version?: string;
+  formatter_file?: string;
+}
+
 function App() {
   const [sql, setSql] = useState('-- 输入你的Spark SQL\nSELECT * FROM table1 JOIN table2');
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
+  const [formatterVersion, setFormatterVersion] = useState<string>('');
+  // 新增: 格式化器版本选择
+  const [selectedFormatter, setSelectedFormatter] = useState<FormatterVersion>(FORMATTER_VERSIONS.V4);
 
   const handleEditorWillMount = () => {
     // 配置 Monaco Editor
@@ -44,13 +57,18 @@ function App() {
     setLoading(true);
     setEditorError(null);
     try {
-      // 调用后端API格式化SQL (使用 v4fixed 端点)
-      const response = await fetch('http://localhost:8888/format/v4fixed', {
+      // 根据选择的版本获取对应的 API 端点
+      const formatUrl = getFormatUrl(selectedFormatter);
+
+      // 调用后端API格式化SQL
+      const response = await fetch(formatUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sql: sql,
-          keyword_case: 'upper'
+          options: {
+            keyword_case: 'upper'
+          }
         })
       });
 
@@ -59,6 +77,16 @@ function App() {
       }
 
       const data = await response.json();
+
+      // 调试：打印原始响应
+      console.log('API Response:', data);
+      console.log('Formatted SQL:', data.formatted);
+      console.log('Formatted SQL (repr):', JSON.stringify(data.formatted));
+
+      // 保存版本信息
+      if (data.version) {
+        setFormatterVersion(`${data.version} (${data.formatter_file || 'formatter_v4_fixed.py'})`);
+      }
 
       if (!data.success) {
         throw new Error(data.error || '格式化失败');
@@ -76,7 +104,7 @@ function App() {
       });
     } catch (error) {
       console.error('格式化失败:', error);
-      alert(`格式化失败: ${error}\n请确保后端服务已启动 (http://localhost:8888)`);
+      alert(`格式化失败: ${error}\n请确保后端服务已启动 (${API_URLS.format})`);
     } finally {
       setLoading(false);
     }
@@ -112,6 +140,16 @@ function App() {
           <div className="section-header">
             <h2>SQL编辑器</h2>
             <div className="actions">
+              {/* 格式化器版本选择器 */}
+              <select
+                value={selectedFormatter}
+                onChange={(e) => setSelectedFormatter(e.target.value as FormatterVersion)}
+                className="formatter-select"
+                title="选择格式化器版本"
+              >
+                <option value={FORMATTER_VERSIONS.V4}>V4 (正则表达式)</option>
+                <option value={FORMATTER_VERSIONS.V5}>V5 (sqlglot AST)</option>
+              </select>
               <button className="btn btn-secondary" onClick={() => setSql('')}>
                 清空
               </button>
@@ -244,7 +282,10 @@ function App() {
       </main>
 
       <footer className="app-footer">
-        <p>基于MIT许可协议的开源组件构建 | 离线版本</p>
+        <p>
+          基于MIT许可协议的开源组件构建 | 离线版本
+          {formatterVersion && <span className="version-badge"> | {formatterVersion}</span>}
+        </p>
       </footer>
     </div>
   );
