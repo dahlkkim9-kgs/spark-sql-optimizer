@@ -77,3 +77,22 @@ def test_exists_subquery():
     print("\n=== EXISTS ===")
     print(result)
     assert "EXISTS" in result.upper()
+
+
+def test_case_when():
+    """测试 CASE WHEN"""
+    sql = "select case when x>0 then 'positive' when x<0 then 'negative' else 'zero' end as sign from t1"
+    result = format_sql_v5(sql)
+    print("\n=== CASE WHEN ===")
+    print(result)
+    assert "CASE" in result.upper()
+    assert "WHEN" in result.upper()
+
+
+def test_cte_with():
+    """测试 CTE WITH"""
+    sql = "with cte1 as (select a,b from t1),cte2 as (select c,d from t2) select * from cte1 join cte2 on cte1.a=cte2.c"
+    result = format_sql_v5(sql)
+    print("\n=== CTE ===")
+    print(result)
+    assert "WITH" in result.upper()
