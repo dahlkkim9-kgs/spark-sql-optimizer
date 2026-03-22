@@ -3,16 +3,38 @@
 SQL Formatter V5 - 基于 sqlglot AST 解析
 结合 v4 的格式化风格
 """
-from typing import Optional
+from typing import Optional, List
 from sqlglot import parse, exp
 from sqlglot.dialects import Spark
+
+# 共享工具和格式化器导入
+try:
+    from .sql_utils import split_by_semicolon
+    from .formatter_v4_fixed import format_sql_v4_fixed
+except ImportError:
+    from sql_utils import split_by_semicolon
+    from formatter_v4_fixed import format_sql_v4_fixed
+
+
+# 常量定义
+DOLLAR_PLACEHOLDER = "___DOLLAR_SIGN_PLACEHOLDER___"
 
 
 class SQLFormatterV5:
     """基于 sqlglot 的 SQL 格式化器"""
 
+    # 类常量
+    DOLLAR_PLACEHOLDER = DOLLAR_PLACEHOLDER
+
     def __init__(self, indent_spaces: int = 4):
         self.indent_spaces = indent_spaces
+
+    def _log(self, step: str, details: str = "") -> None:
+        """统一的日志输出方法"""
+        msg = f"[V5格式化器] {step}"
+        if details:
+            msg += f": {details}"
+        print(msg)
 
     def _apply_v4_column_style(self, sql: str) -> str:
         """应用 v4 风格的列对齐
@@ -164,13 +186,12 @@ class SQLFormatterV5:
         Spark SQL 使用 $ 进行变量替换（如 table_$date）
         sqlglot 无法正确解析这种语法，需要临时转义
         """
-        placeholder = "___DOLLAR_SIGN_PLACEHOLDER___"
-        escaped = sql.replace('$', placeholder)
-        return escaped, placeholder
+        escaped = sql.replace('$', self.DOLLAR_PLACEHOLDER)
+        return escaped, self.DOLLAR_PLACEHOLDER
 
-    def _unescape_dollar_signs(self, sql: str, placeholder: str) -> str:
+    def _unescape_dollar_signs(self, sql: str) -> str:
         """恢复 $ 符号"""
-        return sql.replace(placeholder, '$')
+        return sql.replace(self.DOLLAR_PLACEHOLDER, '$')
 
     def format(self, sql: str, dialect: str = "spark") -> str:
         """格式化 SQL
@@ -183,7 +204,7 @@ class SQLFormatterV5:
             格式化后的 SQL
         """
         # 临时转义 $ 符号
-        escaped_sql, placeholder = self._escape_dollar_signs(sql)
+        escaped_sql, _ = self._escape_dollar_signs(sql)
 
         # 首先尝试整体解析
         try:
@@ -200,7 +221,7 @@ class SQLFormatterV5:
                 formatted = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
 
                 # 恢复 $ 符号
-                formatted = self._unescape_dollar_signs(formatted, placeholder)
+                formatted = self._unescape_dollar_signs(formatted)
 
                 # 应用 v4 风格后处理
                 formatted = self._apply_v4_column_style(formatted)
@@ -211,38 +232,14 @@ class SQLFormatterV5:
             return '\n\n'.join(formatted_statements)
 
         except Exception as e:
-            # 整体解析失败，尝试逐语句解析
-            import traceback
-            print(f"[V5格式化器] 整体解析失败: {type(e).__name__}，尝试逐语句混合解析")
+            # 整体解析失败，尝试逐语句混合解析
+            self._log("整体解析失败", f"{type(e).__name__}，尝试逐语句混合解析")
 
-            # 按分号分割语句
-            statements = []
-            current_stmt = []
-            paren_depth = 0
-
-            for line in sql.split('\n'):
-                stripped = line.strip()
-                if not stripped:
-                    current_stmt.append(line)
-                    continue
-
-                # 计算括号深度
-                paren_depth += line.count('(') - line.count(')')
-
-                current_stmt.append(line)
-
-                # 检测语句结束（分号且括号平衡）
-                if ';' in line and paren_depth == 0:
-                    statements.append('\n'.join(current_stmt))
-                    current_stmt = []
-
-            # 添加最后一个语句
-            if current_stmt:
-                statements.append('\n'.join(current_stmt))
+            # 使用共享的语句分割函数（更高效，支持字符串处理）
+            statements = split_by_semicolon(sql)
 
             # 逐语句尝试解析
             formatted_statements = []
-            from formatter_v4_fixed import format_sql_v4_fixed
 
             for i, stmt in enumerate(statements):
                 stmt = stmt.strip()
@@ -259,21 +256,21 @@ class SQLFormatterV5:
                     asts = parse(escaped_stmt, dialect=dialect, read=dialect)
                     if asts:
                         formatted = asts[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
-                        formatted = self._unescape_dollar_signs(formatted, _)
+                        formatted = self._unescape_dollar_signs(formatted)
                         formatted = self._apply_v4_column_style(formatted)
                         formatted_statements.append(formatted)
-                        print(f"[V5格式化器] 语句 {i+1}/{len(statements)}: 使用 V5 sqlglot")
+                        self._log(f"语句 {i+1}/{len(statements)}", "使用 V5 sqlglot")
                     else:
                         raise ValueError("No AST returned")
-                except Exception as stmt_error:
+                except Exception:
                     # 该语句用 sqlglot 解析失败，回退到 V4
-                    print(f"[V5格式化器] 语句 {i+1}/{len(statements)}: sqlglot失败，使用 V4")
+                    self._log(f"语句 {i+1}/{len(statements)}", "sqlglot失败，使用 V4")
                     formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
                     formatted_statements.append(formatted)
 
             # 合并所有语句
             result = '\n\n'.join(formatted_statements)
-            print(f"[V5格式化器] 混合解析完成: {len(statements)} 个语句")
+            self._log("混合解析完成", f"{len(statements)} 个语句")
             return result
 
 
