@@ -26,13 +26,17 @@ else:
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from core.analyzer import StaticAnalyzer
-from core.formatter_v4 import format_sql_v4
+from core.formatter_v4_fixed import format_sql_v4_fixed
 
+# 版本信息
+API_VERSION = "1.0.0"
+FORMATTER_VERSION = "v4.5-20260320-fulltest"
+FORMATTER_FILE = "formatter_v4_fixed.py"
 
 app = FastAPI(
     title="Spark SQL 优化工具 API",
     description="离线Spark SQL静态分析和优化建议",
-    version="1.0.0"
+    version=API_VERSION
 )
 
 # 配置CORS
@@ -87,6 +91,17 @@ class FormatResult(BaseModel):
     formatted_sql: str
 
 
+class LegacyFormatOptions(BaseModel):
+    keyword_case: Optional[str] = "upper"  # upper 或 lower
+
+
+class LegacyFormatRequest(BaseModel):
+    sql: str
+    options: Optional[LegacyFormatOptions] = None
+    # 兼容部分调用方直接传 keyword_case 的情况
+    keyword_case: Optional[str] = None
+
+
 @app.get("/")
 def read_root():
     """API根路径"""
@@ -99,8 +114,19 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    """健康检查"""
-    return {"status": "healthy"}
+    """健康检查，返回服务状态和版本信息"""
+    return {
+        "status": "healthy",
+        "service": "spark-sql-optimizer",
+        "api_version": API_VERSION,
+        "formatter_version": FORMATTER_VERSION,
+        "formatter_file": FORMATTER_FILE
+    }
+
+@app.get("/api/health")
+def health_check_api():
+    """兼容旧前端的健康检查路径"""
+    return health_check()
 
 
 @app.post("/analyze", response_model=AnalysisResult)
@@ -236,56 +262,68 @@ async def format_sql_v4fixed_endpoint(request: FormatRequest):
 
 @app.post("/format/v5")
 async def format_sql_v5_endpoint(request: FormatRequest):
-    """Format SQL with v5 - 支持高级语法（集合操作、窗口函数、MERGE、LATERAL VIEW等）"""
+    """Format SQL with v5 - 直接使用 v4_fixed（已包含所有高级语法支持）
+
+    注意：V5 的分层架构已被简化，直接使用 v4_fixed。
+    v4_fixed 已支持：UNION、CASE WHEN、OVER、CTE、子查询、MERGE、LATERAL VIEW 等高级语法。
+    """
     try:
         import sys
         import os
-        import re
 
         # 确保 core 目录在路径中
         core_path = os.path.join(os.path.dirname(__file__), '..', 'core')
         if core_path not in sys.path:
             sys.path.insert(0, core_path)
 
-        # 清除所有 formatter 相关模块缓存
-        modules_to_remove = [k for k in sys.modules.keys()
-                              if 'formatter' in k or 'parser' in k or 'processor' in k]
+        # 清除 formatter 模块缓存
+        modules_to_remove = [k for k in sys.modules.keys() if 'formatter' in k]
         for mod in modules_to_remove:
             del sys.modules[mod]
 
-        # 直接导入各个组件
-        from parser.sql_classifier import SQLClassifier
-        from processors.set_operations import SetOperationsProcessor
-        from processors.window_functions import WindowFunctionsProcessor
-        from processors.data_operations import DataOperationsProcessor
-        from processors.advanced_transforms import AdvancedTransformsProcessor
         from formatter_v4_fixed import format_sql_v4_fixed
 
-        # 分类 SQL
-        syntax_types = SQLClassifier.classify(request.sql)
-
-        # 根据类型选择处理器
-        if 'data_operations' in syntax_types:
-            processor = DataOperationsProcessor()
-            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
-        elif 'set_operations' in syntax_types:
-            processor = SetOperationsProcessor()
-            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
-        elif 'window_functions' in syntax_types:
-            processor = WindowFunctionsProcessor()
-            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
-        elif 'advanced_transforms' in syntax_types:
-            processor = AdvancedTransformsProcessor()
-            result = processor.process(request.sql, keyword_case=request.keyword_case or 'upper')
-        else:
-            # 使用 v4_fixed 作为默认
-            result = format_sql_v4_fixed(request.sql, keyword_case=request.keyword_case or 'upper')
+        # 直接使用 v4_fixed
+        result = format_sql_v4_fixed(request.sql, keyword_case=request.keyword_case or 'upper')
 
         return {"formatted": result, "success": True}
     except Exception as e:
         import traceback
         traceback.print_exc()
         return {"error": str(e), "success": False}
+
+@app.post("/api/format")
+async def format_sql_legacy_endpoint(request: LegacyFormatRequest):
+    """
+    兼容旧前端（原 Flask `/api/format`）的返回结构：
+    { success: bool, formatted: str, original: str, error?: str, version?: str }
+
+    版本信息：确保前端可以验证使用的格式化器版本
+    """
+    try:
+        # 强制重新加载模块，确保使用最新代码
+        import importlib
+        import core.formatter_v4_fixed
+        importlib.reload(core.formatter_v4_fixed)
+        from core.formatter_v4_fixed import format_sql_v4_fixed
+
+        keyword_case = (
+            request.keyword_case
+            or (request.options.keyword_case if request.options else None)
+            or "upper"
+        )
+        formatted = format_sql_v4_fixed(request.sql, keyword_case=keyword_case)
+        return {
+            "success": True,
+            "formatted": formatted,
+            "original": request.sql,
+            "version": FORMATTER_VERSION,
+            "formatter_file": FORMATTER_FILE
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e), "original": request.sql}
 
 
 @app.post("/api/format-v5")
@@ -318,4 +356,5 @@ async def format_sql_v5_sqlglot_endpoint(request: FormatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8888)
+    # 与 Electron 开发环境保持一致，统一端口
+    uvicorn.run(app, host="127.0.0.1", port=8889)

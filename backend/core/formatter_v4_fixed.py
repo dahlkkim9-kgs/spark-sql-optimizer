@@ -6,6 +6,11 @@ SQL Formatter V4 - 修复版
 import re
 from typing import List, Dict, Tuple
 
+try:
+    from .indent_context import IndentContext
+except ImportError:
+    from indent_context import IndentContext
+
 
 # ==================== 预编译正则表达式（性能优化） ====================
 # 注释相关
@@ -68,7 +73,7 @@ EMPTY_LINES_PATTERN = re.compile(r'\n{3,}')
 
 
 # ==================== 函数多行结构保护 ====================
-def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
+def _protect_multiline_functions(sql: str, skip_subquery_funcs: bool = False) -> Tuple[str, Dict[str, str]]:
     """保护函数调用中的多行结构，避免被 normalize 压缩
 
     例如：CONCAT('a',
@@ -76,6 +81,10 @@ def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
     会被替换为占位符 __FUNC_0__，normalize 后再恢复
 
     注意：需要排除 SQL 关键字，避免将 FROM (SELECT) 等误认为函数调用
+
+    Args:
+        sql: 要处理的 SQL 字符串
+        skip_subquery_funcs: 是否跳过包含子查询的函数（让专门的处理器处理）
     """
     function_map = {}
     placeholder_count = 0
@@ -129,14 +138,43 @@ def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
             while i < len(sql) and sql[i] in ' \t':
                 i += 1
 
-            # 如果是括号，且标识符不是 SQL 关键字，说明这是函数调用
-            if i < len(sql) and sql[i] == '(' and identifier not in SQL_KEYWORDS:
+            # 检查是否是 database.table 或 schema.table 格式
+            # 如果后面跟 . 则不是函数调用（如 RA03.table_name）
+            if i < len(sql) and sql[i] == '.':
+                # 跳过点号
+                i += 1
+                while i < len(sql) and sql[i] in ' \t':
+                    i += 1
+                # 跳过第二个标识符（table_name）
+                while i < len(sql) and (sql[i].isalnum() or sql[i] == '_'):
+                    i += 1
+                # 跳过空白
+                while i < len(sql) and sql[i] in ' \t':
+                    i += 1
+
+            # 检查前面是否有 CREATE TABLE 关键字（避免将 CREATE TABLE 语句误认为函数）
+            # 向前查找最近的非空白字符
+            check_start = max(0, func_name_start - 150)
+            before_text = sql[check_start:func_name_start].upper()
+            # 检查是否是 CREATE TABLE table_name(...) 形式
+            # 使用更宽松的匹配：检查 CREATE TABLE 是否在 before_text 中，后面跟着表名和可能的空白
+            is_create_table = bool(re.search(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w.]*\s*\Z', before_text))
+
+            # 如果是括号，且标识符不是 SQL 关键字，且不是 CREATE TABLE 语句，说明这是函数调用
+            if i < len(sql) and sql[i] == '(' and identifier not in SQL_KEYWORDS and not is_create_table:
                 paren_start = i
                 paren_end = find_matching_paren(sql, paren_start)
 
                 if paren_end > 0:
                     # 提取完整的函数调用（包括函数名和括号内容）
                     func_call = sql[func_name_start:paren_end + 1]
+
+                    # 如果需要跳过包含子查询的函数，检查是否包含子查询
+                    if skip_subquery_funcs and re.search(r'\(\s*SELECT\b', func_call, re.IGNORECASE):
+                        # 包含子查询，跳过保护，直接添加原函数
+                        protected_sql.append(func_call)
+                        i = paren_end + 1
+                        continue
 
                     # 检查函数调用内部是否有换行
                     if '\n' in func_call:
@@ -167,10 +205,155 @@ def _protect_multiline_functions(sql: str) -> Tuple[str, Dict[str, str]]:
 
 
 def _restore_multiline_functions(sql: str, function_map: Dict[str, str]) -> str:
-    """恢复被保护的函数多行结构"""
+    """恢复被保护的函数多行结构，并修复函数内子查询的缩进"""
     result = sql
     for placeholder, original in function_map.items():
-        result = result.replace(placeholder, original)
+        # 检查函数是否包含子查询
+        if re.search(r'\(\s*SELECT\b', original, re.IGNORECASE):
+            # 找到占位符在结果中的位置
+            placeholder_pos = result.find(placeholder)
+            if placeholder_pos == -1:
+                # 占位符未找到，直接替换
+                result = result.replace(placeholder, original)
+                continue
+
+            # 计算占位符前的内容长度（用于确定缩进）
+            before_placeholder = result[:placeholder_pos]
+            # 找到占位符所在行的起始位置
+            last_newline = before_placeholder.rfind('\n')
+            if last_newline == -1:
+                # 占位符在第一行，line_start 就是从行首到占位符之前的内容
+                line_start = before_placeholder
+            else:
+                line_start = before_placeholder[last_newline + 1:]
+
+            # 从 original 中获取函数名
+            func_match = re.match(r'([A-Z]+)\(', original, re.IGNORECASE)
+            if func_match:
+                # 函数开括号的绝对位置 = 占位符前内容长度（即 line_start 的长度）
+                open_paren_pos = len(line_start)
+
+                # 提取函数中的子查询并格式化
+                formatted_func = _format_function_with_subqueries(original, open_paren_pos)
+                result = result[:placeholder_pos] + formatted_func + result[placeholder_pos + len(placeholder):]
+            else:
+                # 无法解析函数名，直接替换
+                result = result.replace(placeholder, original)
+        else:
+            # 普通函数，直接替换
+            result = result.replace(placeholder, original)
+    return result
+
+
+def _format_function_with_subqueries(func_call: str, open_paren_pos: int) -> str:
+    """Format function calls with subqueries, applying correct indentation
+
+    Args:
+        func_call: Function call string, e.g. "AVG((SELECT ...))"
+        open_paren_pos: Position of function opening parenthesis (relative to line start)
+
+    Returns:
+        Formatted function call
+    """
+    # 查找函数中的子查询
+    result = func_call
+    offset = 0
+
+    while True:
+        # 查找子查询
+        subquery_match = re.search(r'\(\s*SELECT\b', result[offset:], re.IGNORECASE)
+        if not subquery_match:
+            break
+
+        sub_start = offset + subquery_match.start()
+        sub_end = _find_matching_paren(result, sub_start)
+
+        if sub_end == -1:
+            break
+
+        # 提取子查询内容（不包含外层括号）
+        subquery_content = result[sub_start + 1:sub_end]
+
+        # 计算子查询的缩进
+        # 子查询位于函数内部，所以缩进 = 函数开括号位置 + 函数名长度 + 1（子查询开括号）
+        # 但这里我们简化计算：直接使用 open_paren_pos + 1 作为基础缩进
+        # 然后加上子查询在函数中的相对位置
+
+        # 计算子查询开括号相对于函数开括号的位置
+        # 例如：AVG((SELECT...))
+        #      0123456789
+        # 函数开括号在位置 3，子查询开括号在位置 4
+        # 所以子查询的缩进 = open_paren_pos + (子查询开括号在函数中的位置) + 1
+
+        # 计算子查询开括号相对于行首的位置
+        # 需要查找嵌套函数来确定子查询开括号的准确位置
+        # 例如：AVG(COALESCE((SELECT...)) 中，子查询在 COALESCE 内部
+
+        # 计算子查询开括号的绝对位置
+        # 关键修复：需要处理嵌套函数的情况（如 AVG(COALESCE((SELECT...))
+        # 方法：计算函数嵌套深度，每层嵌套增加 4 个空格的基础缩进
+        func_first_paren = func_call.find('(')
+        if func_first_paren == -1:
+            # 异常情况：找不到开括号，使用简化逻辑
+            last_nl = func_call.rfind('\n', 0, sub_start)
+            if last_nl == -1:
+                line_prefix = func_call[:sub_start]
+                open_paren_abs = open_paren_pos + len(line_prefix)
+            else:
+                line_prefix = func_call[last_nl + 1:sub_start]
+                open_paren_abs = len(line_prefix)
+        else:
+            # 检查子查询和函数开括号是否在同一行
+            func_paren_nl = func_call.rfind('\n', 0, func_first_paren)
+            sub_nl = func_call.rfind('\n', 0, sub_start)
+
+            if func_paren_nl == sub_nl:
+                # 同一行：计算嵌套函数深度
+                # 从子查询开括号往前找，计算有多少个开括号（表示嵌套深度）
+                before_sub = func_call[:sub_start]
+                open_count = before_sub.count('(')  # 包含函数开括号和中间嵌套
+                # 每层嵌套增加缩进
+                # 例如：AVG( COALESCE( ( SELECT
+                #      0   1       2   3   (3层开括号)
+                # 用户期望格式：
+                #   , AVG( COALESCE( (
+                #                      SELECT
+                #   其中 AVG 开括号位置 7，SELECT 缩进 23
+                #   公式：open_paren_abs = open_paren_pos * 2 + open_count * 4
+                open_paren_abs = open_paren_pos * 2 + open_count * 4
+            else:
+                # 不同行：子查询在后续行，使用该行的前导空格
+                sub_nl = func_call.rfind('\n', 0, sub_start)
+                if sub_nl == -1:
+                    # 没有换行（不应该走到这里）
+                    line_prefix = func_call[:sub_start]
+                    open_paren_abs = open_paren_pos + len(line_prefix)
+                else:
+                    # 获取子查询所在行的前导空格
+                    line_prefix = func_call[sub_nl + 1:sub_start]
+                    open_paren_abs = len(line_prefix) - len(line_prefix.lstrip())
+
+        # 子查询内容缩进 = 开括号位置 + 1；闭括号与开括号对齐
+        subquery_base_indent = open_paren_abs + 1
+        close_indent = open_paren_abs
+
+        # 格式化子查询
+        try:
+            ctx = IndentContext(base_indent=subquery_base_indent)
+            formatted_lines = _format_subquery(subquery_content, ctx, keyword_case='upper')
+
+            # 构建格式化后的子查询
+            formatted_subquery = f'(\n'
+            formatted_subquery += '\n'.join(formatted_lines)
+            formatted_subquery += f'\n{" " * close_indent})'
+
+            # 替换原始子查询
+            result = result[:sub_start] + formatted_subquery + result[sub_end + 1:]
+            offset = sub_start + len(formatted_subquery)
+        except Exception:
+            # 如果格式化失败，保持原样
+            offset = sub_end + 1
+
     return result
 
 
@@ -582,6 +765,14 @@ def _normalize_select_fields(sql: str) -> str:
 
         return result
 
+    # 检查是否包含函数中的子查询（如 AVG(SELECT...)）
+    # 如果有，跳过 normalize 以免破坏函数结构
+    has_function_subquery = bool(re.search(r'\(\s*SELECT\b', sql, re.IGNORECASE))
+
+    if has_function_subquery:
+        # 跳过 normalize，直接返回原 SQL
+        return sql
+
     # 使用保护的 SQL 进行 normalize
     normalized = re.sub(
         r'\bSELECT\b([\s\S]+?)(\bFROM\b)([\s\S]+?)(?=;|\Z)',
@@ -832,18 +1023,33 @@ def _align_standalone_comments(sql: str) -> str:
 
         # 检查是否是独立注释行（以 -- 开头）
         if stripped.startswith('--'):
-            # 查找上一行非空代码行的缩进
-            indent = 0
+            # 检查是否在 UNION 关键字之前（UNION 之间的注释不应缩进）
+            # 向前查找最近的非空行
+            prev_non_comment_idx = -1
             for j in range(i - 1, -1, -1):
                 if j >= 0:
-                    prev_line = lines[j]
-                    # 跳过空行和其他注释行
-                    if prev_line.strip() and not prev_line.strip().startswith('--'):
-                        indent = len(prev_line) - len(prev_line.lstrip())
+                    prev_line = lines[j].strip()
+                    if prev_line:
+                        prev_non_comment_idx = j
                         break
 
-            # 应用缩进
-            result.append(' ' * indent + stripped)
+            # 如果前一行是 UNION 关键字，不缩进注释
+            if (prev_non_comment_idx >= 0 and
+                lines[prev_non_comment_idx].strip().upper() in ('UNION', 'UNION ALL')):
+                result.append(stripped)
+            else:
+                # 正常情况：对齐到上一行代码的缩进
+                indent = 0
+                for j in range(i - 1, -1, -1):
+                    if j >= 0:
+                        prev_line = lines[j]
+                        # 跳过空行和其他注释行
+                        if prev_line.strip() and not prev_line.strip().startswith('--'):
+                            indent = len(prev_line) - len(prev_line.lstrip())
+                            break
+
+                # 应用缩进
+                result.append(' ' * indent + stripped)
         else:
             result.append(line)
 
@@ -1033,11 +1239,54 @@ def _protect_select_field_comments(sql: str) -> tuple:
     返回：(处理后的SQL, 字段列表) 或 (原SQL, None)
     """
     # 找到 SELECT ... FROM 之间的内容
-    select_match = re.search(r'\bSELECT\b(.+?)\bFROM\b', sql, re.IGNORECASE | re.DOTALL)
+    # 需要使用括号计数来找到正确的 FROM（不在子查询中的 FROM）
+    select_match = re.search(r'\bSELECT\b', sql, re.IGNORECASE)
     if not select_match:
         return sql, None
 
-    fields_section = select_match.group(1)
+    select_start = select_match.end()
+
+    # 从 SELECT 开始位置向后扫描，找到匹配的 FROM
+    paren_depth = 0
+    in_string = False
+    string_char = None
+    from_start = -1
+
+    i = select_start
+    while i < len(sql):
+        char = sql[i]
+
+        # 处理字符串
+        if char in ("'", '"') and (i == 0 or sql[i-1] != '\\'):
+            if not in_string:
+                in_string = True
+                string_char = char
+            elif char == string_char:
+                in_string = False
+
+        # 只在非字符串状态下处理括号和关键字
+        if not in_string:
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth -= 1
+            elif paren_depth == 0:
+                # 检查是否匹配 FROM 关键字
+                if i + 4 <= len(sql) and sql[i:i+4].upper() == 'FROM':
+                    # 确保前后是单词边界
+                    before_ok = (i == 0 or not sql[i-1].isalnum())
+                    after_ok = (i + 4 >= len(sql) or not sql[i+4].isalnum())
+                    if before_ok and after_ok:
+                        from_start = i
+                        break
+
+        i += 1
+
+    if from_start == -1:
+        # 没有找到 FROM，可能是没有 FROM 子句的 SELECT
+        return sql, None
+
+    fields_section = sql[select_start:from_start].strip()
 
     # 检查是否包含注释占位符（只有包含注释才需要特殊处理）
     if '__COMMENT_' not in fields_section:
@@ -1072,7 +1321,7 @@ def _restore_from_newline(sql: str) -> str:
 # 以下是 V4 原有的格式化逻辑，扩展支持更多SQL语句类型
 # ============================================================
 
-def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: int = 0) -> str:
+def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: int = 0, base_indent: int = 0) -> str:
     """
     格式化 SQL 结构
 
@@ -1080,6 +1329,7 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         sql: 原始 SQL
         keyword_case: 关键字大小写
         indent_level: 缩进层级（每级4个空格），用于子查询
+        base_indent: 当前基础缩进（空格数），用于嵌套子查询缩进累积
     """
     """Format SQL structure without comments - V4 原有逻辑 + 支持更多语句类型"""
 
@@ -1102,7 +1352,8 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
                 is_aligned = True
 
     # 保护函数调用的多行结构（在 normalize 之前）
-    sql, function_map = _protect_multiline_functions(sql)
+    # 跳过包含子查询的函数，让 _extract_function_subqueries 处理
+    sql, function_map = _protect_multiline_functions(sql, skip_subquery_funcs=True)
 
     # 保护 IN 列表的多行结构（在 normalize 之前）
     sql, in_list_map = _protect_multiline_in_lists(sql)
@@ -1136,7 +1387,32 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
             sql, extracted_fields = _protect_select_field_comments(sql)
             # 保护 FROM 前的换行
             sql = _protect_from_newline(sql)
+
+        # 新增：保护注释占位符前的换行符
+        # 避免在 normalize 时将独立行的注释占位符与前一行的内容合并
+        # 使用占位符保护 "\n__COMMENT_N__" 模式
+        comment_newline_map = {}
+        def protect_comment_with_newline(match):
+            """保护独立行的注释占位符（前面有换行的）"""
+            placeholder = match.group(0)
+            # 检查前面是否有换行符
+            start = match.start()
+            if start > 0 and sql[start - 1] == '\n':
+                # 这是一个独立行的注释，用占位符保护（包含前面的换行符）
+                new_placeholder = f"__COMMENT_NEWLINE_{len(comment_newline_map)}__"
+                comment_newline_map[new_placeholder] = '\n' + placeholder
+                return new_placeholder
+            return placeholder
+
+        # 保护独立行的注释占位符
+        sql = re.sub(r'__COMMENT_\d+__', protect_comment_with_newline, sql)
+
+        # 执行 normalize（将所有空白字符序列替换为单个空格）
         sql = ' '.join(sql.split())
+
+        # 恢复独立行的注释占位符
+        for new_placeholder, original in comment_newline_map.items():
+            sql = sql.replace(new_placeholder, original)
 
     # 确保相邻的注释占位符之间有换行（normalize 可能会把换行变成空格）
     sql = COMMENT_ADJACENT_PATTERN.sub(r'\1\n\2', sql)
@@ -1352,30 +1628,33 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         return restore_comment_strings(final_result)
 
     # Parse SQL clauses（使用没有注释前缀的SQL）
-    parts = _parse_sql_parts(sql_without_comments, keyword_case, indent_level, extracted_fields)
+    # base_indent 已经是正确的基础缩进值（空格数），不需要从 indent_level 计算
+    parts = _parse_sql_parts(sql_without_comments, keyword_case, indent_level, base_indent, extracted_fields)
 
     # Format each part
     lines = []
 
-    # 计算基础缩进（用于子查询）
-    base_indent = '    ' * indent_level
+    # 计算缩进字符串
+    base_indent_str = ' ' * base_indent if base_indent > 0 else ''
 
     # SELECT clause
     if parts['select']:
-        select_lines = _format_select_clause(parts['select'])
+        # 创建 IndentContext 以支持函数中子查询的缩进
+        select_ctx = IndentContext(base_indent=base_indent)
+        select_lines = _format_select_clause(parts['select'], ctx=select_ctx)
         # 为子查询中的 SELECT 添加缩进
-        if indent_level > 0:
-            lines.append(base_indent + select_lines[0])
+        if base_indent > 0:
+            lines.append(base_indent_str + select_lines[0])
             for line in select_lines[1:]:
-                lines.append(base_indent + line)
+                lines.append(base_indent_str + line)
         else:
             lines.extend(select_lines)
 
     # FROM clause
     if parts['from']:
-        if indent_level > 0:
+        if base_indent > 0:
             # 子查询：FROM 需要缩进
-            from_line = f'{base_indent}FROM {parts["from"]}'
+            from_line = f'{base_indent_str}FROM {parts["from"]}'
         else:
             # 主查询：FROM 不需要缩进（但内容可能包含换行的子查询）
             from_line = f'FROM {parts["from"]}'
@@ -1385,47 +1664,70 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         lines.append(from_line)
 
     # JOIN clauses
+    # 创建 IndentContext 以支持新的缩进计算
+    join_ctx = IndentContext(base_indent=base_indent)
     for join in parts['joins']:
-        join_lines = _format_join_clause(join)
-        # 为子查询中的 JOIN 添加缩进
-        if indent_level > 0:
-            for line in join_lines:
-                lines.append(base_indent + line.lstrip())
-        else:
-            lines.extend(join_lines)
+        join_lines = _format_join_clause(join, join_ctx)
+        # join_lines 已包含正确缩进（基于 ctx.base_indent）
+        lines.extend(join_lines)
 
     # WHERE clause
     if parts['where']:
         where_lines = _format_where_clause(parts['where'])
         # 为子查询中的 WHERE 添加缩进
-        if indent_level > 0:
+        if base_indent > 0:
             for line in where_lines:
-                new_line = base_indent + line if not line.startswith(' ') else line
+                new_line = base_indent_str + line if not line.startswith(' ') else line
                 lines.append(new_line)
         else:
             lines.extend(where_lines)
 
-    # GROUP BY clause（不缩进）
+    # GROUP BY clause
     if parts['group_by']:
-        group_by_line = f'GROUP BY {parts["group_by"]}'
-        lines.append('\n' + group_by_line)
+        if base_indent > 0:
+            # 子查询：GROUP BY 需要缩进
+            group_by_line = f'{base_indent_str}GROUP BY {parts["group_by"]}'
+            lines.append('\n' + group_by_line)
+        else:
+            # 主查询：GROUP BY 不需要缩进
+            group_by_line = f'GROUP BY {parts["group_by"]}'
+            lines.append('\n' + group_by_line)
 
-    # HAVING clause（不缩进）
+    # HAVING clause
     if parts['having']:
-        having_line = f'HAVING {parts["having"]}'
-        lines.append('\n' + having_line)
+        if base_indent > 0:
+            # 子查询：HAVING 需要缩进
+            having_line = f'{base_indent_str}HAVING {parts["having"]}'
+            lines.append('\n' + having_line)
+        else:
+            # 主查询：HAVING 不需要缩进
+            having_line = f'HAVING {parts["having"]}'
+            lines.append('\n' + having_line)
 
-    # ORDER BY clause（不缩进）
+    # ORDER BY clause
     if parts['order_by']:
-        order_by_line = f'ORDER BY {parts["order_by"]}'
-        lines.append('\n' + order_by_line)
+        if base_indent > 0:
+            # 子查询：ORDER BY 需要缩进
+            order_by_line = f'{base_indent_str}ORDER BY {parts["order_by"]}'
+            lines.append('\n' + order_by_line)
+        else:
+            # 主查询：ORDER BY 不需要缩进
+            order_by_line = f'ORDER BY {parts["order_by"]}'
+            lines.append('\n' + order_by_line)
 
     # DISTRIBUTE BY clause
     if parts['distribute_by']:
         distribute_by_line = f'DISTRIBUTE BY {parts["distribute_by"]}'
-        if indent_level > 0:
-            distribute_by_line = f'{base_indent}DISTRIBUTE BY {parts["distribute_by"]}'
+        if base_indent > 0:
+            distribute_by_line = f'{base_indent_str}DISTRIBUTE BY {parts["distribute_by"]}'
         lines.append('\n' + distribute_by_line)
+
+    # 处理尾随注释占位符（独立行的注释）
+    # 这些占位符是在 _parse_sql_parts 中提取的，需要添加到格式化结果的末尾
+    if '__trailing_comments__' in parts:
+        for comment_placeholder in parts['__trailing_comments__']:
+            # 添加独立行的注释占位符
+            lines.append(comment_placeholder)
 
     result = '\n'.join(lines)
 
@@ -1743,7 +2045,7 @@ def _format_with_statement(sql: str) -> str:
 
         # 使用"开括号 + 1"规则
         inner_indent = ' ' * (open_paren_pos + 1)
-        close_paren_indent = ' ' * open_paren_pos
+        close_paren_indent = ' ' * open_paren_pos  # 闭括号与开括号对齐
 
         # 为每一行添加缩进
         lines = []
@@ -1788,9 +2090,18 @@ def _format_cte_only(sql: str) -> str:
         else:
             header = f",\n{cte_name} AS ("
 
-        # 固定缩进：CTE 内容缩进 5 个空格
-        inner_indent = '     '  # 5 个空格
-        close_paren_indent = ''  # 闭括号与 WITH 对齐
+        # 计算开括号位置 - 使用"开括号+1"规则
+        if idx == 0:
+            header = f"WITH {cte_name} AS ("
+            # 开括号位置 = len("WITH {cte_name} AS (")
+            open_paren_pos = 4 + 1 + len(cte_name) + 1 + 2 + 1
+        else:
+            header = f",\n{cte_name} AS ("
+            # 开括号位置 = len("{cte_name} AS (")
+            open_paren_pos = len(cte_name) + 1 + 2 + 1
+
+        inner_indent = ' ' * (open_paren_pos + 1)
+        close_paren_indent = ' ' * open_paren_pos  # 闭括号与开括号对齐
 
         # 为每一行添加缩进
         lines = []
@@ -2356,8 +2667,16 @@ def _format_insert_select(sql: str) -> str:
     return f"{insert_part}\n{select_formatted}"
 
 
-def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 0, pre_extracted_fields: List[str] = None) -> Dict:
-    """Parse SQL into its component parts - V4 原有逻辑"""
+def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 0, base_indent: int = 0, pre_extracted_fields: List[str] = None) -> Dict:
+    """Parse SQL into its component parts - V4 原有逻辑
+
+    Args:
+        sql: SQL string to parse
+        keyword_case: Keyword case ('upper' or 'lower')
+        indent_level: Indent level for legacy support (每级4个空格)
+        base_indent: Current base indent in spaces (用于嵌套子查询缩进累积)
+        pre_extracted_fields: Pre-extracted field names
+    """
     parts = {
         'select': [],
         'from': '',
@@ -2435,13 +2754,31 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
         end = matches[i + 1].start() if i + 1 < len(matches) else len(protected_sql)
         # 获取原始内容
         raw_content = protected_sql[start:end]
-        # 检查内容是否以换行开头（包含嵌套的缩进子查询）
-        if raw_content.lstrip().startswith('\n'):
-            # 包含嵌套的缩进子查询，保留完整内容
-            clause_content = raw_content.rstrip(' ,')
-        else:
-            # 普通内容，strip 移除多余空格
-            clause_content = raw_content.strip().rstrip(',')
+
+        # 新增：处理独立行的注释占位符（__COMMENT_N__）
+        # 如果内容末尾有独立行的注释占位符，将其提取到单独的列表中
+        # 避免在格式化时被合并到同一行
+        trailing_comment_placeholders = []
+        lines = raw_content.split('\n')
+        main_content_lines = []
+
+        for line in lines:
+            stripped = line.strip()
+            # 检查是否是独立的注释占位符行
+            if stripped and re.match(r'^__COMMENT_\d+__$', stripped):
+                # 这是独立的注释占位符，保存到列表
+                trailing_comment_placeholders.append(stripped)
+            else:
+                main_content_lines.append(line)
+
+        # 重建主内容（保留内部换行）
+        clause_content = '\n'.join(main_content_lines).strip().rstrip(',')
+
+        # 将独立的注释占位符添加到 parts 字典中，键为 '__trailing_comments__'
+        if trailing_comment_placeholders and '__trailing_comments__' not in parts:
+            parts['__trailing_comments__'] = trailing_comment_placeholders
+        elif trailing_comment_placeholders:
+            parts['__trailing_comments__'].extend(trailing_comment_placeholders)
 
         # Restore placeholders in content and format subqueries
         for placeholder, original in placeholders.items():
@@ -2451,8 +2788,21 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                     # 递归格式化子查询（增加缩进层级）
                     # 去除外层括号
                     subquery_content = original[1:-1] if original.startswith('(') and original.endswith(')') else original
-                    # 格式化子查询（不增加缩进层级，手动添加缩进）
-                    formatted_subquery = _format_sql_structure(subquery_content, keyword_case, 0)
+
+                    # 计算当前子查询的基础缩进
+                    # 需要计算从 clause_keyword 到开括号的长度
+                    placeholder_pos = clause_content.find(placeholder)
+                    before_placeholder = clause_content[:placeholder_pos]
+                    clause_keyword = clause_type.replace('_', ' ')
+                    context_line = clause_keyword + ' ' + before_placeholder + '('
+                    # 开括号位置 = 上下文行的长度 - 1
+                    open_paren_pos = len(context_line) - 1
+                    # 子查询内容的基础缩进 = 开括号位置 + 1
+                    # 这是子查询内部内容的起始缩进位置
+                    subquery_base_indent = base_indent + open_paren_pos + 1
+
+                    # 格式化子查询，传递累积的基础缩进
+                    formatted_subquery = _format_sql_structure(subquery_content, keyword_case, 0, subquery_base_indent)
 
                     # 检查子查询格式化结果中是否还有 OVER 占位符
                     # 如果有，说明这些占位符是在子查询内部被保护的，需要在这里恢复
@@ -2473,51 +2823,63 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                         # 检查子查询是否是简单的 SELECT...FROM...
                         # 如果是单行，保持括号在同一行；如果是多行，换行并添加缩进
                         if '\n' in formatted_subquery:
-                            # 检测子查询前面的模式，确定缩进
-                            placeholder_pos = clause_content.find(placeholder)
-                            before_placeholder = clause_content[:placeholder_pos]
+                            # 子查询已经格式化，包含了基于 subquery_base_indent 的正确缩进
+                            # 所以我们不需要再添加额外的缩进
+                            # 只需要在最后添加闭括号即可
 
-                            # 动态计算开括号位置
-                            # 构建完整的上下文行（子句关键字 + 子查询前的内容 + 开括号）
-                            # 例如："FROM (" 或 "WHERE id IN ("
-                            clause_keyword = clause_type.replace('_', ' ')
-                            context_line = clause_keyword + ' ' + before_placeholder + '('
+                            # 闭括号缩进 = 开括号位置（相对于全局base_indent）
+                            close_paren_indent = ' ' * (base_indent + open_paren_pos)
 
-                            # 开括号位置 = 上下文行的长度 - 1
-                            open_paren_pos = len(context_line) - 1
+                            # 子查询已经格式化，包含了基于 subquery_base_indent 的正确缩进
+                            # formatted_subquery 已经包含了所有必要的内容，包括嵌套子查询的闭括号
+                            # 但是当前层级的开括号和闭括号需要在这里添加
+                            # 闭括号缩进 = 开括号位置（相对于全局base_indent）
+                            close_paren_indent = ' ' * (base_indent + open_paren_pos)
 
-                            # 内容缩进 = 开括号位置 + 1
-                            subquery_indent = ' ' * (open_paren_pos + 1)
-                            # 闭括号缩进 = 开括号位置
-                            close_paren_indent = ' ' * open_paren_pos
+                            # 替换占位符，并添加当前层级的括号
+                            # 注意：formatted_subquery 已经包含了嵌套子查询的括号，我们只需要添加当前层级的
+                            clause_content = clause_content.replace(placeholder, '(\n' + formatted_subquery + '\n' + close_paren_indent + ')')
 
-                            # 为子查询的每一行添加缩进
-                            indented_lines = []
-                            in_nested_subquery = False  # 标记是否在嵌套子查询中
-                            for line in formatted_subquery.split('\n'):
-                                if line.strip():  # 非空行添加缩进
-                                    # 检查是否是嵌套子查询的开始（有多余的缩进）
-                                    leading_spaces = len(line) - len(line.lstrip())
-                                    line_content_stripped = line.lstrip()
-                                    # 如果缩进超过标准缩进（4个空格的倍数），说明是嵌套子查询
-                                    # 但要排除逗号开头的 SELECT 列表行
-                                    is_comma_line = line_content_stripped.startswith(',')
-                                    if leading_spaces > 4 and leading_spaces % 4 != 0 and not is_comma_line:
-                                        # 嵌套子查询，保留原始缩进
-                                        in_nested_subquery = True
-                                        indented_lines.append(line)
-                                    elif in_nested_subquery and leading_spaces > 0:
-                                        # 仍在嵌套子查询中，保留原始缩进
-                                        indented_lines.append(line)
-                                        # 检查是否是嵌套子查询的结束（闭括号行）
-                                        if ')' in line and '(' not in line:
-                                            in_nested_subquery = False
+                            # 设置 indented_subquery 以供后续处理使用
+                            indented_subquery = formatted_subquery
+
+                            # 后处理：处理 WHERE IN/NOT IN/EXISTS 中的子查询缩进
+                            # 检测是否有 NOT IN (SELECT 或 IN (SELECT 模式
+                            has_in_subquery = re.search(r'\b(?:NOT IN|IN|EXISTS)\s*\(\s*SELECT\b', indented_subquery, re.IGNORECASE)
+                            if has_in_subquery:
+                                lines = indented_subquery.split('\n')
+                                result_lines = []
+                                i = 0
+                                while i < len(lines):
+                                    line = lines[i]
+                                    # 检测是否是 WHERE IN 等关键字行
+                                    match = re.search(r'(\bWHERE\b.*?\b(?:NOT IN|IN|EXISTS)\s*\()$', line.rstrip(), re.IGNORECASE)
+                                    if match:
+                                        # 找到 WHERE IN 等关键字，计算开括号位置
+                                        paren_pos = len(line.rstrip()) - 1
+                                        in_sub_indent = paren_pos + 1
+                                        # 保留当前行，修改后续行的缩进
+                                        result_lines.append(line)
+                                        i += 1
+                                        # 处理子查询内容（直到闭括号）
+                                        paren_depth = 1
+                                        while i < len(lines) and paren_depth > 0:
+                                            nested_line = lines[i]
+                                            paren_depth += nested_line.count('(') - nested_line.count(')')
+                                            if nested_line.strip() == ')':
+                                                # 闭括号，与开括号对齐
+                                                result_lines.append(' ' * paren_pos + nested_line.strip())
+                                            elif nested_line.strip():
+                                                # 内容行，缩进到开括号 + 1
+                                                result_lines.append(' ' * in_sub_indent + nested_line.strip())
+                                            else:
+                                                result_lines.append('')
+                                            i += 1
                                     else:
-                                        # 普通行，移除原始缩进，添加新计算的缩进
-                                        indented_lines.append(subquery_indent + line_content_stripped)
-                                else:  # 空行保持空行
-                                    indented_lines.append('')
-                            indented_subquery = '\n'.join(indented_lines)
+                                        result_lines.append(line)
+                                        i += 1
+                                indented_subquery = '\n'.join(result_lines)
+
 
                             # 后处理：如果子查询内部有嵌套的子查询（在 IN/NOT IN 中），需要重新计算缩进
                             # 检测是否有 NOT IN ( ... ) 或 IN ( ... ) 模式，其中 ... 包含换行
@@ -2564,7 +2926,7 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                                         i += 1
                                 indented_subquery = '\n'.join(result_lines)
 
-                            clause_content = clause_content.replace(placeholder, '(\n' + indented_subquery + '\n' + close_paren_indent + ')')
+                            # clause_content 已经在上面替换过了，这里跳过
 
                             # 子查询恢复后，检查闭括号后是否需要换行（LATERAL VIEW 等关键字）
                             # 模式: ) alias KEYWORD 或 ) KEYWORD，需要在 KEYWORD 前换行
@@ -2702,7 +3064,8 @@ def _format_over_clause(over_clause: str) -> str:
     content = match.group(2).strip()  # 括号内容
     close_paren = match.group(3)  # )
 
-    # 计算开括号位置：OVER ( = 5 个字符（OVER + 空格 + (）
+    # 计算开括号位置：开括号在 "OVER (" 中的索引是 5
+    # O(0)V(1)E(2)R(3) (4)((5)
     open_paren_pos = 5  # 相对于 over_clause 字符串的开头
 
     # 如果内容已经包含多个子句（如 PARTITION BY 和 ORDER BY），进行多行格式化
@@ -2895,15 +3258,165 @@ def _parse_select_fields(fields_str: str, pre_extracted_fields: List[str] = None
     return result
 
 
-def _format_select_clause(fields: List[str]) -> List[str]:
-    """Format SELECT clause with comma-first style and smart alignment"""
+def _find_matching_paren(s: str, start: int) -> int:
+    """找到匹配的右括号位置
+
+    Args:
+        s: 字符串
+        start: 开始位置（应该是左括号的位置）
+
+    Returns:
+        匹配的右括号位置，如果没找到返回 -1
+    """
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == '(':
+            depth += 1
+        elif s[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _extract_function_subqueries(field: str, ctx: IndentContext = None) -> str:
+    """提取并格式化函数中的子查询
+
+    检测函数参数中的子查询（如 AVG((SELECT ...))），
+    并为它们应用正确的累积缩进。
+
+    递归处理嵌套函数中的子查询（如 AVG(COALESCE((SELECT...), 0))）。
+
+    Args:
+        field: 字段表达式
+        ctx: 缩进上下文
+
+    Returns:
+        格式化后的字段表达式
+    """
+    if not ctx:
+        return field
+
+    result = field
+
+    # 步骤 1: 先递归处理所有嵌套函数中的子查询（从内到外）
+    func_matches = list(re.finditer(
+        r'\b(AVG|SUM|COUNT|MIN|MAX|COALESCE|NULLIF|CAST|EXTRACT|DATE_ADD|DATE_SUB|CONCAT|ROUND|FLOOR|CEIL|ABS|POWER|SQRT|LN|LOG|EXP|GREATEST|LEAST|ARRAY|MAP|STRUCT)\s*\(',
+        result, re.IGNORECASE
+    ))
+
+    # 从右向左处理（从内到外）
+    for func_match in reversed(func_matches):
+        func_name = func_match.group(1).upper()
+        func_start = func_match.start()
+        func_paren_start = func_match.end() - 1  # 左括号位置
+
+        # 找到函数的右括号
+        func_paren_end = _find_matching_paren(result, func_paren_start)
+        if func_paren_end == -1:
+            continue
+
+        # 提取函数参数
+        func_args = result[func_paren_start + 1:func_paren_end]
+
+        # 创建子上下文，累积当前函数的缩进
+        func_prefix = result[func_start:func_paren_start + 1]
+        func_indent = ctx.get_content_indent(func_prefix)
+        func_ctx = ctx.with_base_indent(func_indent)
+
+        # 递归处理参数（这会处理嵌套函数中的子查询）
+        processed_args = _extract_function_subqueries(func_args, func_ctx)
+
+        # 如果参数被修改，替换它们
+        if processed_args != func_args:
+            result = result[:func_paren_start + 1] + processed_args + result[func_paren_end:]
+            # 更新后续位置
+            func_paren_end = func_paren_start + 1 + len(processed_args)
+
+    # 步骤 2: 格式化当前层级的子查询（只处理未被格式化的子查询）
+    offset = 0
+
+    while offset < len(result):
+        # 查找子查询模式 (SELECT...)
+        # 只匹配单行的 (SELECT...)，不匹配已格式化的多行子查询
+        subquery_match = re.search(r'\(\s*SELECT\b', result[offset:], re.IGNORECASE)
+        if not subquery_match:
+            break
+
+        sub_start = offset + subquery_match.start()
+
+        # 检查是否已经是多行子查询（已格式化）
+        # 如果子查询开括号前有换行，则认为已格式化，跳过
+        if sub_start > 0 and result[sub_start - 1] == '\n':
+            offset = sub_start + 1
+            continue
+
+        sub_end = _find_matching_paren(result, sub_start)
+
+        if sub_end == -1:
+            break
+
+        # 提取子查询内容（不包含外层括号）
+        subquery_content = result[sub_start + 1:sub_end]
+
+        # 检查子查询内容是否包含换行（已格式化）
+        if '\n' in subquery_content:
+            offset = sub_end + 1
+            continue
+
+        # 计算子查询的缩进
+        # 子查询的内容缩进应该 = ctx.base_indent + 1（相对于开括号）
+        # 但闭括号应该与开括号对齐
+        subquery_indent = ctx.base_indent + 1
+
+        # 创建子查询的缩进上下文
+        subquery_ctx = ctx.with_base_indent(subquery_indent)
+
+        # 格式化子查询
+        try:
+            formatted_lines = _format_subquery(subquery_content, subquery_ctx, keyword_case='upper')
+
+            # 构建格式化后的子查询字符串
+            # 闭括号与开括号对齐
+            close_indent = ctx.base_indent
+            formatted_subquery = f'(\n'
+            formatted_subquery += '\n'.join(formatted_lines)
+            formatted_subquery += f'\n{" " * close_indent})'
+
+            # 替换原始子查询
+            result = result[:sub_start] + formatted_subquery + result[sub_end + 1:]
+
+            # 更新偏移量
+            offset = sub_start + len(formatted_subquery)
+        except Exception:
+            # 如果格式化失败，保持原样
+            offset = sub_end + 1
+
+    return result
+
+
+def _format_select_clause(fields: List[str], ctx: IndentContext = None) -> List[str]:
+    """Format SELECT clause with comma-first style and smart alignment
+
+    Args:
+        fields: List of field expressions
+        ctx: Optional IndentContext for proper nesting indentation
+
+    Returns:
+        List of formatted lines with proper indentation
+    """
     if not fields:
-        return ['SELECT']
+        base_spaces = " " * (ctx.base_indent if ctx else 0)
+        return [f'{base_spaces}SELECT']
+
+    # Get base indentation from context or default to 0
+    base_indent = ctx.base_indent if ctx else 0
+    base_spaces = " " * base_indent
 
     # 首先格式化每个字段（处理 CASE 表达式等）
     formatted_fields = []
     for i, field in enumerate(fields):
-        formatted_field = _format_field(field, is_first=(i == 0))
+        formatted_field = _format_field(field, is_first=(i == 0), ctx=ctx)
         formatted_fields.append(formatted_field)
 
     # 应用智能对齐
@@ -2913,21 +3426,33 @@ def _format_select_clause(fields: List[str]) -> List[str]:
     lines = []
     for i, field in enumerate(aligned_fields):
         if i == 0:
-            lines.append(f'SELECT {field}')
+            lines.append(f'{base_spaces}SELECT {field}')
         else:
             # Comma-first style: align with SELECT
-            lines.append(f'     , {field}')
+            lines.append(f'{base_spaces}     , {field}')
 
     return lines
 
 
-def _format_field(field: str, is_first: bool = False) -> str:
-    """Format a single field, handling CASE expressions - V4 原有逻辑"""
+def _format_field(field: str, is_first: bool = False, ctx: IndentContext = None) -> str:
+    """Format a single field, handling CASE expressions and function subqueries
+
+    Args:
+        field: 字段表达式
+        is_first: 是否是第一个字段
+        ctx: 缩进上下文（用于函数嵌套子查询）
+
+    Returns:
+        格式化后的字段
+    """
     field = field.strip()
 
     # Check if field contains CASE expression
     if re.search(r'\bCASE\b', field, re.IGNORECASE):
         return _format_case_expression(field, base_indent=0 if not is_first else 4)
+
+    # 注意：不在这里处理函数中的子查询
+    # 让 _restore_multiline_functions 在后续处理，以获得正确的缩进
 
     return field
 
@@ -3979,18 +4504,22 @@ def _split_parenthesized_conditions(condition: str, base_indent: int = 0, open_p
 
         if is_subquery:
             # 这是一个子查询，使用专门的格式化函数
-            formatted_subquery = _format_subquery(paren_content_stripped)
+            # 关键修复：限制最大缩进，避免过度缩进
+            # WHERE 子句中的子查询不应该太深
+            max_base_indent = min(actual_paren_pos + 1, 15)  # 最多15个空格
 
-            # 使用"开括号+1"规则缩进子查询内容
-            inner_indent = ' ' * (actual_paren_pos + 1)
+            # 使用 IndentContext 格式化，传递受限的基础缩进
+            ctx = IndentContext(base_indent=max_base_indent)
+            formatted_subquery = _format_subquery(paren_content_stripped, ctx, keyword_case='upper')
+
+            # 闭括号缩进 = 开括号位置
             close_indent = ' ' * actual_paren_pos
 
+            # 直接使用格式化后的子查询（已经包含正确缩进）
+            # 只添加开括号和闭括号
             lines = ['(']
             for line in formatted_subquery.split('\n'):
-                if line.strip():
-                    lines.append(inner_indent + line)
-                else:
-                    lines.append('')
+                lines.append(line)  # line 已经被 _format_subquery 添加了正确的缩进
             lines.append(close_indent + ')')
             return '\n'.join(lines)
 
@@ -4127,7 +4656,9 @@ def _split_parenthesized_conditions(condition: str, base_indent: int = 0, open_p
                 actual_paren_pos = base_indent + paren_start
 
             # 格式化子查询
-            formatted_subquery = _format_subquery(paren_content.strip())
+            # TODO: Consider migrating to new _format_subquery with IndentContext
+            # Currently using legacy for WHERE clause OR conditions
+            formatted_subquery = _format_subquery_legacy(paren_content.strip())
 
             # 使用"开括号+1"规则缩进子查询内容
             inner_indent = ' ' * (actual_paren_pos + 1)
@@ -4379,10 +4910,14 @@ def _parse_case_parts(content: str) -> Dict:
     return parts
 
 
-def _format_join_clause(join: Dict) -> List[str]:
+def _format_join_clause(join: Dict, ctx: IndentContext) -> List[str]:
     """Format JOIN clause
 
     JOIN 与 FROM 对齐（无缩进），ON 条件缩进 4 个空格
+
+    Args:
+        join: JOIN 字典
+        ctx: 缩进上下文
     """
     lines = []
     join_type = join['type']
@@ -4415,16 +4950,13 @@ def _format_join_clause(join: Dict) -> List[str]:
             subquery_full = content[subquery_start+1:subquery_end].strip()
             after_subquery = content[subquery_end+1:].strip()
 
-            # 计算开括号位置 (LEFT JOIN 后的 4 个空格 + 括号 = 第5列)
-            # 子查询内容缩进 = 开括号位置 + 1 = 5 + 1 = 6 个空格
-            open_paren_pos = 5  # "    (" 中括号的位置
-            inner_indent = open_paren_pos + 1  # 6 个空格
+            # 使用 IndentContext 计算子查询缩进
+            # 当前行的前缀是 "    (" (4 空格 + 括号)
+            inner_indent = ctx.get_content_indent("    ")
+            subquery_ctx = ctx.with_base_indent(inner_indent)
 
-            # 格式化子查询，不传递基础缩进（使用默认的相对缩进）
-            subquery_formatted = _format_subquery(subquery_full, 'upper', 0)
-
-            # 给子查询内容添加缩进 (开括号+1 规则)
-            subquery_indented = '\n'.join(' ' * inner_indent + line for line in subquery_formatted.split('\n'))
+            # 格式化子查询，使用新的 IndentContext
+            subquery_lines = _format_subquery(subquery_full, subquery_ctx, 'upper')
 
             trailing_comment_match = re.search(r'(__COMMENT_\d+__)\s*$', after_subquery)
             trailing_comment = ''
@@ -4444,12 +4976,15 @@ def _format_join_clause(join: Dict) -> List[str]:
             alias_part = alias_part + trailing_comment
 
             # JOIN 与 FROM 对齐（无缩进）
-            lines.append(f'{join_type}')
-            lines.append(f'    (')
-            lines.append(f'{subquery_indented}')
-            lines.append(f'    ) {alias_part}')
+            join_spaces = " " * ctx.base_indent
+            lines.append(f'{join_spaces}{join_type}')
+            lines.append(f'{join_spaces}    (')
+            lines.extend(subquery_lines)  # 子查询行已带缩进
+            lines.append(f'{join_spaces}    ) {alias_part}')
             if on_condition:
-                lines.append(f'    ON {on_condition}')
+                # ON 条件使用智能换行，缩进 2 个空格
+                on_lines = _format_on_condition(on_condition, base_indent=ctx.base_indent + 2)
+                lines.extend(on_lines)
             return lines
 
     on_match = re.search(r'\bON\b\s+(.+)$', content, re.IGNORECASE | re.DOTALL)
@@ -4458,36 +4993,38 @@ def _format_join_clause(join: Dict) -> List[str]:
         table = content[:on_match.start()].strip()
         on_condition = on_match.group(1).strip()
 
-        # JOIN 与 FROM 对齐（无缩进）
-        lines.append(f'{join_type} {table}')
-        # 格式化ON条件，按AND分割并换行
-        on_lines = _format_on_condition(on_condition)
+        # ON 条件始终使用多行格式
+        join_spaces = " " * ctx.base_indent
+        lines.append(f'{join_spaces}{join_type} {table}')
+        on_lines = _format_on_condition(on_condition, base_indent=ctx.base_indent + 2)
         lines.extend(on_lines)
     else:
-        lines.append(f'{join_type} {content}')
+        join_spaces = " " * ctx.base_indent
+        lines.append(f'{join_spaces}{join_type} {content}')
 
     return lines
 
 
-def _format_on_condition(on_condition: str, base_indent: int = 4) -> List[str]:
-    """Format ON condition with AND on new lines
+def _format_on_condition(on_condition: str, base_indent: int = 2) -> List[str]:
+    """Format ON condition with multi-line formatting
 
     Args:
         on_condition: ON 条件内容
-        base_indent: 基础缩进空格数，默认 4
+        base_indent: 基础缩进空格数，默认 2
 
     Returns:
-        格式化后的行列表，每行已添加 base_indent 个空格的前导缩进
+        格式化后的行列表
+
+    Rules:
+    - 每个条件换行，与 ON 关键字对齐
     """
     lines = []
 
-    conditions = _split_by_logical_op(on_condition, 'AND')
-
-    if not conditions:
-        return [f'{" " * base_indent}ON {on_condition}']
+    # 按 AND 分割条件
+    and_parts = _split_by_logical_op(on_condition, 'AND')
 
     # 第一个条件
-    first_cond = conditions[0].strip()
+    first_cond = and_parts[0].strip()
 
     # 检查第一个条件是否包含OR
     or_parts = _split_by_logical_op(first_cond, 'OR')
@@ -4499,7 +5036,7 @@ def _format_on_condition(on_condition: str, base_indent: int = 4) -> List[str]:
         lines.append(f'{" " * base_indent}ON {first_cond}')
 
     # 后续条件（按AND换行）
-    for cond in conditions[1:]:
+    for cond in and_parts[1:]:
         cond = cond.strip()
         if not cond:
             continue
@@ -4516,31 +5053,37 @@ def _format_on_condition(on_condition: str, base_indent: int = 4) -> List[str]:
     return lines
 
 
-def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: int = 0) -> str:
-    """Format a subquery - 返回不带缩进的内容，由调用代码添加缩进
+def _format_subquery(subquery: str, ctx: IndentContext, keyword_case: str = 'upper') -> List[str]:
+    """Format a subquery with proper indentation
 
-    子查询内部使用相对缩进：
-    - SELECT/FROM/WHERE: 无前导空格
-    - AND/OR: 相对于 WHERE 缩进 0（与 WHERE 对齐）
-    - 括号内内容: 相对于开括号缩进 4 个空格
+    Args:
+        subquery: 子查询内容
+        ctx: 缩进上下文
+        keyword_case: 关键字大小写
+
+    Returns:
+        带缩进的行列表
+
+    子查询内部使用相对于 ctx 的缩进：
+    - SELECT/FROM/WHERE: 相对缩进
+    - AND/OR: 相对缩进
     """
-    parts = _parse_sql_parts(subquery, keyword_case, indent_level)
+    parts = _parse_sql_parts(subquery, keyword_case, 0, ctx.base_indent)  # 使用 base_indent 参数
 
+    base_indent_str = " " * ctx.base_indent
     lines = []
 
     if parts['select']:
-        select_lines = _format_select_clause(parts['select'])
-        for sl in select_lines:
-            lines.append(sl)  # 不添加缩进，由调用代码处理
+        select_lines = _format_select_clause(parts['select'], ctx)
+        lines.extend(select_lines)
 
     if parts['from']:
-        lines.append(f'FROM {parts["from"]}')
+        lines.append(f"{base_indent_str}FROM {parts['from']}")
 
-    # JOIN clauses - 添加 JOIN 处理支持
+    # JOIN clauses - join_lines 已包含正确缩进（基于 ctx.base_indent）
     if parts['joins']:
         for join in parts['joins']:
-            join_lines = _format_join_clause(join)
-            # 注意：不添加缩进，由调用代码处理
+            join_lines = _format_join_clause(join, ctx)
             lines.extend(join_lines)
 
     if parts['where']:
@@ -4549,11 +5092,11 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
 
         or_parts = _split_by_logical_op(first_cond, 'OR')
         if len(or_parts) > 1:
-            lines.append(f'WHERE {or_parts[0].strip()}')
+            lines.append(f"{base_indent_str}WHERE {or_parts[0].strip()}")
             for op in or_parts[1:]:
-                lines.append(f'OR {op.strip()}')
+                lines.append(f"{base_indent_str}OR {op.strip()}")
         else:
-            lines.append(f'WHERE {first_cond}')
+            lines.append(f"{base_indent_str}WHERE {first_cond}")
 
         for cond in where_conditions[1:]:
             cond = cond.strip()
@@ -4561,36 +5104,54 @@ def _format_subquery(subquery: str, keyword_case: str = 'upper', indent_level: i
                 inner = cond[1:-1].strip()
                 or_parts = _split_by_logical_op(inner, 'OR')
                 if len(or_parts) > 1:
-                    lines.append(f'AND (')
-                    lines.append(f'    {or_parts[0].strip()}')
+                    lines.append(f"{base_indent_str}AND (")
+                    lines.append(f"{base_indent_str}    {or_parts[0].strip()}")
                     for op in or_parts[1:]:
-                        lines.append(f'    OR {op.strip()}')
-                    lines.append(f')')
+                        lines.append(f"{base_indent_str}    OR {op.strip()}")
+                    lines.append(f"{base_indent_str})")
                     continue
             or_parts = _split_by_logical_op(cond, 'OR')
             if len(or_parts) > 1:
-                lines.append(f'AND {or_parts[0].strip()}')
+                lines.append(f"{base_indent_str}AND {or_parts[0].strip()}")
                 for op in or_parts[1:]:
-                    lines.append(f'OR {op.strip()}')
+                    lines.append(f"{base_indent_str}OR {op.strip()}")
             else:
-                lines.append(f'AND {cond}')
+                lines.append(f"{base_indent_str}AND {cond}")
 
     # 添加 GROUP BY 子句支持
     if parts['group_by']:
-        lines.append(f'GROUP BY {parts["group_by"]}')
+        lines.append(f"{base_indent_str}GROUP BY {parts['group_by']}")
 
     # 添加 HAVING 子句支持
     if parts['having']:
-        lines.append(f'HAVING {parts["having"]}')
+        lines.append(f"{base_indent_str}HAVING {parts['having']}")
 
     # 添加 ORDER BY 子句支持
     if parts['order_by']:
-        lines.append(f'ORDER BY {parts["order_by"]}')
+        lines.append(f"{base_indent_str}ORDER BY {parts['order_by']}")
 
     # 添加 DISTRIBUTE BY 子句支持
     if parts['distribute_by']:
-        lines.append(f'DISTRIBUTE BY {parts["distribute_by"]}')
+        lines.append(f"{base_indent_str}DISTRIBUTE BY {parts['distribute_by']}")
 
+    return lines
+
+
+def _format_subquery_legacy(subquery: str, keyword_case: str = 'upper', indent_level: int = 0) -> str:
+    """Legacy wrapper for _format_subquery (向后兼容)
+
+    TODO: 逐步迁移所有调用点到新签名后移除此函数
+
+    Args:
+        subquery: 子查询内容
+        keyword_case: 关键字大小写
+        indent_level: 缩进层级（每层 4 空格）
+
+    Returns:
+        格式化后的子查询字符串
+    """
+    ctx = IndentContext(base_indent=indent_level * 4)  # 假设每层 4 空格
+    lines = _format_subquery(subquery, ctx, keyword_case)
     return '\n'.join(lines)
 
 
@@ -4629,7 +5190,7 @@ def _format_where_clause(where: str) -> List[str]:
 def _split_by_union(sql: str) -> List[str]:
     """分割 UNION/UNION ALL 连接的多个 SELECT 语句
 
-    处理嵌套括号和字符串，避免误分割
+    处理嵌套括号、字符串和行注释，避免误分割
 
     返回格式: [SELECT语句1, 'UNION' 或 'UNION ALL', SELECT语句2, ...]
     """
@@ -4642,6 +5203,28 @@ def _split_by_union(sql: str) -> List[str]:
 
     while i < len(sql):
         char = sql[i]
+
+        # 处理行内注释 --
+        if char == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+            # 保存当前语句
+            stmt = ''.join(current).strip()
+            if stmt:
+                statements.append(stmt)
+
+            # 提取注释及其后的内容到行尾
+            j = i
+            while j < len(sql) and sql[j] != '\n':
+                j += 1
+            comment = sql[i:j].rstrip()
+            statements.append(comment)
+
+            # 清空 current，跳过已处理的内容
+            current = []
+            i = j
+            # 跳过换行符
+            while i < len(sql) and sql[i] in '\n\r':
+                i += 1
+            continue
 
         # 处理字符串
         if not in_string and char in ('"', "'"):
@@ -4739,9 +5322,14 @@ def _format_union_statement(sql: str, keyword_case: str = 'upper') -> str:
     formatted_parts = []
     for i, part in enumerate(union_parts):
         part = part.strip()
+        if not part:
+            continue
         if part.upper() in ('UNION', 'UNION ALL'):
             # 这是 UNION 关键字，保留（已经是大写）
             formatted_parts.append(part.upper())
+        elif part.startswith('--'):
+            # 这是行注释，直接保留
+            formatted_parts.append(part)
         else:
             # 这是 SELECT 语句，格式化它
             formatted = _format_sql_structure(part, keyword_case)

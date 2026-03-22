@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import sqlglot
 from sqlglot import exp
 from sqlglot.dialects import Spark
-from core.formatter_v3 import format_sql_v3 as format_sql
+from .formatter_v4_fixed import format_sql_v4_fixed as format_sql
 
 
 @dataclass

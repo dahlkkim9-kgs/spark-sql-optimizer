@@ -158,6 +158,20 @@ class SQLFormatterV5:
 
         return '\n'.join(result)
 
+    def _escape_dollar_signs(self, sql: str) -> tuple:
+        """临时转义 $ 符号以绕过 sqlglot 解析限制
+
+        Spark SQL 使用 $ 进行变量替换（如 table_$date）
+        sqlglot 无法正确解析这种语法，需要临时转义
+        """
+        placeholder = "___DOLLAR_SIGN_PLACEHOLDER___"
+        escaped = sql.replace('$', placeholder)
+        return escaped, placeholder
+
+    def _unescape_dollar_signs(self, sql: str, placeholder: str) -> str:
+        """恢复 $ 符号"""
+        return sql.replace(placeholder, '$')
+
     def format(self, sql: str, dialect: str = "spark") -> str:
         """格式化 SQL
 
@@ -168,9 +182,13 @@ class SQLFormatterV5:
         Returns:
             格式化后的 SQL
         """
+        # 临时转义 $ 符号
+        escaped_sql, placeholder = self._escape_dollar_signs(sql)
+
+        # 首先尝试整体解析
         try:
             # 解析为 AST（可能返回多个语句）
-            asts = parse(sql, dialect=dialect, read=dialect)
+            asts = parse(escaped_sql, dialect=dialect, read=dialect)
 
             if not asts:
                 return sql
@@ -181,6 +199,9 @@ class SQLFormatterV5:
                 # 使用 sqlglot 格式化
                 formatted = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
 
+                # 恢复 $ 符号
+                formatted = self._unescape_dollar_signs(formatted, placeholder)
+
                 # 应用 v4 风格后处理
                 formatted = self._apply_v4_column_style(formatted)
 
@@ -190,8 +211,70 @@ class SQLFormatterV5:
             return '\n\n'.join(formatted_statements)
 
         except Exception as e:
-            # 解析失败时返回原 SQL
-            return sql
+            # 整体解析失败，尝试逐语句解析
+            import traceback
+            print(f"[V5格式化器] 整体解析失败: {type(e).__name__}，尝试逐语句混合解析")
+
+            # 按分号分割语句
+            statements = []
+            current_stmt = []
+            paren_depth = 0
+
+            for line in sql.split('\n'):
+                stripped = line.strip()
+                if not stripped:
+                    current_stmt.append(line)
+                    continue
+
+                # 计算括号深度
+                paren_depth += line.count('(') - line.count(')')
+
+                current_stmt.append(line)
+
+                # 检测语句结束（分号且括号平衡）
+                if ';' in line and paren_depth == 0:
+                    statements.append('\n'.join(current_stmt))
+                    current_stmt = []
+
+            # 添加最后一个语句
+            if current_stmt:
+                statements.append('\n'.join(current_stmt))
+
+            # 逐语句尝试解析
+            formatted_statements = []
+            from formatter_v4_fixed import format_sql_v4_fixed
+
+            for i, stmt in enumerate(statements):
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
+
+                # 移除结尾分号
+                if stmt.endswith(';'):
+                    stmt = stmt[:-1].strip()
+
+                try:
+                    # 尝试用 sqlglot 解析
+                    escaped_stmt, _ = self._escape_dollar_signs(stmt)
+                    asts = parse(escaped_stmt, dialect=dialect, read=dialect)
+                    if asts:
+                        formatted = asts[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
+                        formatted = self._unescape_dollar_signs(formatted, _)
+                        formatted = self._apply_v4_column_style(formatted)
+                        formatted_statements.append(formatted)
+                        print(f"[V5格式化器] 语句 {i+1}/{len(statements)}: 使用 V5 sqlglot")
+                    else:
+                        raise ValueError("No AST returned")
+                except Exception as stmt_error:
+                    # 该语句用 sqlglot 解析失败，回退到 V4
+                    print(f"[V5格式化器] 语句 {i+1}/{len(statements)}: sqlglot失败，使用 V4")
+                    formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
+                    formatted_statements.append(formatted)
+
+            # 合并所有语句
+            result = '\n\n'.join(formatted_statements)
+            print(f"[V5格式化器] 混合解析完成: {len(statements)} 个语句")
+            return result
 
 
 def format_sql_v5(sql: str, **options) -> str:

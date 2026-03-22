@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from 'react';
 import './App.css';
+import { getFormatUrl, FORMATTER_VERSIONS, type FormatterVersion } from './config';
 
 interface Issue {
   rule: string;
@@ -190,6 +191,7 @@ WHERE name LIKE '%john%'
   const [analysisCollapsed, setAnalysisCollapsed] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<LineNumberEditorRef>(null);
+  const [selectedFormatter, setSelectedFormatter] = useState<FormatterVersion>(FORMATTER_VERSIONS.V4);
 
   // 跳转到指定行
   const jumpToLine = (lineNumber: number) => {
@@ -236,12 +238,13 @@ WHERE name LIKE '%john%'
     setFormattedSql('');
 
     try {
-      const response = await fetch('http://127.0.0.1:8888/format/v5', {
+      const formatUrl = getFormatUrl(selectedFormatter);
+      const response = await fetch(formatUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sql: sql,
-          keyword_case: 'upper'
+          options: { keyword_case: 'upper' }
         })
       });
 
@@ -354,6 +357,15 @@ WHERE name LIKE '%john%'
                   onChange={handleFileUpload}
                   style={{ display: 'none' }}
                 />
+                <select
+                  value={selectedFormatter}
+                  onChange={(e) => setSelectedFormatter(e.target.value as FormatterVersion)}
+                  className="formatter-select"
+                  title="选择格式化器版本"
+                >
+                  <option value={FORMATTER_VERSIONS.V4}>V4 (正则)</option>
+                  <option value={FORMATTER_VERSIONS.V5}>V5 (sqlglot)</option>
+                </select>
                 <button
                   className="btn btn-secondary"
                   onClick={() => fileInputRef.current?.click()}
