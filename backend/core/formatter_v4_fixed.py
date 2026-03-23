@@ -170,8 +170,10 @@ def _protect_multiline_functions(sql: str, skip_subquery_funcs: bool = False) ->
                     func_call = sql[func_name_start:paren_end + 1]
 
                     # 如果需要跳过包含子查询的函数，检查是否包含子查询
-                    if skip_subquery_funcs and re.search(r'\(\s*SELECT\b', func_call, re.IGNORECASE):
+                    # 修复：检查函数内是否包含任何 SELECT 关键字（不仅限于紧跟括号后的情况）
+                    if skip_subquery_funcs and re.search(r'\bSELECT\b', func_call, re.IGNORECASE):
                         # 包含子查询，跳过保护，直接添加原函数
+                        # 这样可以让子查询处理逻辑正确处理嵌套的子查询
                         protected_sql.append(func_call)
                         i = paren_end + 1
                         continue
@@ -1642,13 +1644,9 @@ def _format_sql_structure(sql: str, keyword_case: str = 'upper', indent_level: i
         # 创建 IndentContext 以支持函数中子查询的缩进
         select_ctx = IndentContext(base_indent=base_indent)
         select_lines = _format_select_clause(parts['select'], ctx=select_ctx)
-        # 为子查询中的 SELECT 添加缩进
-        if base_indent > 0:
-            lines.append(base_indent_str + select_lines[0])
-            for line in select_lines[1:]:
-                lines.append(base_indent_str + line)
-        else:
-            lines.extend(select_lines)
+        # select_lines 已经包含正确的缩进（由 IndentContext 处理）
+        # 不要重复添加 base_indent_str，否则会导致缩进翻倍
+        lines.extend(select_lines)
 
     # FROM clause
     if parts['from']:
@@ -2721,26 +2719,40 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
         i += 1
 
     # Protect subqueries in parentheses that contain SELECT
-    paren_depth = 0
-    paren_start = -1
-    i = 0
-    while i < len(protected_sql):
-        if protected_sql[i] == '(':
-            if paren_depth == 0:
-                paren_start = i
-            paren_depth += 1
-        elif protected_sql[i] == ')':
-            paren_depth -= 1
-            if paren_depth == 0 and paren_start >= 0:
-                paren_content = protected_sql[paren_start:i+1]
-                if re.search(r'\bSELECT\b', paren_content, re.IGNORECASE):
-                    placeholder = f"__SUBQUERY_{len(placeholders)}__"
-                    placeholders[placeholder] = paren_content
-                    protected_sql = protected_sql[:paren_start] + placeholder + protected_sql[i+1:]
-                    i = -1
-                    paren_depth = 0
-                    paren_start = -1
-        i += 1
+    # 修复：使用正则表达式直接查找所有 (SELECT...) 模式的子查询
+    # 这样可以正确处理嵌套在函数调用中的子查询
+    placeholder_count = 0
+    while True:
+        # 查找 (SELECT ... ) 模式（允许嵌套括号）
+        match = None
+        for m in re.finditer(r'\(\s*SELECT\b', protected_sql, re.IGNORECASE):
+            # 找到匹配的右括号
+            paren_start = m.start()
+            paren_depth = 1
+            j = paren_start + 1
+            while j < len(protected_sql) and paren_depth > 0:
+                if protected_sql[j] == '(':
+                    paren_depth += 1
+                elif protected_sql[j] == ')':
+                    paren_depth -= 1
+                j += 1
+            paren_end = j - 1
+
+            paren_content = protected_sql[paren_start:paren_end + 1]
+            # 验证：括号内容（去除括号后）应该以 SELECT 开头
+            inner_content = paren_content[1:-1].strip()
+            if re.match(r'^SELECT\b', inner_content, re.IGNORECASE):
+                match = (paren_start, paren_end, paren_content)
+                break  # 找到最左边的子查询
+
+        if not match:
+            break
+
+        paren_start, paren_end, paren_content = match
+        placeholder = f'__SUBQUERY_{placeholder_count}__'
+        placeholder_count += 1
+        placeholders[placeholder] = paren_content
+        protected_sql = protected_sql[:paren_start] + placeholder + protected_sql[paren_end + 1:]
 
     # Now parse the protected SQL
     # Pattern to find clause boundaries at the TOP LEVEL only
@@ -2794,10 +2806,33 @@ def _parse_sql_parts(sql: str, keyword_case: str = 'upper', indent_level: int = 
                     placeholder_pos = clause_content.find(placeholder)
                     before_placeholder = clause_content[:placeholder_pos]
                     clause_keyword = clause_type.replace('_', ' ')
-                    context_line = clause_keyword + ' ' + before_placeholder + '('
-                    # 开括号位置 = 上下文行的长度 - 1
-                    open_paren_pos = len(context_line) - 1
-                    # 子查询内容的基础缩进 = 开括号位置 + 1
+
+                    # 修复：正确计算开括号位置
+                    # 查找占位符所在行的起始位置（相对于 clause_content 开头）
+                    # 而不是简单地把 clause_keyword 加在前面
+                    last_newline_in_before = before_placeholder.rfind('\n')
+                    if last_newline_in_before == -1:
+                        # 占位符在第一行，计算从 clause_content 开头到占位符的位置
+                        # 但需要考虑逗号前置风格的缩进
+                        # 例如：", AVG( COALESCE( (" - 占位符前有 ", AVG( COALESCE( "
+                        # 我们需要找到实际的开括号位置，而不是包含所有这些前缀
+                        # 简化方案：对于 SELECT 字段中的子查询，使用相对缩进
+                        # 开括号大约在 ", AVG(...(" 的某个位置
+                        # 使用 before_placeholder 的最后一个 '(' 位置作为参考
+                        last_paren = before_placeholder.rfind('(')
+                        if last_paren != -1:
+                            # 找到了括号，从这里开始计算
+                            context_prefix = before_placeholder[last_paren:]
+                            open_paren_pos = len(context_prefix)
+                        else:
+                            # 没有找到括号，使用完整长度
+                            open_paren_pos = len(before_placeholder)
+                    else:
+                        # 占位符不在第一行，使用当前行的长度
+                        current_line = before_placeholder[last_newline_in_before + 1:]
+                        open_paren_pos = len(current_line)
+
+                    # 子查询内容的基础缩进 = 开括号位置 + 1（相对于当前行）
                     # 这是子查询内部内容的起始缩进位置
                     subquery_base_indent = base_indent + open_paren_pos + 1
 
