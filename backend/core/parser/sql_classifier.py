@@ -63,6 +63,62 @@ class SQLClassifier:
     }
 
     @classmethod
+    def _remove_comments(cls, sql: str) -> str:
+        """
+        Remove SQL comments to avoid false positives in pattern matching.
+
+        Handles both line comments (--) and block comments (/* */).
+
+        Args:
+            sql: SQL statement
+
+        Returns:
+            SQL with comments removed
+        """
+        import re
+
+        # Remove block comments /* ... */
+        sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+
+        # Remove line comments -- ...
+        # Need to be careful with strings that might contain --
+        in_string = False
+        string_char = None
+        result = []
+        i = 0
+
+        while i < len(sql):
+            char = sql[i]
+
+            # Handle strings
+            if not in_string and char in ('"', "'"):
+                in_string = True
+                string_char = char
+                result.append(char)
+            elif in_string and char == string_char:
+                # Check if escaped
+                if i > 0 and sql[i - 1] != '\\':
+                    in_string = False
+                    string_char = None
+                result.append(char)
+            elif in_string:
+                result.append(char)
+            # Handle line comments
+            elif char == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                # Skip until end of line
+                while i < len(sql) and sql[i] != '\n':
+                    i += 1
+                # Keep the newline
+                if i < len(sql):
+                    result.append(sql[i])
+            else:
+                result.append(char)
+
+            i += 1
+
+        return ''.join(result)
+
+    @classmethod
     def classify(cls, sql: str) -> List[str]:
         """
         Classify SQL statement by syntax type.
@@ -77,22 +133,26 @@ class SQLClassifier:
         if not sql or not sql.strip():
             return []
 
+        # Remove comments before pattern matching to avoid false positives
+        # e.g., "--4. UNION + test" should not be classified as set_operations
+        sql_without_comments = cls._remove_comments(sql)
+
         detected = []
 
         # Check data operations (highest priority)
-        if cls._check_patterns(sql, cls.PATTERNS['data_operations']):
+        if cls._check_patterns(sql_without_comments, cls.PATTERNS['data_operations']):
             detected.append('data_operations')
 
         # Check set operations
-        if cls._check_patterns(sql, cls.PATTERNS['set_operations']):
+        if cls._check_patterns(sql_without_comments, cls.PATTERNS['set_operations']):
             detected.append('set_operations')
 
         # Check window functions
-        if cls._check_patterns(sql, cls.PATTERNS['window_functions']):
+        if cls._check_patterns(sql_without_comments, cls.PATTERNS['window_functions']):
             detected.append('window_functions')
 
         # Check advanced transforms
-        if cls._check_patterns(sql, cls.PATTERNS['advanced_transforms']):
+        if cls._check_patterns(sql_without_comments, cls.PATTERNS['advanced_transforms']):
             detected.append('advanced_transforms')
 
         # Default to basic if no special syntax detected

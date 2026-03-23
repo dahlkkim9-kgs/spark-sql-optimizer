@@ -81,3 +81,39 @@ WHERE active = 1"""
 
     assert "-- This is a header comment" in result
     assert "-- Filter active users" in result
+
+
+def test_function_embedded_subquery_does_not_runaway_indent():
+    """
+    Regression: subquery inside nested function args should not get runaway indentation.
+
+    Shape: AVG(COALESCE((SELECT ...), 0))
+    """
+    sql = """SELECT
+  AVG(
+    COALESCE(
+      (
+        SELECT SUM(o.quantity * o.unit_price)
+        FROM order_items o
+        INNER JOIN orders ord ON o.order_id = ord.order_id
+        WHERE o.product_id = p.product_id
+          AND ord.order_date BETWEEN '2024-01-01' AND '2024-12-31'
+      ),
+      0
+    )
+  ) AS category_avg
+FROM products p
+;"""
+
+    formatted = format_sql_v4_fixed(sql)
+
+    def leading_spaces(line: str) -> int:
+        return len(line) - len(line.lstrip(" "))
+
+    lines = formatted.splitlines()
+    # pick the SELECT line that belongs to the inner subquery block (not the outer SELECT)
+    select_line = next(l for l in lines if "SELECT SUM(" in l.upper())
+
+    # The nested SELECT should not be indented excessively ("runaway indent").
+    # Keep this threshold conservative to avoid regressions while preserving overall style.
+    assert leading_spaces(select_line) <= 30
