@@ -56,8 +56,12 @@ class SetOperationsProcessor(BaseProcessor):
 
     def can_process(self, sql: str) -> bool:
         """检查 SQL 是否包含集合操作"""
+        # 先移除注释，避免注释中的关键字被误判
+        from parser.sql_classifier import SQLClassifier
+        sql_without_comments = SQLClassifier._remove_comments(sql)
+
         for name, pattern in self.patterns:
-            if pattern.search(sql):
+            if pattern.search(sql_without_comments):
                 return True
         return False
 
@@ -121,6 +125,10 @@ class SetOperationsProcessor(BaseProcessor):
 
     def _split_by_set_operations(self, sql: str) -> List[str]:
         """按集合操作符分割 SQL（考虑括号嵌套）"""
+        # 先移除注释用于检测，但分割位置基于原始 SQL
+        from parser.sql_classifier import SQLClassifier
+        sql_without_comments = SQLClassifier._remove_comments(sql)
+
         segments = []
         current = ""
         i = 0
@@ -145,8 +153,12 @@ class SetOperationsProcessor(BaseProcessor):
             if paren_depth == 0:
                 matched = False
                 for name, pattern in self.patterns:
+                    # 在无注释版本中匹配，但匹配位置基于原始 SQL
                     match = pattern.match(sql, pos=i)
-                    if match:
+                    # 同时检查无注释版本，避免注释中的关键字
+                    match_no_comment = pattern.match(sql_without_comments, pos=i)
+
+                    if match and match_no_comment:
                         # 添加当前累积的内容
                         if current.strip():
                             segments.append(current.strip())
