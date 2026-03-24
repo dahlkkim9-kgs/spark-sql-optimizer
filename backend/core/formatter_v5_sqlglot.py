@@ -11,9 +11,11 @@ from sqlglot.dialects import Spark
 try:
     from .sql_utils import split_by_semicolon
     from .formatter_v4_fixed import format_sql_v4_fixed
+    from .parenthesis_align_post_processor import ParenthesisAlignPostProcessor
 except ImportError:
     from sql_utils import split_by_semicolon
     from formatter_v4_fixed import format_sql_v4_fixed
+    from parenthesis_align_post_processor import ParenthesisAlignPostProcessor
 
 
 # 常量定义
@@ -226,6 +228,10 @@ class SQLFormatterV5:
                 # 应用 v4 风格后处理
                 formatted = self._apply_v4_column_style(formatted)
 
+                # 应用括号对齐后处理
+                paren_processor = ParenthesisAlignPostProcessor()
+                formatted = paren_processor.process(formatted)
+
                 formatted_statements.append(formatted)
 
             # 用空行分隔多个语句
@@ -258,6 +264,9 @@ class SQLFormatterV5:
                         formatted = asts[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
                         formatted = self._unescape_dollar_signs(formatted)
                         formatted = self._apply_v4_column_style(formatted)
+                        # 应用括号对齐后处理
+                        paren_processor = ParenthesisAlignPostProcessor()
+                        formatted = paren_processor.process(formatted)
                         formatted_statements.append(formatted)
                         self._log(f"语句 {i+1}/{len(statements)}", "使用 V5 sqlglot")
                     else:

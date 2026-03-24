@@ -5,8 +5,13 @@
 复用 V4 的 IndentContext 进行缩进计算
 """
 from typing import List, Tuple
-from backend.core.indent_context import IndentContext
-from backend.core.sql_utils import find_matching_paren
+
+try:
+    from .indent_context import IndentContext
+    from .sql_utils import find_matching_paren
+except ImportError:
+    from indent_context import IndentContext
+    from sql_utils import find_matching_paren
 
 
 class ParenthesisAlignPostProcessor:
