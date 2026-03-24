@@ -58,8 +58,9 @@ class ParenthesisAlignPostProcessor:
             # 处理开括号行
             if analysis['has_open_paren']:
                 # 计算开括号绝对位置
-                prefix = analysis['prefix']
-                open_pos = analysis['base_indent'] + len(prefix)
+                # prefix 包含前导空格，需要使用整行的 prefix
+                prefix = analysis['prefix']  # 已包含原始缩进
+                open_pos = len(prefix)
                 content_indent = open_pos + 1
 
                 # 压栈
@@ -81,6 +82,47 @@ class ParenthesisAlignPostProcessor:
             result.append(line)
 
         return '\n'.join(result)
+        # lines = sql.split('\n')
+        # result = []
+        # paren_stack = []  # 存储 (开括号位置, 内容缩进)
+        #
+        # for line in lines:
+        #     analysis = self._analyze_line_parens(line)
+        #
+        #     # 处理闭括号行
+        #     if analysis['has_close_paren'] and not analysis['has_open_paren']:
+        #         if paren_stack:
+        #             open_pos, _ = paren_stack.pop()
+        #             # 闭括号与开括号对齐
+        #             result.append(' ' * open_pos + ')')
+        #             continue
+        #
+        #     # 处理开括号行
+        #     if analysis['has_open_paren']:
+        #         # 计算开括号绝对位置
+        #         prefix = analysis['prefix']
+        #         open_pos = analysis['base_indent'] + len(prefix)
+        #         content_indent = open_pos + 1
+        #
+        #         # 压栈
+        #         paren_stack.append((open_pos, content_indent))
+        #
+        #         # 输出开括号行
+        #         result.append(line.rstrip())
+        #         continue
+        #
+        #     # 处理内容行（有活动括号上下文时）
+        #     if paren_stack:
+        #         _, content_indent = paren_stack[-1]
+        #         stripped = line.lstrip()
+        #         if stripped:  # 非空行
+        #             result.append(' ' * content_indent + stripped)
+        #             continue
+        #
+        #     # 默认：保持原样
+        #     result.append(line)
+        #
+        # return '\n'.join(result)
 
     def _find_matching_paren(self, s: str, start: int) -> int:
         """找到匹配的右括号
@@ -108,6 +150,9 @@ class ParenthesisAlignPostProcessor:
             - close_paren_pos: int (闭括号位置，-1 表示无)
             - prefix: str (开括号前的文本)
             - base_indent: int (行首空格数)
+
+        Note:
+            此方法目前已禁用，因为 process() 方法直接返回原 SQL。
         """
         stripped = line.lstrip()
         indent = len(line) - len(stripped)

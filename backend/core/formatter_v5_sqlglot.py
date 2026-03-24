@@ -228,7 +228,7 @@ class SQLFormatterV5:
                 # 应用 v4 风格后处理
                 formatted = self._apply_v4_column_style(formatted)
 
-                # 应用括号对齐后处理
+                # 应用括号对齐后处理（V4 风格）
                 paren_processor = ParenthesisAlignPostProcessor()
                 formatted = paren_processor.process(formatted)
 
@@ -264,7 +264,7 @@ class SQLFormatterV5:
                         formatted = asts[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
                         formatted = self._unescape_dollar_signs(formatted)
                         formatted = self._apply_v4_column_style(formatted)
-                        # 应用括号对齐后处理
+                        # 应用括号对齐后处理（V4 风格）
                         paren_processor = ParenthesisAlignPostProcessor()
                         formatted = paren_processor.process(formatted)
                         formatted_statements.append(formatted)

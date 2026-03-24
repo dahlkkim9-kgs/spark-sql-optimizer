@@ -80,12 +80,7 @@ def test_analyze_line_parens():
 
 
 def test_simple_subquery_align():
-    """测试简单子查询对齐
-
-    注意：ParenthesisAlignPostProcessor 现已被禁用（直接返回输入），
-    因为 sqlglot 已经正确处理了括号缩进。
-    此测试保留用于文档目的。
-    """
+    """测试简单子查询对齐"""
     processor = ParenthesisAlignPostProcessor()
 
     input_sql = """WHERE a IN (
@@ -94,8 +89,11 @@ FROM t2
 )"""
     result = processor.process(input_sql)
     print("Result:", repr(result))
-    # 后处理器现在被禁用，直接返回输入
-    assert result == input_sql
+    # 验证子查询内容被缩进
+    lines = result.split('\n')
+    select_line = [l for l in lines if 'SELECT' in l][0]
+    # SELECT 应该有缩进（大于开括号位置）
+    assert select_line.startswith(' ' * 5)  # 至少 5 空格缩进
 
 
 def test_multi_line_subquery():
