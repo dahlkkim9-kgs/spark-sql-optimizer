@@ -24,14 +24,58 @@ class ParenthesisAlignPostProcessor:
     def process(self, sql: str) -> str:
         """调整括号缩进
 
+        遵循 V4 的 "开括号+1" 规则：
+        - 开括号位置 = len(prefix)
+        - 内容缩进 = 开括号位置 + 1
+        - 闭括号缩进 = 开括号位置
+
         Args:
             sql: sqlglot 格式化后的 SQL
 
         Returns:
             括号缩进调整后的 SQL
         """
-        # TODO: 实现
-        return sql
+        lines = sql.split('\n')
+        result = []
+        paren_stack = []  # 存储 (开括号位置, 内容缩进)
+
+        for line in lines:
+            analysis = self._analyze_line_parens(line)
+
+            # 处理闭括号行
+            if analysis['has_close_paren'] and not analysis['has_open_paren']:
+                if paren_stack:
+                    open_pos, _ = paren_stack.pop()
+                    # 闭括号与开括号对齐
+                    result.append(' ' * open_pos + ')')
+                    continue
+
+            # 处理开括号行
+            if analysis['has_open_paren']:
+                # 计算开括号绝对位置
+                prefix = analysis['prefix']
+                open_pos = analysis['base_indent'] + len(prefix)
+                content_indent = open_pos + 1
+
+                # 压栈
+                paren_stack.append((open_pos, content_indent))
+
+                # 输出开括号行
+                result.append(line.rstrip())
+                continue
+
+            # 处理内容行（有活动括号上下文时）
+            if paren_stack:
+                _, content_indent = paren_stack[-1]
+                stripped = line.lstrip()
+                if stripped:  # 非空行
+                    result.append(' ' * content_indent + stripped)
+                    continue
+
+            # 默认：保持原样
+            result.append(line)
+
+        return '\n'.join(result)
 
     def _find_matching_paren(self, s: str, start: int) -> int:
         """找到匹配的右括号

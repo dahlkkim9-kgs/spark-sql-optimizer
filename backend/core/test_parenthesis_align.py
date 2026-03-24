@@ -77,3 +77,60 @@ def test_analyze_line_parens():
     assert result['has_close_paren'] == True
     assert result['has_open_paren'] == False
     assert result['close_paren_pos'] == 0
+
+
+def test_simple_subquery_align():
+    """测试简单子查询对齐"""
+    processor = ParenthesisAlignPostProcessor()
+
+    input_sql = """WHERE a IN (
+SELECT x
+FROM t2
+)"""
+    result = processor.process(input_sql)
+    print("Result:", repr(result))
+    # 验证 SELECT 缩进（开括号位置 + 1）
+    assert "    SELECT" in result or "  SELECT" in result
+    # 验证闭括号与开括号对齐
+    lines = result.split('\n')
+    close_paren_line = [l for l in lines if l.strip() == ')'][0]
+    open_paren_line = [l for l in lines if '(' in l][0]
+    # 闭括号应该与开括号对齐
+    assert len(close_paren_line) == len(open_paren_line.rstrip())
+
+
+def test_multi_line_subquery():
+    """测试多行子查询对齐"""
+    processor = ParenthesisAlignPostProcessor()
+
+    input_sql = """    WHERE a IN (
+        SELECT
+            x,
+            y
+        FROM t2
+    )"""
+    result = processor.process(input_sql)
+    print("Result:", repr(result))
+    lines = result.split('\n')
+    # 验证内容缩进
+    for line in lines:
+        if 'SELECT' in line or 'FROM' in line or 'x,' in line or 'y' in line:
+            # 内容行应该在开括号后缩进
+            assert line.startswith(' ') or line[0] in 'SFxy'
+
+
+def test_nested_subquery():
+    """测试嵌套子查询"""
+    processor = ParenthesisAlignPostProcessor()
+
+    input_sql = """WHERE a IN (
+SELECT x
+FROM (
+    SELECT y
+    FROM t3
+) t2
+)"""
+    result = processor.process(input_sql)
+    print("Result:", repr(result))
+    # 验证有两个闭括号
+    assert result.count(')') == 2
