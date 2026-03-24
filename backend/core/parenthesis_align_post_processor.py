@@ -58,9 +58,10 @@ class ParenthesisAlignPostProcessor:
             # 处理开括号行
             if analysis['has_open_paren']:
                 # 计算开括号绝对位置
-                # prefix 包含前导空格，需要使用整行的 prefix
-                prefix = analysis['prefix']  # 已包含原始缩进
-                open_pos = len(prefix)
+                # open_paren_pos 是在原始行中的位置（直接使用）
+                # 但是 _analyze_line_parens 返回的是在 stripped 中的位置
+                # 所以需要加上 base_indent
+                open_pos = analysis['base_indent'] + analysis['open_paren_pos']
                 content_indent = open_pos + 1
 
                 # 压栈
