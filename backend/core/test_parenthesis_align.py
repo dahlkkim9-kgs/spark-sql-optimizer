@@ -43,3 +43,37 @@ def test_find_matching_paren():
 
     # 不匹配
     assert processor._find_matching_paren("(a", 0) == -1
+
+
+def test_analyze_line_parens():
+    """测试行级括号分析"""
+    processor = ParenthesisAlignPostProcessor()
+
+    # 开括号行
+    result = processor._analyze_line_parens("    WHERE a IN (")
+    assert result['has_open_paren'] == True
+    assert result['prefix'] == "WHERE a IN "
+    assert result['base_indent'] == 4
+
+    # 闭括号行
+    result = processor._analyze_line_parens("    )")
+    assert result['has_close_paren'] == True
+    assert result['has_open_paren'] == False
+
+    # 无括号行
+    result = processor._analyze_line_parens("    SELECT a")
+    assert result['has_open_paren'] == False
+    assert result['has_close_paren'] == False
+
+    # 多个括号行（只检测第一个）
+    result = processor._analyze_line_parens("  SELECT (a), (b)")
+    assert result['has_open_paren'] == True
+    assert result['open_paren_pos'] == 7  # "SELECT " 长度为 7
+    assert result['prefix'] == "SELECT "
+    assert result['base_indent'] == 2
+
+    # 只有闭括号
+    result = processor._analyze_line_parens("    ) AND b > 0")
+    assert result['has_close_paren'] == True
+    assert result['has_open_paren'] == False
+    assert result['close_paren_pos'] == 0
