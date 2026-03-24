@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """括号对齐后处理器测试"""
 import pytest
-from backend.core.parenthesis_align_post_processor import ParenthesisAlignPostProcessor
+from parenthesis_align_post_processor import ParenthesisAlignPostProcessor
 
 
 def test_basic_passthrough():
@@ -80,7 +80,12 @@ def test_analyze_line_parens():
 
 
 def test_simple_subquery_align():
-    """测试简单子查询对齐"""
+    """测试简单子查询对齐
+
+    注意：ParenthesisAlignPostProcessor 现已被禁用（直接返回输入），
+    因为 sqlglot 已经正确处理了括号缩进。
+    此测试保留用于文档目的。
+    """
     processor = ParenthesisAlignPostProcessor()
 
     input_sql = """WHERE a IN (
@@ -89,14 +94,8 @@ FROM t2
 )"""
     result = processor.process(input_sql)
     print("Result:", repr(result))
-    # 验证 SELECT 缩进（开括号位置 + 1）
-    assert "    SELECT" in result or "  SELECT" in result
-    # 验证闭括号与开括号对齐
-    lines = result.split('\n')
-    close_paren_line = [l for l in lines if l.strip() == ')'][0]
-    open_paren_line = [l for l in lines if '(' in l][0]
-    # 闭括号应该与开括号对齐
-    assert len(close_paren_line) == len(open_paren_line.rstrip())
+    # 后处理器现在被禁用，直接返回输入
+    assert result == input_sql
 
 
 def test_multi_line_subquery():
