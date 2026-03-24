@@ -31,3 +31,23 @@ class ParenthesisAlignPostProcessor:
         """
         # TODO: 实现
         return sql
+
+    def _find_matching_paren(self, s: str, start: int) -> int:
+        """找到匹配的右括号
+
+        Args:
+            s: 字符串
+            start: 左括号位置
+
+        Returns:
+            匹配的右括号位置，-1 表示未找到
+        """
+        depth = 0
+        for i in range(start, len(s)):
+            if s[i] == '(':
+                depth += 1
+            elif s[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1

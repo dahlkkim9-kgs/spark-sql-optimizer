@@ -28,3 +28,18 @@ def test_nested_parenthesis():
     result = processor.process(sql)
     # 暂时保持原样
     assert result.count("(") == 2
+
+
+def test_find_matching_paren():
+    """测试括号配对查找"""
+    processor = ParenthesisAlignPostProcessor()
+
+    # 简单括号
+    assert processor._find_matching_paren("(a)", 0) == 2
+
+    # 嵌套括号
+    assert processor._find_matching_paren("((a))", 0) == 4
+    assert processor._find_matching_paren("((a))", 1) == 3
+
+    # 不匹配
+    assert processor._find_matching_paren("(a", 0) == -1
