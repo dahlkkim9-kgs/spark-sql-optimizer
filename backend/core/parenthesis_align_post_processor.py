@@ -6,6 +6,7 @@
 """
 from typing import List, Tuple
 from backend.core.indent_context import IndentContext
+from backend.core.sql_utils import find_matching_paren
 
 
 class ParenthesisAlignPostProcessor:
@@ -42,12 +43,4 @@ class ParenthesisAlignPostProcessor:
         Returns:
             匹配的右括号位置，-1 表示未找到
         """
-        depth = 0
-        for i in range(start, len(s)):
-            if s[i] == '(':
-                depth += 1
-            elif s[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    return i
-        return -1
+        return find_matching_paren(s, start)
