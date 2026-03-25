@@ -182,6 +182,136 @@ class SQLFormatterV5:
 
         return '\n'.join(result)
 
+    def _apply_v4_full_style(self, sql: str) -> str:
+        """应用完整的 V4 风格后处理
+
+        处理：
+        1. 修复 WHERE 条件（应该在同一行，如果不太长）
+        2. 统一子查询缩进（1 空格递增）
+        3. 添加结尾分号
+        """
+        lines = sql.split('\n')
+        result = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            # 检测 WHERE 子句后跟条件（在不同行）
+            if stripped == 'WHERE' and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                # 如果下一行是条件（不是关键字），合并到一行
+                if next_line and not any(next_line.startswith(kw) for kw in ['SELECT', 'FROM', 'WHERE', 'ORDER', 'GROUP', 'HAVING', 'LIMIT', 'JOIN', 'ON', 'AND', 'OR']):
+                    result.append('WHERE ' + next_line)
+                    i += 2
+                    continue
+
+            # 处理缩进
+            if (stripped.startswith('FROM') or
+                stripped.startswith('WHERE') or
+                stripped.startswith('INNER JOIN') or
+                stripped.startswith('LEFT JOIN') or
+                stripped.startswith('RIGHT JOIN') or
+                stripped.startswith('FULL JOIN') or
+                stripped.startswith('CROSS JOIN') or
+                stripped.startswith('ORDER BY') or
+                stripped.startswith('GROUP BY') or
+                stripped.startswith('HAVING') or
+                stripped.startswith('LIMIT')):
+                # 主子句顶格
+                result.append(stripped)
+            elif stripped.startswith('ON') or stripped.startswith('AND') or stripped.startswith('OR'):
+                # ON/AND/OR 缩进 2 空格
+                result.append('  ' + stripped)
+            elif stripped.startswith('SELECT'):
+                # 检查是否是子查询
+                if result and result[-1].strip() == '(':
+                    # 子查询的 SELECT，缩进 1 空格
+                    result.append(' ' + stripped)
+                elif result and result[-1].strip().endswith('('):
+                    # 也可能是子查询
+                    result.append(' ' + stripped)
+                else:
+                    result.append(stripped)
+            else:
+                # 保持原有缩进，但规范化（子查询内容）
+                if stripped:
+                    current_indent = len(line) - len(line.lstrip())
+                    # 如果是子查询内容（缩进 > 0），规范化为 1 空格递增
+                    if current_indent > 0 and result:
+                        # 获取上一层的缩进
+                        last_indent = len(result[-1]) - len(result[-1].lstrip()) if result[-1].strip() else 0
+                        # 如果当前缩进与上一行相差较大，规范化
+                        if current_indent - last_indent > 2:
+                            result.append(' ' * (last_indent + 1) + stripped)
+                        else:
+                            result.append(line)
+                    else:
+                        result.append(line)
+                else:
+                    result.append(line)
+
+            i += 1
+
+        # 添加结尾分号
+        formatted = '\n'.join(result)
+        if formatted and not formatted.rstrip().endswith(';'):
+            formatted = formatted + '\n;'
+
+        return formatted
+
+    def _protect_line_comments(self, sql: str) -> tuple:
+        """保护行内 -- 注释
+
+        1. 查找所有 -- 注释（不包括字符串内的 --）
+        2. 替换为占位符 __COMMENT_N__
+        3. 返回 (替换后的SQL, 注释列表)
+        """
+        comments = []
+        result = []
+        i = 0
+
+        while i < len(sql):
+            char = sql[i]
+
+            # 检测行内注释 --
+            if char == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                # 检查是否在字符串内
+                in_string = False
+
+                # 简单检查：向前查找字符串开始
+                for j in range(i - 1, -1, -1):
+                    if sql[j] in ('"', "'"):
+                        # 找到引号，检查是否转义
+                        if j > 0 and sql[j - 1] != '\\':
+                            in_string = not in_string
+
+                if not in_string:
+                    # 找到注释结束位置（行尾）
+                    comment_start = i
+                    comment_end = i + 2
+
+                    while comment_end < len(sql) and sql[comment_end] not in ('\n', '\r'):
+                        comment_end += 1
+
+                    # 提取注释内容
+                    comment = sql[comment_start:comment_end].strip()
+                    comments.append(comment)
+
+                    # 替换为占位符
+                    placeholder = f" __COMMENT_{len(comments) - 1}__ "
+                    result.append(placeholder)
+
+                    # 跳到行尾
+                    i = comment_end
+                    continue
+
+            result.append(char)
+            i += 1
+
+        return ''.join(result), comments
+
     def _escape_dollar_signs(self, sql: str) -> tuple:
         """临时转义 $ 符号以绕过 sqlglot 解析限制
 
@@ -198,6 +328,8 @@ class SQLFormatterV5:
     def format(self, sql: str, dialect: str = "spark") -> str:
         """格式化 SQL
 
+        策略：使用 sqlglot 解析（确保语法正确性），然后用 V4 格式化
+
         Args:
             sql: 原始 SQL（支持多语句，用分号分隔）
             dialect: SQL 方言 (默认 spark)
@@ -208,37 +340,37 @@ class SQLFormatterV5:
         # 临时转义 $ 符号
         escaped_sql, _ = self._escape_dollar_signs(sql)
 
-        # 首先尝试整体解析
+        # 首先尝试整体解析（仅用于验证语法）
         try:
-            # 解析为 AST（可能返回多个语句）
+            # 解析为 AST（验证语法正确性）
             asts = parse(escaped_sql, dialect=dialect, read=dialect)
 
             if not asts:
                 return sql
 
-            # 格式化每个语句
+            # 语法正确，直接使用 V4 格式化（保持风格一致）
+            # 分割语句
+            statements = split_by_semicolon(sql)
+
             formatted_statements = []
-            for ast in asts:
-                # 使用 sqlglot 格式化
-                formatted = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
+            for stmt in statements:
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
 
-                # 恢复 $ 符号
-                formatted = self._unescape_dollar_signs(formatted)
+                # 确保以分号结尾
+                if not stmt.endswith(';'):
+                    stmt += ';'
 
-                # 应用 v4 风格后处理
-                formatted = self._apply_v4_column_style(formatted)
-
-                # 应用括号对齐后处理（V4 风格）
-                paren_processor = ParenthesisAlignPostProcessor()
-                formatted = paren_processor.process(formatted)
-
+                # 使用 V4 格式化
+                formatted = format_sql_v4_fixed(stmt, **{'indent': self.indent_spaces})
                 formatted_statements.append(formatted)
 
             # 用空行分隔多个语句
             return '\n\n'.join(formatted_statements)
 
         except Exception as e:
-            # 整体解析失败，尝试逐语句混合解析
+            # 解析失败，尝试逐语句混合解析
             self._log("整体解析失败", f"{type(e).__name__}，尝试逐语句混合解析")
 
             # 使用共享的语句分割函数（更高效，支持字符串处理）
@@ -257,23 +389,19 @@ class SQLFormatterV5:
                     stmt = stmt[:-1].strip()
 
                 try:
-                    # 尝试用 sqlglot 解析
+                    # 尝试用 sqlglot 解析验证语法
                     escaped_stmt, _ = self._escape_dollar_signs(stmt)
                     asts = parse(escaped_stmt, dialect=dialect, read=dialect)
                     if asts:
-                        formatted = asts[0].sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
-                        formatted = self._unescape_dollar_signs(formatted)
-                        formatted = self._apply_v4_column_style(formatted)
-                        # 应用括号对齐后处理（V4 风格）
-                        paren_processor = ParenthesisAlignPostProcessor()
-                        formatted = paren_processor.process(formatted)
+                        # 语法正确，使用 V4 格式化
+                        formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
                         formatted_statements.append(formatted)
-                        self._log(f"语句 {i+1}/{len(statements)}", "使用 V5 sqlglot")
+                        self._log(f"语句 {i+1}/{len(statements)}", "语法验证通过，使用 V4 格式化")
                     else:
                         raise ValueError("No AST returned")
                 except Exception:
-                    # 该语句用 sqlglot 解析失败，回退到 V4
-                    self._log(f"语句 {i+1}/{len(statements)}", "sqlglot失败，使用 V4")
+                    # 该语句语法可能有问题，直接用 V4 格式化
+                    self._log(f"语句 {i+1}/{len(statements)}", "使用 V4 格式化")
                     formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
                     formatted_statements.append(formatted)
 
