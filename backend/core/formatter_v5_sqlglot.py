@@ -319,16 +319,17 @@ class SQLFormatterV5:
         2. 替换回原 -- 注释
         3. 同时把 /* */ 格式改回 -- 格式（如果 sqlglot 转换了）
         """
+        import re
         result = sql
 
-        # 首先恢复占位符
+        # 首先恢复占位符（使用正则，匹配周围可能的空格）
         for i, comment in enumerate(comments):
-            placeholder = f" __COMMENT_{i}__ "
-            if placeholder in result:
-                result = result.replace(placeholder, f" {comment} ")
+            # 匹配占位符，前后可能有空格
+            pattern = rf'\s*__COMMENT_{i}__\s*'
+            # 替换为原注释（保留一个前置空格）
+            result = re.sub(pattern, f' {comment} ', result)
 
         # 然后把 /* */ 改回 -- 格式（如果 sqlglot 转换了）
-        import re
         # 简单处理：单行 /* comment */ 改为 -- comment
         result = re.sub(r'/\* (.*?) \*/', r'-- \1', result)
 
@@ -359,8 +360,11 @@ class SQLFormatterV5:
         Returns:
             格式化后的 SQL
         """
-        # 临时转义 $ 符号
-        escaped_sql, _ = self._escape_dollar_signs(sql)
+        # Step 1: 保护 -- 注释
+        protected_sql, comments = self._protect_line_comments(sql)
+
+        # Step 2: 临时转义 $ 符号（原有逻辑）
+        escaped_sql, _ = self._escape_dollar_signs(protected_sql)
 
         # 首先尝试整体解析（仅用于验证语法）
         try:
@@ -372,7 +376,7 @@ class SQLFormatterV5:
 
             # 语法正确，直接使用 V4 格式化（保持风格一致）
             # 分割语句
-            statements = split_by_semicolon(sql)
+            statements = split_by_semicolon(protected_sql)
 
             formatted_statements = []
             for stmt in statements:
@@ -386,6 +390,8 @@ class SQLFormatterV5:
 
                 # 使用 V4 格式化
                 formatted = format_sql_v4_fixed(stmt, **{'indent': self.indent_spaces})
+                # 恢复注释（改回 -- 格式）
+                formatted = self._restore_line_comments(formatted, comments)
                 formatted_statements.append(formatted)
 
             # 用空行分隔多个语句
@@ -396,7 +402,7 @@ class SQLFormatterV5:
             self._log("整体解析失败", f"{type(e).__name__}，尝试逐语句混合解析")
 
             # 使用共享的语句分割函数（更高效，支持字符串处理）
-            statements = split_by_semicolon(sql)
+            statements = split_by_semicolon(protected_sql)
 
             # 逐语句尝试解析
             formatted_statements = []
@@ -417,6 +423,8 @@ class SQLFormatterV5:
                     if asts:
                         # 语法正确，使用 V4 格式化
                         formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
+                        # 恢复注释（改回 -- 格式）
+                        formatted = self._restore_line_comments(formatted, comments)
                         formatted_statements.append(formatted)
                         self._log(f"语句 {i+1}/{len(statements)}", "语法验证通过，使用 V4 格式化")
                     else:
@@ -425,6 +433,8 @@ class SQLFormatterV5:
                     # 该语句语法可能有问题，直接用 V4 格式化
                     self._log(f"语句 {i+1}/{len(statements)}", "使用 V4 格式化")
                     formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
+                    # 恢复注释（改回 -- 格式）
+                    formatted = self._restore_line_comments(formatted, comments)
                     formatted_statements.append(formatted)
 
             # 合并所有语句
