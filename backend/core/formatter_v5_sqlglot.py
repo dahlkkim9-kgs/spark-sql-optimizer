@@ -139,36 +139,78 @@ class SQLFormatterV5:
                         columns.append(('subquery', '\n'.join(sub_lines), has_comment))
                         continue
 
-                    # 普通列
-                    # 移除结尾的逗号
-                    col_name = col_stripped.rstrip(',').strip()
-                    if col_name:
-                        columns.append(('simple', col_name, has_comment))
+                    # 普通列（包括带注释的列）
+                    if has_comment:
+                        # 带注释的列：需要正确分离列名和注释
+                        column_part = None
+                        comment_part = None
+
+                        # 处理 /* comment */ 格式
+                        if '/*' in col_line:
+                            # 分离列名和注释
+                            parts = col_line.split('/*', 1)
+                            column_part = parts[0].strip()
+                            # 保持注释的原始格式（包括 /* 和内部空格）
+                            comment_part = '/*' + parts[1]
+
+                            # 移除列名后的逗号（如果有）
+                            if column_part.endswith(','):
+                                column_part = column_part[:-1].strip()
+
+                            columns.append(('with_comment', column_part, comment_part))
+                        # 处理 -- comment 格式
+                        elif '--' in col_line:
+                            parts = col_line.split('--', 1)
+                            column_part = parts[0].strip()
+                            # 保持 -- 注释的原始格式
+                            comment_part = '--' + parts[1]
+
+                            if column_part.endswith(','):
+                                column_part = column_part[:-1].strip()
+
+                            columns.append(('with_comment', column_part, comment_part))
+                        else:
+                            # 其他格式，保持原样
+                            col_name = col_stripped.rstrip(',').strip()
+                            if col_name:
+                                columns.append(('simple', col_name, False))
+                    else:
+                        # 普通列（无注释）
+                        # 移除结尾的逗号
+                        col_name = col_stripped.rstrip(',').strip()
+                        if col_name:
+                            columns.append(('simple', col_name, has_comment))
                     i += 1
 
                 # 格式化列
                 if columns:
                     # 第一列
-                    if columns[0][0] == 'simple' and not columns[0][2]:
+                    if columns[0][0] == 'simple':
                         result.append(f"{indent}SELECT{select_modifier} {columns[0][1]}")
-                    elif columns[0][0] == 'simple':
-                        # 带注释的列，保持原样
-                        result.append(f"{indent}SELECT{select_modifier}")
-                        result.append(lines[1])  # 原始第一列行
+                    elif columns[0][0] == 'with_comment':
+                        # 带注释的列：列名 + 注释
+                        column_part = columns[0][1]
+                        comment_part = columns[0][2]
+                        result.append(f"{indent}SELECT{select_modifier} {column_part} {comment_part}")
                     else:  # subquery
                         result.append(f"{indent}SELECT{select_modifier}")
                         result.append(columns[0][1])
 
                     # 后续列
-                    for idx, (col_type, col_content, has_comment) in enumerate(columns[1:], 1):
-                        if col_type == 'simple' and not has_comment:
+                    for idx, col_info in enumerate(columns[1:], 1):
+                        col_type = col_info[0]
+
+                        if col_type == 'simple':
+                            # 普通列（无注释）
+                            col_content = col_info[1]
                             result.append(f"{indent}     , {col_content}")
-                        elif col_type == 'simple':
-                            # 带注释的列，保持原样
-                            # 需要找到原始行
-                            # 这里简化处理：直接使用列内容（带逗号）
-                            result.append(f"{indent}     {col_content},")
+                        elif col_type == 'with_comment':
+                            # 带注释的列：列名 + 注释
+                            column_part = col_info[1]
+                            comment_part = col_info[2]
+                            result.append(f"{indent}     , {column_part} {comment_part}")
                         else:  # subquery
+                            col_content = col_info[1]
                             result.append(f"{indent}     ,")
                             result.append(col_content)
                 else:
