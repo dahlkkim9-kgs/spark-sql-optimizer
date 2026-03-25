@@ -312,6 +312,28 @@ class SQLFormatterV5:
 
         return ''.join(result), comments
 
+    def _restore_line_comments(self, sql: str, comments: list) -> str:
+        """恢复 -- 注释格式
+
+        1. 查找所有占位符 __COMMENT_N__
+        2. 替换回原 -- 注释
+        3. 同时把 /* */ 格式改回 -- 格式（如果 sqlglot 转换了）
+        """
+        result = sql
+
+        # 首先恢复占位符
+        for i, comment in enumerate(comments):
+            placeholder = f" __COMMENT_{i}__ "
+            if placeholder in result:
+                result = result.replace(placeholder, f" {comment} ")
+
+        # 然后把 /* */ 改回 -- 格式（如果 sqlglot 转换了）
+        import re
+        # 简单处理：单行 /* comment */ 改为 -- comment
+        result = re.sub(r'/\* (.*?) \*/', r'-- \1', result)
+
+        return result
+
     def _escape_dollar_signs(self, sql: str) -> tuple:
         """临时转义 $ 符号以绕过 sqlglot 解析限制
 
