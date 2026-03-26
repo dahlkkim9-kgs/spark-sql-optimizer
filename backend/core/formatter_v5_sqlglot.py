@@ -1,32 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-SQL Formatter V5 - 基于 sqlglot AST 解析
-结合 v4 的格式化风格
+SQL Formatter V5 - 基于 sqlglot AST 解析 + V4 列对齐后处理
+
+正确架构：
+1. sqlglot 解析并基础格式化
+2. 将 /* */ 注释改回 -- 格式
+3. V4 列对齐后处理
 """
-from typing import Optional, List
-from sqlglot import parse, exp
-from sqlglot.dialects import Spark
-
-# 共享工具和格式化器导入
-try:
-    from .sql_utils import split_by_semicolon
-    from .formatter_v4_fixed import format_sql_v4_fixed
-    from .parenthesis_align_post_processor import ParenthesisAlignPostProcessor
-except ImportError:
-    from sql_utils import split_by_semicolon
-    from formatter_v4_fixed import format_sql_v4_fixed
-    from parenthesis_align_post_processor import ParenthesisAlignPostProcessor
-
-
-# 常量定义
-DOLLAR_PLACEHOLDER = "___DOLLAR_SIGN_PLACEHOLDER___"
+from typing import Optional
+from sqlglot import parse
+import re
 
 
 class SQLFormatterV5:
     """基于 sqlglot 的 SQL 格式化器"""
-
-    # 类常量
-    DOLLAR_PLACEHOLDER = DOLLAR_PLACEHOLDER
 
     def __init__(self, indent_spaces: int = 4):
         self.indent_spaces = indent_spaces
@@ -38,451 +25,314 @@ class SQLFormatterV5:
             msg += f": {details}"
         print(msg)
 
-    def _apply_v4_column_style(self, sql: str) -> str:
-        """应用 v4 风格的列对齐
+    def _convert_block_comments_to_line_comments(self, sql: str) -> str:
+        """将 /* comment */ 格式改回 -- comment
 
-        将:
-            SELECT
-              a,
-              b,
-              c
-            FROM t1
+        sqlglot 会把 -- 转换成 /* */，这里改回来
 
-        转换为:
-            SELECT a
-                 , b
-                 , c
-            FROM t1
-
-        注意：
-        - 只处理最外层 SELECT 的列，子查询保持原样
-        - 带注释的列保持原样（不重新格式化）
+        处理情况：
+        - `a, /* comment */` -> `a --comment` (移除注释前的逗号)
+        - `a /* comment */` -> `a --comment`
         """
-        lines = sql.split('\n')
         result = []
-        i = 0
+        lines = sql.split('\n')
 
-        while i < len(lines):
-            line = lines[i]
-            stripped = line.strip()
+        for line in lines:
+            # 查找 /* ... */ 模式
+            pattern = r'/\*\s+(.*?)\s+\*/'
+            matches = list(re.finditer(pattern, line))
 
-            # 检测 SELECT 子句（包括 SELECT DISTINCT, SELECT ALL 等）
-            if stripped.startswith('SELECT'):
-                # 获取缩进
-                indent = line[:line.index('SELECT')]
+            # 从后往前替换（避免位置偏移）
+            new_line = line
+            for match in reversed(matches):
+                comment_content = match.group(1).strip()
+                start = match.start()
+                end = match.end()
 
-                # 提取 SELECT 修饰符（DISTINCT, ALL 等）
-                select_modifier = ""
-                if " DISTINCT" in stripped:
-                    select_modifier = " DISTINCT"
-                elif " ALL" in stripped:
-                    select_modifier = " ALL"
+                # 检查注释前是否有逗号
+                before_comment = new_line[:start].rstrip()
+                has_comma = before_comment.endswith(',')
 
-                # 查找 SELECT 后面的列
-                i += 1
-                columns = []  # 存储列信息 (type, content, has_comment)
+                # 替换为 -- 格式
+                replacement = f"--{comment_content}"
 
-                while i < len(lines):
-                    col_line = lines[i]
-                    col_stripped = col_line.strip()
-
-                    # 检测 FROM/JOIN 等结束列列表
-                    if (col_stripped.startswith('FROM') or
-                        col_stripped.startswith('JOIN') or
-                        col_stripped.startswith('INNER') or
-                        col_stripped.startswith('LEFT') or
-                        col_stripped.startswith('RIGHT') or
-                        col_stripped.startswith('FULL') or
-                        col_stripped.startswith('CROSS') or
-                        col_stripped.startswith('WHERE') or
-                        col_stripped.startswith('GROUP') or
-                        col_stripped.startswith('HAVING') or
-                        col_stripped.startswith('ORDER') or
-                        col_stripped.startswith('LIMIT')):
-                        break
-
-                    # 跳过空行
-                    if not col_stripped:
-                        i += 1
-                        continue
-
-                    # 检查是否包含注释
-                    has_comment = ('/*' in col_line or '--' in col_line)
-
-                    # 检查是否是子查询开始（括号开头）
-                    if col_stripped.startswith('('):
-                        # 收集子查询的所有行
-                        sub_lines = [col_line]
-                        i += 1
-                        paren_count = col_line.count('(') - col_line.count(')')
-                        while i < len(lines) and paren_count > 0:
-                            sub_lines.append(lines[i])
-                            paren_count += lines[i].count('(') - lines[i].count(')')
-                            i += 1
-                        # 收集子查询后的别名行（如果有）
-                        while i < len(lines):
-                            next_stripped = lines[i].strip()
-                            # 如果是下一个列（以逗号结尾）或子句关键字，停止
-                            if (next_stripped.startswith('FROM') or
-                                next_stripped.startswith('WHERE') or
-                                next_stripped.endswith(',') or
-                                next_stripped.startswith(')')):
-                                break
-                            # 可能是别名行（AS xxx）
-                            if next_stripped.startswith('AS') or ' AS ' in next_stripped:
-                                sub_lines.append(lines[i])
-                                i += 1
-                                break
-                            # 其他情况也作为别名行
-                            sub_lines.append(lines[i])
-                            i += 1
-                        columns.append(('subquery', '\n'.join(sub_lines), has_comment))
-                        continue
-
-                    # 普通列（包括带注释的列）
-                    if has_comment:
-                        # 带注释的列：需要正确分离列名和注释
-                        column_part = None
-                        comment_part = None
-
-                        # 处理 /* comment */ 格式
-                        if '/*' in col_line:
-                            # 分离列名和注释
-                            parts = col_line.split('/*', 1)
-                            column_part = parts[0].strip()
-                            # 保持注释的原始格式（包括 /* 和内部空格）
-                            comment_part = '/*' + parts[1]
-
-                            # 移除列名后的逗号（如果有）
-                            if column_part.endswith(','):
-                                column_part = column_part[:-1].strip()
-
-                            columns.append(('with_comment', column_part, comment_part))
-                        # 处理 -- comment 格式
-                        elif '--' in col_line:
-                            parts = col_line.split('--', 1)
-                            column_part = parts[0].strip()
-                            # 保持 -- 注释的原始格式
-                            comment_part = '--' + parts[1]
-
-                            if column_part.endswith(','):
-                                column_part = column_part[:-1].strip()
-
-                            columns.append(('with_comment', column_part, comment_part))
-                        else:
-                            # 其他格式，保持原样
-                            col_name = col_stripped.rstrip(',').strip()
-                            if col_name:
-                                columns.append(('simple', col_name, False))
-                    else:
-                        # 普通列（无注释）
-                        # 移除结尾的逗号
-                        col_name = col_stripped.rstrip(',').strip()
-                        if col_name:
-                            columns.append(('simple', col_name, has_comment))
-                    i += 1
-
-                # 格式化列
-                if columns:
-                    # 第一列
-                    if columns[0][0] == 'simple':
-                        result.append(f"{indent}SELECT{select_modifier} {columns[0][1]}")
-                    elif columns[0][0] == 'with_comment':
-                        # 带注释的列：列名 + 注释
-                        column_part = columns[0][1]
-                        comment_part = columns[0][2]
-                        result.append(f"{indent}SELECT{select_modifier} {column_part} {comment_part}")
-                    else:  # subquery
-                        result.append(f"{indent}SELECT{select_modifier}")
-                        result.append(columns[0][1])
-
-                    # 后续列
-                    for idx, col_info in enumerate(columns[1:], 1):
-                        col_type = col_info[0]
-
-                        if col_type == 'simple':
-                            # 普通列（无注释）
-                            col_content = col_info[1]
-                            result.append(f"{indent}     , {col_content}")
-                        elif col_type == 'with_comment':
-                            # 带注释的列：列名 + 注释
-                            column_part = col_info[1]
-                            comment_part = col_info[2]
-                            result.append(f"{indent}     , {column_part} {comment_part}")
-                        else:  # subquery
-                            col_content = col_info[1]
-                            result.append(f"{indent}     ,")
-                            result.append(col_content)
+                # 如果有逗号，移除它
+                if has_comma:
+                    new_line = before_comment[:-1] + ' ' + replacement + new_line[end:]
                 else:
-                    result.append(f"{indent}SELECT{select_modifier}")
+                    new_line = new_line[:start] + replacement + new_line[end:]
 
-                # 继续处理（i 已经指向下一行）
-                continue
-
-            result.append(line)
-            i += 1
+            result.append(new_line)
 
         return '\n'.join(result)
 
-    def _apply_v4_full_style(self, sql: str) -> str:
-        """应用完整的 V4 风格后处理
+    def _apply_v4_column_style(self, sql: str) -> str:
+        """应用 v4 风格的列对齐
 
-        处理：
-        1. 修复 WHERE 条件（应该在同一行，如果不太长）
-        2. 统一子查询缩进（1 空格递增）
-        3. 添加结尾分号
+        将逗号移到行首，并保持对齐
         """
         lines = sql.split('\n')
         result = []
-        i = 0
+        in_select = False
+        columns = []
 
-        while i < len(lines):
-            line = lines[i]
+        for i, line in enumerate(lines):
             stripped = line.strip()
 
-            # 检测 WHERE 子句后跟条件（在不同行）
-            if stripped == 'WHERE' and i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                # 如果下一行是条件（不是关键字），合并到一行
-                if next_line and not any(next_line.startswith(kw) for kw in ['SELECT', 'FROM', 'WHERE', 'ORDER', 'GROUP', 'HAVING', 'LIMIT', 'JOIN', 'ON', 'AND', 'OR']):
-                    result.append('WHERE ' + next_line)
-                    i += 2
+            # 检测 SELECT 开始
+            if stripped.upper().startswith('SELECT'):
+                # 提取 SELECT 后面的内容
+                parts = stripped.split(None, 1)
+                if len(parts) > 1:
+                    # SELECT a, b -> 第一列是 a
+                    first_col = parts[1].strip()
+                    # 移除结尾逗号
+                    if first_col.endswith(','):
+                        first_col = first_col[:-1].strip()
+                    if first_col:
+                        columns.append(first_col)
+                in_select = True
+                continue
+
+            # 检测 FROM/WHERE/GROUP BY 等结束 SELECT 子句
+            if in_select and stripped:
+                first_word = stripped.split()[0].upper()
+                if first_word in ('FROM', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'UNION', 'INTERSECT', 'EXCEPT',
+                                 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP'):
+                    # 输出之前收集的列
+                    if columns:
+                        for j, col in enumerate(columns):
+                            if j == 0:
+                                result.append(f"SELECT {col}")
+                            else:
+                                result.append(f"     , {col}")
+                        columns = []
+                    in_select = False
+                    result.append(line)
                     continue
 
-            # 处理缩进
-            if (stripped.startswith('FROM') or
-                stripped.startswith('WHERE') or
-                stripped.startswith('INNER JOIN') or
-                stripped.startswith('LEFT JOIN') or
-                stripped.startswith('RIGHT JOIN') or
-                stripped.startswith('FULL JOIN') or
-                stripped.startswith('CROSS JOIN') or
-                stripped.startswith('ORDER BY') or
-                stripped.startswith('GROUP BY') or
-                stripped.startswith('HAVING') or
-                stripped.startswith('LIMIT')):
-                # 主子句顶格
-                result.append(stripped)
-            elif stripped.startswith('ON') or stripped.startswith('AND') or stripped.startswith('OR'):
-                # ON/AND/OR 缩进 2 空格
-                result.append('  ' + stripped)
-            elif stripped.startswith('SELECT'):
-                # 检查是否是子查询
-                if result and result[-1].strip() == '(':
-                    # 子查询的 SELECT，缩进 1 空格
-                    result.append(' ' + stripped)
-                elif result and result[-1].strip().endswith('('):
-                    # 也可能是子查询
-                    result.append(' ' + stripped)
-                else:
-                    result.append(stripped)
-            else:
-                # 保持原有缩进，但规范化（子查询内容）
-                if stripped:
-                    current_indent = len(line) - len(line.lstrip())
-                    # 如果是子查询内容（缩进 > 0），规范化为 1 空格递增
-                    if current_indent > 0 and result:
-                        # 获取上一层的缩进
-                        last_indent = len(result[-1]) - len(result[-1].lstrip()) if result[-1].strip() else 0
-                        # 如果当前缩进与上一行相差较大，规范化
-                        if current_indent - last_indent > 2:
-                            result.append(' ' * (last_indent + 1) + stripped)
-                        else:
-                            result.append(line)
-                    else:
-                        result.append(line)
-                else:
+            # 在 SELECT 子句中，收集列
+            if in_select:
+                if stripped and not stripped.startswith('--'):
+                    # 处理列
+                    col = stripped
+                    # 移除开头的逗号
+                    if col.startswith(','):
+                        col = col[1:].strip()
+                    # 移除结尾的逗号
+                    if col.endswith(','):
+                        col = col[:-1].strip()
+                    if col:
+                        columns.append(col)
+                    continue
+                elif stripped.startswith('--'):
+                    # 注释行，直接输出
+                    if columns:
+                        for j, col in enumerate(columns):
+                            if j == 0:
+                                result.append(f"SELECT {col}")
+                            else:
+                                result.append(f"     , {col}")
+                        columns = []
                     result.append(line)
+                    continue
 
-            i += 1
+            # 输出之前收集的列
+            if columns and not in_select:
+                for j, col in enumerate(columns):
+                    if j == 0:
+                        result.append(f"SELECT {col}")
+                    else:
+                        result.append(f"     , {col}")
+                columns = []
 
-        # 添加结尾分号
-        formatted = '\n'.join(result)
-        if formatted and not formatted.rstrip().endswith(';'):
-            formatted = formatted + '\n;'
+            result.append(line)
 
-        return formatted
+        # 处理剩余的列
+        if columns:
+            for j, col in enumerate(columns):
+                if j == 0:
+                    result.append(f"SELECT {col}")
+                else:
+                    result.append(f"     , {col}")
 
-    def _protect_line_comments(self, sql: str) -> tuple:
-        """保护行内 -- 注释
+        return '\n'.join(result)
 
-        1. 查找所有 -- 注释（不包括字符串内的 --）
-        2. 替换为占位符 __COMMENT_N__
-        3. 返回 (替换后的SQL, 注释列表)
+    def _escape_dollar_signs(self, sql: str) -> tuple:
+        """转义特殊符号（sqlglot 可能误解析）
+
+        转义 $ 符号和 {} 变量语法
         """
-        comments = []
-        result = []
+        import re
+        # 转义 $ 符号
+        escaped = re.sub(r'\$', '___DOLLAR___', sql)
+        # 转义 {} 变量语法，如 {DATA_DT}
+        escaped = re.sub(r'\{([^}]*)\}', r'___BRACE_OPEN___\1___BRACE_CLOSE___', escaped)
+        return escaped, sql.count('$') + sql.count('{')
+
+    def _unescape_dollar_signs(self, sql: str) -> str:
+        """恢复转义的符号"""
+        import re
+        # 恢复 {} 变量语法 - 非贪婪匹配任意字符
+        sql = re.sub(r'___BRACE_OPEN___(.*?)___BRACE_CLOSE___', r'{\1}', sql)
+        # 恢复 $ 符号
+        sql = re.sub(r'___DOLLAR___', '$', sql)
+        return sql
+
+    def _split_sql_statements(self, sql: str) -> list:
+        """分割 SQL 语句
+
+        按分号分割，但忽略字符串和注释中的分号
+        """
+        statements = []
+        current = []
         i = 0
 
         while i < len(sql):
             char = sql[i]
 
-            # 检测行内注释 --
+            # 处理字符串
+            if char in ('"', "'"):
+                quote = char
+                current.append(char)
+                i += 1
+                while i < len(sql) and sql[i] != quote:
+                    if sql[i] == '\\' and i + 1 < len(sql):
+                        current.append(sql[i])
+                        i += 1
+                    current.append(sql[i])
+                    i += 1
+                if i < len(sql):
+                    current.append(sql[i])
+                    i += 1
+                continue
+
+            # 处理 -- 注释
             if char == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
-                # 检查是否在字符串内
-                in_string = False
+                while i < len(sql) and sql[i] not in ('\n', '\r'):
+                    current.append(sql[i])
+                    i += 1
+                continue
 
-                # 简单检查：向前查找字符串开始
-                for j in range(i - 1, -1, -1):
-                    if sql[j] in ('"', "'"):
-                        # 找到引号，检查是否转义
-                        if j > 0 and sql[j - 1] != '\\':
-                            in_string = not in_string
+            # 处理 /* */ 注释
+            if char == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                while i < len(sql) and not (sql[i] == '*' and i + 1 < len(sql) and sql[i + 1] == '/'):
+                    current.append(sql[i])
+                    i += 1
+                if i < len(sql):
+                    current.append(sql[i])
+                    i += 1
+                if i < len(sql):
+                    current.append(sql[i])
+                    i += 1
+                continue
 
-                if not in_string:
-                    # 找到注释结束位置（行尾）
-                    comment_start = i
-                    comment_end = i + 2
+            # 处理分号
+            if char == ';':
+                stmt = ''.join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                i += 1
+                continue
 
-                    while comment_end < len(sql) and sql[comment_end] not in ('\n', '\r'):
-                        comment_end += 1
-
-                    # 提取注释内容
-                    comment = sql[comment_start:comment_end].strip()
-                    comments.append(comment)
-
-                    # 替换为占位符
-                    placeholder = f" __COMMENT_{len(comments) - 1}__ "
-                    result.append(placeholder)
-
-                    # 跳到行尾
-                    i = comment_end
-                    continue
-
-            result.append(char)
+            current.append(char)
             i += 1
 
-        return ''.join(result), comments
+        # 最后一个语句
+        stmt = ''.join(current).strip()
+        if stmt:
+            statements.append(stmt)
 
-    def _restore_line_comments(self, sql: str, comments: list) -> str:
-        """恢复 -- 注释格式
-
-        1. 查找所有占位符 __COMMENT_N__
-        2. 替换回原 -- 注释
-        3. 同时把 /* */ 格式改回 -- 格式（如果 sqlglot 转换了）
-        """
-        import re
-        result = sql
-
-        # 首先恢复占位符（使用正则，匹配周围可能的空格）
-        for i, comment in enumerate(comments):
-            # 匹配占位符，前后可能有空格
-            pattern = rf'\s*__COMMENT_{i}__\s*'
-            # 替换为原注释（保留一个前置空格）
-            result = re.sub(pattern, f' {comment} ', result)
-
-        # 然后把 /* */ 改回 -- 格式（如果 sqlglot 转换了）
-        # 简单处理：单行 /* comment */ 改为 -- comment
-        result = re.sub(r'/\* (.*?) \*/', r'-- \1', result)
-
-        return result
-
-    def _escape_dollar_signs(self, sql: str) -> tuple:
-        """临时转义 $ 符号以绕过 sqlglot 解析限制
-
-        Spark SQL 使用 $ 进行变量替换（如 table_$date）
-        sqlglot 无法正确解析这种语法，需要临时转义
-        """
-        escaped = sql.replace('$', self.DOLLAR_PLACEHOLDER)
-        return escaped, self.DOLLAR_PLACEHOLDER
-
-    def _unescape_dollar_signs(self, sql: str) -> str:
-        """恢复 $ 符号"""
-        return sql.replace(self.DOLLAR_PLACEHOLDER, '$')
+        return statements
 
     def format(self, sql: str, dialect: str = "spark") -> str:
         """格式化 SQL
 
-        策略：使用 sqlglot 解析（确保语法正确性），然后用 V4 格式化
+        正确架构：
+        1. 分割 SQL 语句
+        2. 对每个语句：sqlglot 解析 → 格式化 → 注释转换 → 列对齐
+        3. 合并结果
 
         Args:
-            sql: 原始 SQL（支持多语句，用分号分隔）
+            sql: 原始 SQL
             dialect: SQL 方言 (默认 spark)
 
         Returns:
             格式化后的 SQL
         """
-        # Step 1: 保护 -- 注释
-        protected_sql, comments = self._protect_line_comments(sql)
+        # Step 1: 分割语句
+        statements = self._split_sql_statements(sql)
 
-        # Step 2: 临时转义 $ 符号（原有逻辑）
-        escaped_sql, _ = self._escape_dollar_signs(protected_sql)
+        if not statements:
+            return sql
 
-        # 首先尝试整体解析（仅用于验证语法）
-        try:
-            # 解析为 AST（验证语法正确性）
-            asts = parse(escaped_sql, dialect=dialect, read=dialect)
+        # Step 2: 分别格式化每个语句
+        formatted_statements = []
+        failed_statements = []
 
-            if not asts:
-                return sql
+        for i, stmt in enumerate(statements):
+            try:
+                # 转义 $ 符号
+                escaped_stmt, _ = self._escape_dollar_signs(stmt)
 
-            # 语法正确，直接使用 V4 格式化（保持风格一致）
-            # 分割语句
-            statements = split_by_semicolon(protected_sql)
+                # sqlglot 解析并格式化
+                asts = parse(escaped_stmt, dialect=dialect, read=dialect)
 
-            formatted_statements = []
-            for stmt in statements:
-                stmt = stmt.strip()
-                if not stmt:
+                if not asts:
+                    # sqlglot 无法解析，保留原语句
+                    self._log(f"语句 {i+1}", "sqlglot 返回空，保留原语句")
+                    formatted_statements.append(stmt)
                     continue
 
-                # 确保以分号结尾
-                if not stmt.endswith(';'):
-                    stmt += ';'
+                # 格式化（通常只有一个 AST）
+                formatted = []
+                for ast in asts:
+                    fmt = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
+                    # 恢复 $ 符号
+                    fmt = self._unescape_dollar_signs(fmt)
+                    # 将 /* */ 改回 -- 格式
+                    fmt = self._convert_block_comments_to_line_comments(fmt)
+                    # TODO: 暂时禁用 V4 列对齐后处理，保证 SQL 完整性
+                    # 问题：当前实现在处理子查询时会破坏 SQL 语法
+                    # 后续计划：用 sqlglot AST 辅助识别 SELECT 子句范围后重新启用
+                    # fmt = self._apply_v4_column_style(fmt)
+                    # 添加分号
+                    if not fmt.endswith(';'):
+                        fmt += ';'
+                    formatted.append(fmt)
 
-                # 使用 V4 格式化
-                formatted = format_sql_v4_fixed(stmt, **{'indent': self.indent_spaces})
-                # 恢复注释（改回 -- 格式）
-                formatted = self._restore_line_comments(formatted, comments)
-                formatted_statements.append(formatted)
+                formatted_statements.extend(formatted)
 
-            # 用空行分隔多个语句
-            return '\n\n'.join(formatted_statements)
+            except Exception as e:
+                # 单个语句解析失败，记录但继续处理其他语句
+                error_msg = str(e)
+                self._log(f"语句 {i+1} 解析失败", error_msg[:50] + '...')
+                failed_statements.append((i + 1, stmt, error_msg))
+                formatted_statements.append(stmt)
 
-        except Exception as e:
-            # 解析失败，尝试逐语句混合解析
-            self._log("整体解析失败", f"{type(e).__name__}，尝试逐语句混合解析")
+        # Step 3: 如果有任何语句失败，抛出错误
+        if failed_statements:
+            errors = []
+            for idx, stmt, err in failed_statements:
+                stmt_preview = stmt[:100] + '...' if len(stmt) > 100 else stmt
 
-            # 使用共享的语句分割函数（更高效，支持字符串处理）
-            statements = split_by_semicolon(protected_sql)
+                # 检测常见错误并给出提示
+                hint = ""
+                if "Failed to parse any statement following CTE" in str(err):
+                    hint = "    提示: CTE (WITH...AS) 后面需要跟 SELECT 语句，例如: WITH A AS (...) SELECT * FROM A"
+                elif "Expecting )" in str(err):
+                    hint = "    提示: 括号不匹配，请检查 SQL 中的括号是否成对"
 
-            # 逐语句尝试解析
-            formatted_statements = []
+                errors.append(f"  语句 {idx}: {err}\n    内容: {stmt_preview}")
+                if hint:
+                    errors.append(hint)
 
-            for i, stmt in enumerate(statements):
-                stmt = stmt.strip()
-                if not stmt:
-                    continue
+            error_msg = f"V5 格式化失败 ({len(failed_statements)} 个语句无法解析):\n" + "\n".join(errors)
+            raise ValueError(error_msg)
 
-                # 移除结尾分号
-                if stmt.endswith(';'):
-                    stmt = stmt[:-1].strip()
-
-                try:
-                    # 尝试用 sqlglot 解析验证语法
-                    escaped_stmt, _ = self._escape_dollar_signs(stmt)
-                    asts = parse(escaped_stmt, dialect=dialect, read=dialect)
-                    if asts:
-                        # 语法正确，使用 V4 格式化
-                        formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
-                        # 恢复注释（改回 -- 格式）
-                        formatted = self._restore_line_comments(formatted, comments)
-                        formatted_statements.append(formatted)
-                        self._log(f"语句 {i+1}/{len(statements)}", "语法验证通过，使用 V4 格式化")
-                    else:
-                        raise ValueError("No AST returned")
-                except Exception:
-                    # 该语句语法可能有问题，直接用 V4 格式化
-                    self._log(f"语句 {i+1}/{len(statements)}", "使用 V4 格式化")
-                    formatted = format_sql_v4_fixed(stmt + ';', **{'indent': self.indent_spaces})
-                    # 恢复注释（改回 -- 格式）
-                    formatted = self._restore_line_comments(formatted, comments)
-                    formatted_statements.append(formatted)
-
-            # 合并所有语句
-            result = '\n\n'.join(formatted_statements)
-            self._log("混合解析完成", f"{len(statements)} 个语句")
-            return result
+        # Step 4: 合并结果
+        return '\n\n'.join(formatted_statements)
 
 
 def format_sql_v5(sql: str, **options) -> str:
