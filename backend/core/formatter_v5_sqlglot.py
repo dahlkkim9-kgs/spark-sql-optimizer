@@ -1780,6 +1780,352 @@ class SQLFormatterV5:
             i = j
         return result, i
 
+    # ============================================================
+    # 长行标量子查询拆分
+    # ============================================================
+
+    def _split_long_scalar_subqueries(self, text: str) -> str:
+        """拆分超长标量子查询为多行格式。
+
+        处理两种模式：
+        1. EXISTS(SELECT...)/NOT EXISTS(SELECT...) — 在 CASE WHEN 或 WHERE 中
+        2. 函数内标量子查询 — 如 AVG(COALESCE((SELECT...), 0))
+
+        只处理超过 120 字符的行。
+        """
+        lines = text.split('\n')
+        result = []
+        for line in lines:
+            if len(line) > 120 and self._contains_scalar_subquery(line.strip()):
+                expanded = self._expand_scalar_subquery_in_line(line)
+                result.extend(expanded)
+            else:
+                result.append(line)
+        return '\n'.join(result)
+
+    @staticmethod
+    def _contains_scalar_subquery(text: str) -> bool:
+        """检测文本是否包含标量子查询模式。"""
+        # 模式1: EXISTS(SELECT...) 或 NOT EXISTS(SELECT...)
+        if re.search(r'\bEXISTS\s*\(\s*SELECT\b', text, re.IGNORECASE):
+            return True
+        # 模式2: ((SELECT... — 函数内嵌套括号包裹标量子查询
+        if re.search(r'\(\s*\(\s*SELECT\b', text, re.IGNORECASE):
+            return True
+        # 模式3: IN (SELECT...) 或 NOT IN (SELECT...)
+        if re.search(r'\bIN\s*\(\s*SELECT\b', text, re.IGNORECASE):
+            return True
+        return False
+
+    @staticmethod
+    def _find_matching_paren_safe(text: str, start: int) -> int:
+        """从 start 位置（必须是 '('）找到匹配的 ')'，跳过字符串字面量。"""
+        if start >= len(text) or text[start] != '(':
+            return -1
+        depth = 0
+        in_str = False
+        qc = None
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if c == qc:
+                    in_str = False
+                continue
+            if c in ("'", '"'):
+                in_str = True
+                qc = c
+                continue
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    def _find_scalar_subquery_start(self, text: str) -> int:
+        """找到标量子查询起始 '(' 的位置。
+
+        处理：
+        - EXISTS(SELECT...) → EXISTS 后的 (
+        - NOT EXISTS(SELECT...) → EXISTS 后的 (
+        - ((SELECT...) → 内层的 (
+        - IN (SELECT...) → IN 后的 (
+        """
+        # EXISTS 模式
+        for m in re.finditer(r'\bEXISTS\s*\(', text, re.IGNORECASE):
+            paren_pos = m.end() - 1  # ( 的位置
+            rest = text[paren_pos + 1:].lstrip()
+            if re.match(r'^SELECT\b', rest, re.IGNORECASE):
+                return paren_pos
+
+        # IN (SELECT...) 模式
+        for m in re.finditer(r'\bIN\s*\(', text, re.IGNORECASE):
+            paren_pos = m.end() - 1
+            rest = text[paren_pos + 1:].lstrip()
+            if re.match(r'^SELECT\b', rest, re.IGNORECASE):
+                return paren_pos
+
+        # ((SELECT...) 模式 — 找内层 (
+        for m in re.finditer(r'\(\s*\(\s*SELECT\b', text, re.IGNORECASE):
+            # 找内层 (
+            inner_start = text.index('(', m.start() + 1)
+            return inner_start
+
+        return -1
+
+    def _split_by_top_level_clauses(self, text: str) -> list:
+        """按顶层 SQL 子句关键字拆分，忽略括号和字符串内的关键字。
+
+        Returns:
+            拆分后的子句列表，每个包含关键字及其后内容。
+            如 ['SELECT SUM(x)', 'FROM t', 'WHERE a = 1 AND b = 2']
+        """
+        clauses = []
+        depth = 0
+        in_str = False
+        qc = None
+        current_start = 0
+        i = 0
+
+        clause_keywords = [
+            'SELECT', 'FROM', 'WHERE', 'INNER JOIN', 'LEFT JOIN',
+            'RIGHT JOIN', 'FULL JOIN', 'CROSS JOIN', 'JOIN',
+            'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT',
+            'AND', 'OR', 'ON',
+        ]
+
+        while i < len(text):
+            c = text[i]
+            if in_str:
+                if c == qc:
+                    in_str = False
+                i += 1
+                continue
+            if c in ("'", '"'):
+                in_str = True
+                qc = c
+                i += 1
+                continue
+            if c == '(':
+                depth += 1
+                i += 1
+                continue
+            if c == ')':
+                depth -= 1
+                i += 1
+                continue
+
+            if depth == 0:
+                for kw in clause_keywords:
+                    kw_len = len(kw)
+                    if i + kw_len > len(text):
+                        continue
+                    upper_ahead = text[i:i + kw_len].upper()
+                    if upper_ahead != kw:
+                        continue
+                    # 检查边界：关键字前后不能是字母数字或下划线
+                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
+                    after_pos = i + kw_len
+                    after_ok = (after_pos >= len(text) or not text[after_pos].isalnum() and text[after_pos] != '_')
+                    if not (before_ok and after_ok):
+                        continue
+
+                    # 对于 AND/OR，需要特殊处理 BETWEEN...AND
+                    if kw in ('AND', 'OR'):
+                        # 排除 BETWEEN ... AND 模式（简化检测）
+                        seg = text[current_start:i].strip().upper()
+                        if re.search(r'\bBETWEEN\s+\S+\s*$', seg):
+                            continue
+
+                    # 找到子句边界
+                    if i > current_start:
+                        seg = text[current_start:i].strip()
+                        if seg:
+                            clauses.append(seg)
+                    current_start = i
+                    i += kw_len
+                    break
+                else:
+                    i += 1
+                    continue
+                continue  # matched a keyword, skip normal i += 1
+            i += 1
+
+        remaining = text[current_start:].strip()
+        if remaining:
+            clauses.append(remaining)
+        return clauses
+
+    def _format_scalar_subquery_content(self, content: str, indent: int) -> list:
+        """将标量子查询内容格式化为多行。
+
+        Args:
+            content: 子查询内容（不含外层括号）
+            indent: 子查询内容的缩进级别
+
+        Returns:
+            格式化后的行列表
+        """
+        clauses = self._split_by_top_level_clauses(content)
+        result = []
+
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            upper = clause.upper()
+
+            # AND/OR 单独缩进
+            if re.match(r'^AND\b', upper) or re.match(r'^OR\b', upper):
+                # AND/OR 右对齐
+                and_or_ind = indent + (2 if upper.startswith('AND') else 1)
+                result.append(f"{' ' * and_or_ind}{clause}")
+            elif re.match(r'^ON\b', upper):
+                result.append(f"{' ' * (indent + 2)}{clause}")
+            else:
+                result.append(f"{' ' * indent}{clause}")
+
+        return result
+
+    def _expand_scalar_subquery_in_line(self, line: str) -> list:
+        """将包含标量子查询的单行拆分为多行。
+
+        处理 EXISTS 和函数内嵌两种模式。
+        """
+        indent = len(line) - len(line.lstrip())
+        stripped = line.lstrip()
+
+        # 找到标量子查询起始位置
+        paren_pos = self._find_scalar_subquery_start(stripped)
+        if paren_pos == -1:
+            return [line]
+
+        # 前缀：子查询 ( 之前的内容
+        before = stripped[:paren_pos]
+        close_pos = self._find_matching_paren_safe(stripped, paren_pos)
+        if close_pos == -1:
+            return [line]
+
+        # 后缀：子查询 ) 之后的内容
+        after = stripped[close_pos + 1:].strip()
+
+        # 子查询内容（去掉括号）
+        subquery_content = stripped[paren_pos + 1:close_pos].strip()
+
+        result = []
+        prefix_spaces = ' ' * indent
+
+        # 判断模式
+        is_exists = bool(re.search(r'\bEXISTS\s*$', before, re.IGNORECASE))
+        is_not_exists = bool(re.search(r'\bNOT\s+EXISTS\s*$', before, re.IGNORECASE))
+        is_in = bool(re.search(r'\bIN\s*$', before, re.IGNORECASE))
+
+        if is_exists or is_not_exists or is_in:
+            # EXISTS(SELECT...) / IN (SELECT...) 模式
+            keyword_before = before.rstrip()
+            subquery_indent = indent + len(keyword_before) + 2  # "( " 后缩进
+
+            result.append(f"{prefix_spaces}{keyword_before} (")
+
+            # 格式化子查询内容
+            sub_lines = self._format_scalar_subquery_content(
+                subquery_content, subquery_indent
+            )
+            result.extend(sub_lines)
+
+            # 闭括号 + 后续内容
+            close_line = f"{prefix_spaces}{' ' * len(keyword_before)}"
+            if after:
+                close_line += f"){after}"
+            else:
+                close_line += ")"
+            result.append(close_line)
+        else:
+            # 函数内嵌标量子查询模式（如 AVG(COALESCE((SELECT...), 0))）
+            # before 有 N 层未闭合的 (，after 有 N 个 ) + 可选参数和别名
+            func_depth = before.count('(') - before.count(')')
+            if func_depth <= 0:
+                return [line]
+
+            # 输出 before（如 "AVG(COALESCE("）
+            result.append(f"{prefix_spaces}{before}")
+
+            # 子查询外层括号 ( — 使用固定缩进增量，避免 len(before) 导致过度缩进
+            inner_indent = indent + 4
+            result.append(f"{' ' * inner_indent}(")
+
+            # 格式化子查询内容
+            content_indent = inner_indent + 4
+            sub_lines = self._format_scalar_subquery_content(
+                subquery_content, content_indent
+            )
+            result.extend(sub_lines)
+
+            # 关闭子查询外层括号 )
+            result.append(f"{' ' * inner_indent})")
+
+            # 解析 after：提取参数、闭括号、别名
+            # after 如 ", 0)) AS category_avg"
+            segments = []  # [(type, content)] type: 'param'|'close'|'alias'
+            if after:
+                current = []
+                depth = 0
+                in_str = False
+                sq = None
+                for c in after:
+                    if in_str:
+                        if c == sq:
+                            in_str = False
+                        current.append(c)
+                        continue
+                    if c in ("'", '"'):
+                        in_str = True
+                        sq = c
+                        current.append(c)
+                        continue
+                    if c == '(':
+                        depth += 1
+                        current.append(c)
+                    elif c == ')':
+                        if depth > 0:
+                            depth -= 1
+                            current.append(c)
+                        else:
+                            seg = ''.join(current).strip()
+                            if seg:
+                                segments.append(('param', seg))
+                            segments.append(('close', ')'))
+                            current = []
+                    elif c == ',' and depth == 0:
+                        seg = ''.join(current).strip()
+                        if seg:
+                            segments.append(('param', seg))
+                        current = [c]
+                    else:
+                        current.append(c)
+                seg = ''.join(current).strip()
+                if seg:
+                    if segments and segments[-1][0] == 'close':
+                        segments.append(('alias', seg))
+                    else:
+                        segments.append(('param', seg))
+
+            # 输出参数和闭括号
+            close_indent = inner_indent
+
+            for seg_type, seg_content in segments:
+                if seg_type == 'param':
+                    result.append(f"{' ' * close_indent}{seg_content}")
+                elif seg_type == 'close':
+                    close_indent = max(indent, close_indent - 4)
+                    result.append(f"{' ' * close_indent})")
+                elif seg_type == 'alias':
+                    if result:
+                        result[-1] += f" {seg_content}"
+
+        return result
+
     def _unescape_dollar_signs(self, sql: str) -> str:
         """恢复转义的符号"""
         import re
@@ -1913,6 +2259,8 @@ class SQLFormatterV5:
                     )
                     # 修复子查询括号对齐和内容缩进
                     fmt = self._fix_subquery_indent(fmt)
+                    # 拆分超长标量子查询
+                    fmt = self._split_long_scalar_subqueries(fmt)
                     # 添加分号
                     if not fmt.endswith(';'):
                         fmt += ';'
