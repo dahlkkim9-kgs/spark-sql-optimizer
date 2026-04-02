@@ -30,8 +30,8 @@ from core.formatter_v4_fixed import format_sql_v4_fixed
 
 # 版本信息
 API_VERSION = "1.0.0"
-FORMATTER_VERSION = "v4.5-20260320-fulltest"
-FORMATTER_FILE = "formatter_v4_fixed.py"
+FORMATTER_VERSION = "v5.0-20260324-sqlglot"
+FORMATTER_FILE = "formatter_v5_sqlglot.py"
 
 app = FastAPI(
     title="Spark SQL 优化工具 API",
@@ -100,6 +100,8 @@ class LegacyFormatRequest(BaseModel):
     options: Optional[LegacyFormatOptions] = None
     # 兼容部分调用方直接传 keyword_case 的情况
     keyword_case: Optional[str] = None
+    # 缩进空格数
+    indent: Optional[int] = 4
 
 
 @app.get("/")
@@ -262,73 +264,16 @@ async def format_sql_v4fixed_endpoint(request: FormatRequest):
 
 @app.post("/format/v5")
 async def format_sql_v5_endpoint(request: FormatRequest):
-    """Format SQL with v5 - 直接使用 v4_fixed（已包含所有高级语法支持）
+    """Format SQL with v5 - 使用 sqlglot AST 解析 + V4 格式化
 
-    注意：V5 的分层架构已被简化，直接使用 v4_fixed。
-    v4_fixed 已支持：UNION、CASE WHEN、OVER、CTE、子查询、MERGE、LATERAL VIEW 等高级语法。
+    V5 架构：
+    1. sqlglot 解析验证语法正确性
+    2. V4 formatter 应用格式化风格
+
+    优势：
+    - 准确解析复杂嵌套、新语法
+    - 保持 V4 风格一致性
     """
-    try:
-        import sys
-        import os
-
-        # 确保 core 目录在路径中
-        core_path = os.path.join(os.path.dirname(__file__), '..', 'core')
-        if core_path not in sys.path:
-            sys.path.insert(0, core_path)
-
-        # 清除 formatter 模块缓存
-        modules_to_remove = [k for k in sys.modules.keys() if 'formatter' in k]
-        for mod in modules_to_remove:
-            del sys.modules[mod]
-
-        from formatter_v4_fixed import format_sql_v4_fixed
-
-        # 直接使用 v4_fixed
-        result = format_sql_v4_fixed(request.sql, keyword_case=request.keyword_case or 'upper')
-
-        return {"formatted": result, "success": True}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "success": False}
-
-@app.post("/api/format")
-async def format_sql_legacy_endpoint(request: LegacyFormatRequest):
-    """
-    兼容旧前端（原 Flask `/api/format`）的返回结构：
-    { success: bool, formatted: str, original: str, error?: str, version?: str }
-
-    版本信息：确保前端可以验证使用的格式化器版本
-    """
-    try:
-        # 强制重新加载模块，确保使用最新代码
-        import importlib
-        import core.formatter_v4_fixed
-        importlib.reload(core.formatter_v4_fixed)
-        from core.formatter_v4_fixed import format_sql_v4_fixed
-
-        keyword_case = (
-            request.keyword_case
-            or (request.options.keyword_case if request.options else None)
-            or "upper"
-        )
-        formatted = format_sql_v4_fixed(request.sql, keyword_case=keyword_case)
-        return {
-            "success": True,
-            "formatted": formatted,
-            "original": request.sql,
-            "version": FORMATTER_VERSION,
-            "formatter_file": FORMATTER_FILE
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "error": str(e), "original": request.sql}
-
-
-@app.post("/api/format-v5")
-async def format_sql_v5_sqlglot_endpoint(request: FormatRequest):
-    """v5 格式化 API (基于 sqlglot AST 解析)"""
     try:
         import sys
         import os
@@ -340,18 +285,105 @@ async def format_sql_v5_sqlglot_endpoint(request: FormatRequest):
 
         from core.formatter_v5_sqlglot import format_sql_v5
 
-        # 使用 v5 sqlglot 版本格式化
+        # 使用 V5 sqlglot 版本格式化
+        result = format_sql_v5(request.sql, indent=request.indent or 4)
+
+        return {"formatted": result, "success": True, "version": "v5-sqlglot"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "success": False}
+
+@app.post("/api/format")
+async def format_sql_legacy_endpoint(request: LegacyFormatRequest):
+    """
+    主格式化端点（使用 V4 fixed）
+
+    返回结构：
+    { success: bool, formatted: str, original: str, error?: str, version?: str }
+
+    版本信息：确保前端可以验证使用的格式化器版本
+    """
+    try:
+        import re
+        import sys
+
+        # 强制重新加载模块
+        for mod in list(sys.modules.keys()):
+            if 'formatter' in mod:
+                del sys.modules[mod]
+
+        from core.formatter_v4_fixed import format_sql_v4_fixed
+
+        keyword_case = (
+            request.keyword_case
+            or (request.options.keyword_case if request.options else None)
+            or "upper"
+        )
+
+        # 使用 V4 fixed 版本格式化
+        formatted = format_sql_v4_fixed(request.sql, keyword_case=keyword_case)
+
+        return {
+            "success": True,
+            "formatted": formatted,
+            "original": request.sql,
+            "version": "v4-fixed",
+            "formatter_file": "formatter_v4_fixed.py"
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e), "original": request.sql}
+
+
+@app.post("/api/format-v5")
+async def format_sql_v5_sqlglot_endpoint(request: LegacyFormatRequest):
+    """v5 格式化 API (基于 sqlglot AST 解析 + V4 列对齐)
+
+    V5 架构：
+    1. sqlglot 解析并基础格式化
+    2. 将 /* */ 注释改回 -- 格式
+    3. V4 列对齐后处理
+
+    兼容旧前端返回结构
+    """
+    try:
+        import sys
+        import os
+
+        # 确保 core 目录在路径中
+        core_path = os.path.join(os.path.dirname(__file__), '..', 'core')
+        if core_path not in sys.path:
+            sys.path.insert(0, core_path)
+
+        from core.formatter_v5_sqlglot import format_sql_v5
+
+        # 获取参数
+        keyword_case = (
+            request.keyword_case
+            or (request.options.keyword_case if request.options else None)
+            or "upper"
+        )
+
+        # 使用 V5 sqlglot 版本格式化
         formatted = format_sql_v5(request.sql, indent=request.indent or 4)
 
         return {
             "success": True,
             "formatted": formatted,
-            "version": "v5-sqlglot"
+            "original": request.sql,
+            "version": "v5-sqlglot",
+            "formatter_file": "formatter_v5_sqlglot.py"
         }
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return {"error": str(e), "success": False}
+        return {
+            "success": False,
+            "error": str(e),
+            "original": request.sql
+        }
 
 
 if __name__ == "__main__":

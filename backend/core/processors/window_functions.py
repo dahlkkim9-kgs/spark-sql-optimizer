@@ -13,8 +13,43 @@ Examples:
 """
 
 import re
-from typing import List, Literal, Tuple, Optional
+import sys
+import os
+from typing import List, Literal, Tuple, Optional, Dict
 from .base_processor import BaseProcessor
+
+
+def _get_formatter():
+    """动态导入 formatter_v4_fixed，兼容不同运行环境"""
+    try:
+        # 尝试从 backend.core 导入（API 环境）
+        from backend.core.formatter_v4_fixed import format_sql_v4_fixed
+        return format_sql_v4_fixed
+    except ImportError:
+        # 尝试从 core 导入（测试环境）
+        try:
+            # 确保 core 路径在 sys.path 中
+            core_path = os.path.join(os.path.dirname(__file__), '..')
+            if core_path not in sys.path:
+                sys.path.insert(0, core_path)
+            from core.formatter_v4_fixed import format_sql_v4_fixed
+            return format_sql_v4_fixed
+        except ImportError:
+            # 最后尝试直接导入
+            from formatter_v4_fixed import format_sql_v4_fixed
+            return format_sql_v4_fixed
+
+
+# 缓存导入的函数
+_formatter_func = None
+
+
+def _call_formatter(sql: str, keyword_case: str = 'upper') -> str:
+    """调用 formatter_v4_fixed.format_sql_v4_fixed"""
+    global _formatter_func
+    if _formatter_func is None:
+        _formatter_func = _get_formatter()
+    return _formatter_func(sql, keyword_case=keyword_case)
 
 # Indentation constants
 OVER_INDENT = 4  # OVER clause content indentation
@@ -616,25 +651,125 @@ class WindowFunctionsProcessor(BaseProcessor):
             return sql
 
     def _format_base_preserving_over(self, sql: str, keyword_case: str) -> str:
-        """Format base SQL while preserving OVER clause formatting"""
-        # This is a placeholder - for now, we'll return the SQL as-is
-        # A full implementation would:
-        # 1. Extract OVER clauses
-        # 2. Format base SQL with v4_fixed
-        # 3. Re-insert formatted OVER clauses
+        """Format base SQL while preserving OVER clause formatting
 
-        # For now, just apply keyword case to main keywords
+        Strategy:
+        1. Extract OVER clauses with placeholders
+        2. Format base SQL with v4_fixed
+        3. Re-insert formatted OVER clauses
+        """
+        # 简化策略：直接使用 V4 格式化，然后处理 OVER 子句的缩进
+        try:
+            # 先用 V4 格式化整个 SQL
+            formatted = _call_formatter(sql, keyword_case=keyword_case)
+
+            # 检查是否有 OVER 子句
+            if not self.over_pattern.search(formatted):
+                return formatted
+
+            # 后处理：调整 OVER 子句的格式
+            return self._fix_over_clause_indentation(formatted, keyword_case)
+
+        except Exception:
+            # 如果 V4 格式化失败，回退到简单处理
+            return self._simple_over_format(sql, keyword_case)
+
+    def _fix_over_clause_indentation(self, sql: str, keyword_case: str) -> str:
+        """修复 OVER 子句的缩进，使其符合 V4 风格"""
+        lines = sql.split('\n')
+        result = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+
+            # 检查是否包含 OVER 关键字
+            if self.over_pattern.search(line):
+                # 找到 OVER 在行中的位置
+                over_match = self.over_pattern.search(line)
+
+                # 提取 OVER 前的内容（函数名等）
+                before_over = line[:over_match.start()].rstrip()
+                after_over = line[over_match.end():]
+
+                # 提取完整的 OVER 子句
+                full_over_clause = self._extract_over_clause_from_line(line, over_match.start())
+
+                if full_over_clause:
+                    # 格式化 OVER 子句
+                    formatted_over = self._format_over_clause(full_over_clause, keyword_case)
+
+                    # 分割格式化后的 OVER 子句
+                    over_lines = formatted_over.split('\n')
+
+                    # 添加函数名行
+                    if before_over:
+                        result.append(before_over)
+                    else:
+                        result.append(line[:over_match.start()])
+
+                    # 添加 OVER 子句行（需要调整缩进）
+                    # V4 风格：OVER 子句内容缩进 4 空格
+                    for j, over_line in enumerate(over_lines):
+                        if j == 0:
+                            # OVER ( 行，缩进 3 空格
+                            result.append('   ' + over_line)
+                        else:
+                            # 内容行，缩进 4 空格
+                            result.append('    ' + over_line)
+
+                    # 检查下一行是否有 AS 别名
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        if next_line.upper().startswith('AS '):
+                            # 添加到 OVER 子句的最后一行
+                            result[-1] += ' ' + next_line
+                            i += 1  # 跳过已处理的 AS 行
+                else:
+                    # 无法提取完整 OVER 子句，保持原样
+                    result.append(line)
+            else:
+                result.append(line)
+
+            i += 1
+
+        return '\n'.join(result)
+
+    def _extract_over_clause_from_line(self, line: str, start_pos: int) -> Optional[str]:
+        """从行中提取完整的 OVER 子句"""
+        # 简化版本：假设 OVER 子句在同一行或跨越多行
+        # 这里我们只处理当前行，复杂情况需要更多上下文
+        over_match = self.over_pattern.search(line[start_pos:])
+        if not over_match:
+            return None
+
+        # 尝试找到匹配的右括号
+        paren_start = start_pos + over_match.end()
+        if paren_start >= len(line):
+            return None
+
+        if line[paren_start] != '(':
+            return None
+
+        # 简化处理：假设 OVER 子句在同一行
+        closing_paren = line.rfind(')', paren_start)
+        if closing_paren > paren_start:
+            return line[start_pos:closing_paren + 1]
+
+        return None
+
+    def _simple_over_format(self, sql: str, keyword_case: str) -> str:
+        """简单的 OVER 格式化（后备方案）"""
+        # 应用关键字大小写
         result = sql
-
-        # Apply case to main SQL keywords (but not inside OVER clauses)
         keywords = [
             'SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING',
             'ORDER BY', 'LIMIT', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN',
-            'INNER JOIN', 'OUTER JOIN', 'ON', 'AND', 'OR'
+            'INNER JOIN', 'OUTER JOIN', 'ON', 'AND', 'OR', 'OVER',
+            'PARTITION BY'
         ]
 
         for keyword in keywords:
-            # Only replace if not already in OVER clause (simplified check)
             result = re.sub(
                 r'\b' + keyword + r'\b',
                 lambda m: self._apply_case(m.group(0), keyword_case),

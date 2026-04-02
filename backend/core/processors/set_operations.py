@@ -83,7 +83,10 @@ class SetOperationsProcessor(BaseProcessor):
                 formatted_segments.append(segment.upper())
 
         # 用换行连接
-        return '\n'.join(formatted_segments)
+        result = '\n'.join(formatted_segments)
+
+        # 添加结尾分号以保持与 V4 一致
+        return result + '\n;'
 
     def _format_segment(self, segment: str, keyword_case: str) -> str:
         """格式化单个段落（可能是 SELECT 语句或括号包裹的子查询）"""
