@@ -18,6 +18,73 @@ class SQLFormatterV5:
     def __init__(self, indent_spaces: int = 4):
         self.indent_spaces = indent_spaces
 
+    # ============================================================
+    # Shared utilities: string-aware scanning & keyword boundary
+    # ============================================================
+
+    @staticmethod
+    def _is_keyword_boundary(text, pos, kw_len):
+        """Check if text[pos:pos+kw_len] is a whole-word keyword match.
+
+        Returns True only if the character before is not alphanumeric/underscore
+        and the character after is not alphanumeric/underscore.
+        """
+        before_ok = (pos == 0 or not text[pos - 1].isalnum() and text[pos - 1] != '_')
+        after_pos = pos + kw_len
+        after_ok = (after_pos >= len(text) or not text[after_pos].isalnum() and text[after_pos] != '_')
+        return before_ok and after_ok
+
+    @staticmethod
+    def _count_parens(text):
+        """Count open/close parentheses in text, skipping string literals.
+
+        Returns (open_count, close_count).
+        """
+        open_c = close_c = 0
+        in_str = False
+        qc = None
+        for ch in text:
+            if in_str:
+                if ch == qc:
+                    in_str = False
+            elif ch in ("'", '"'):
+                in_str = True
+                qc = ch
+            elif ch == '(':
+                open_c += 1
+            elif ch == ')':
+                close_c += 1
+        return open_c, close_c
+
+    @staticmethod
+    def _find_matching_paren_str(text, start):
+        """From start position (must be '('), find matching ')', skipping strings.
+
+        Returns the index of the matching ')', or -1.
+        """
+        if start >= len(text) or text[start] != '(':
+            return -1
+        depth = 0
+        in_str = False
+        qc = None
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if c == qc:
+                    in_str = False
+                continue
+            if c in ("'", '"'):
+                in_str = True
+                qc = c
+                continue
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
     def _log(self, step: str, details: str = "") -> None:
         """统一的日志输出方法"""
         msg = f"[V5格式化器] {step}"
@@ -263,28 +330,7 @@ class SQLFormatterV5:
                 skip_keywords = {'PARTITION', 'PARTITIONED', 'TBLPROPERTIES', 'BY'}
 
                 if last_word not in skip_keywords:
-                    # 查找匹配的 )
-                    depth = 0
-                    in_str = False
-                    qc = None
-                    paren_end = -1
-                    for ci in range(paren_start, len(stripped)):
-                        ch = stripped[ci]
-                        if in_str:
-                            if ch == qc:
-                                in_str = False
-                            continue
-                        if ch in ("'", '"'):
-                            in_str = True
-                            qc = ch
-                            continue
-                        if ch == '(':
-                            depth += 1
-                        elif ch == ')':
-                            depth -= 1
-                            if depth == 0:
-                                paren_end = ci
-                                break
+                    paren_end = self._find_matching_paren_str(stripped, paren_start)
 
                     if paren_end > paren_start:
                         table_prefix = stripped[:paren_start]
@@ -424,52 +470,9 @@ class SQLFormatterV5:
                         break
                 continue
 
-            # === WHERE (standalone) ===
-            if upper == 'WHERE':
-                first_cond, i = self._merge_standalone_keyword(lines, i + 1, indent)
-                if first_cond:
-                    segments = self._split_and_or_in_line(first_cond)
-                    result.append(f"{' ' * indent}WHERE {segments[0]}")
-                    for seg in segments[1:]:
-                        result.append(f"{' ' * (indent + 2)}{seg}")
-                else:
-                    result.append(f"{' ' * indent}WHERE")
-                while i < len(lines):
-                    s = lines[i].strip()
-                    si = len(lines[i]) - len(lines[i].lstrip())
-                    if not s or s == ')' or s.startswith(')'):
-                        break
-                    if si <= indent and (self._is_clause_line(s) or s.upper().startswith('SELECT')):
-                        break
-                    if self._is_and_or(s):
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
-                    else:
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
-                continue
-
-            # === WHERE with condition ===
-            if upper.startswith('WHERE '):
-                where_cond = stripped[6:]  # Remove "WHERE "
-                segments = self._split_and_or_in_line(where_cond)
-                result.append(f"{' ' * indent}WHERE {segments[0]}")
-                for seg in segments[1:]:
-                    result.append(f"{' ' * (indent + 2)}{seg}")
-                i += 1
-                while i < len(lines):
-                    s = lines[i].strip()
-                    si = len(lines[i]) - len(lines[i].lstrip())
-                    if not s or s == ')' or s.startswith(')'):
-                        break
-                    if si <= indent and (self._is_clause_line(s) or s.upper().startswith('SELECT')):
-                        break
-                    if self._is_and_or(s):
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
-                    else:
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
+            # === WHERE (standalone or with condition) ===
+            if upper == 'WHERE' or upper.startswith('WHERE '):
+                i = self._handle_condition_clause(lines, i, indent, 'WHERE', 6, result)
                 continue
 
             # === GROUP BY ===
@@ -477,52 +480,9 @@ class SQLFormatterV5:
                 result, i = self._format_group_order(lines, i, indent, 'GROUP BY', result)
                 continue
 
-            # === HAVING (standalone) ===
-            if upper == 'HAVING':
-                first_cond, i = self._merge_standalone_keyword(lines, i + 1, indent)
-                if first_cond:
-                    segments = self._split_and_or_in_line(first_cond)
-                    result.append(f"{' ' * indent}HAVING {segments[0]}")
-                    for seg in segments[1:]:
-                        result.append(f"{' ' * (indent + 2)}{seg}")
-                else:
-                    result.append(f"{' ' * indent}HAVING")
-                while i < len(lines):
-                    s = lines[i].strip()
-                    si = len(lines[i]) - len(lines[i].lstrip())
-                    if not s or s == ')' or s.startswith(')'):
-                        break
-                    if si <= indent and (self._is_clause_line(s) or s.upper().startswith('SELECT')):
-                        break
-                    if self._is_and_or(s):
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
-                    else:
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
-                continue
-
-            # === HAVING with condition ===
-            if upper.startswith('HAVING '):
-                having_cond = stripped[7:]  # Remove "HAVING "
-                segments = self._split_and_or_in_line(having_cond)
-                result.append(f"{' ' * indent}HAVING {segments[0]}")
-                for seg in segments[1:]:
-                    result.append(f"{' ' * (indent + 2)}{seg}")
-                i += 1
-                while i < len(lines):
-                    s = lines[i].strip()
-                    si = len(lines[i]) - len(lines[i].lstrip())
-                    if not s or s == ')' or s.startswith(')'):
-                        break
-                    if si <= indent and (self._is_clause_line(s) or s.upper().startswith('SELECT')):
-                        break
-                    if self._is_and_or(s):
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
-                    else:
-                        result.append(f"{' ' * (indent + 2)}{s}")
-                        i += 1
+            # === HAVING (standalone or with condition) ===
+            if upper == 'HAVING' or upper.startswith('HAVING '):
+                i = self._handle_condition_clause(lines, i, indent, 'HAVING', 7, result)
                 continue
 
             # === ORDER BY ===
@@ -614,21 +574,7 @@ class SQLFormatterV5:
                 break
 
             # 统计本行的括号（排除字符串内的括号）
-            open_count = 0
-            close_count = 0
-            in_str = False
-            str_char = None
-            for ch in s:
-                if in_str:
-                    if ch == str_char:
-                        in_str = False
-                elif ch in ("'", '"'):
-                    in_str = True
-                    str_char = ch
-                elif ch == '(':
-                    open_count += 1
-                elif ch == ')':
-                    close_count += 1
+            open_count, close_count = self._count_parens(s)
 
             # 在闭括号处停止（顶层闭括号）
             if not in_subquery and not in_func_parens and paren_depth == 0 and (s == ')' or s.startswith(')')):
@@ -756,6 +702,54 @@ class SQLFormatterV5:
             # 癩以CTE name AS (独立关键字（如 "), high_paid_depts") - 不不会被误合并
             return s, start_i + 1
         return '', start_i
+
+    def _handle_condition_clause(self, lines, start_i, indent, keyword, kw_len, result):
+        """Handle WHERE/HAVING condition clauses (standalone and with condition).
+
+        Processes both standalone keyword (WHERE / HAVING) and keyword-with-condition
+        (WHERE x=1 / HAVING x=1) patterns, then collects continuation lines.
+
+        Args:
+            lines: all lines
+            start_i: index of the keyword line
+            indent: base indent level
+            keyword: 'WHERE' or 'HAVING'
+            kw_len: length of keyword + space (6 for WHERE, 7 for HAVING)
+            result: output list to append to
+
+        Returns:
+            next line index after processing
+        """
+        stripped = lines[start_i].strip()
+        upper = stripped.upper()
+
+        if upper == keyword:
+            first_cond, i = self._merge_standalone_keyword(lines, start_i + 1, indent)
+            if first_cond:
+                segments = self._split_and_or_in_line(first_cond)
+                result.append(f"{' ' * indent}{keyword} {segments[0]}")
+                for seg in segments[1:]:
+                    result.append(f"{' ' * (indent + 2)}{seg}")
+            else:
+                result.append(f"{' ' * indent}{keyword}")
+        else:
+            cond = stripped[kw_len:]
+            segments = self._split_and_or_in_line(cond)
+            result.append(f"{' ' * indent}{keyword} {segments[0]}")
+            for seg in segments[1:]:
+                result.append(f"{' ' * (indent + 2)}{seg}")
+            i = start_i + 1
+
+        while i < len(lines):
+            s = lines[i].strip()
+            si = len(lines[i]) - len(lines[i].lstrip())
+            if not s or s == ')' or s.startswith(')'):
+                break
+            if si <= indent and (self._is_clause_line(s) or s.upper().startswith('SELECT')):
+                break
+            result.append(f"{' ' * (indent + 2)}{s}")
+            i += 1
+        return i
 
     def _format_group_order(self, lines, start_i, indent, keyword, result):
         """格式化 GROUP BY / ORDER BY 子句（leading comma）"""
@@ -890,20 +884,14 @@ class SQLFormatterV5:
                 i += 1
                 continue
 
-            # 检查 CASE 关键字
             if i + 4 <= len(text) and text[i:i + 4].upper() == 'CASE':
-                before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                after_ok = (i + 4 >= len(text) or not text[i + 4].isalnum() and text[i + 4] != '_')
-                if before_ok and after_ok:
+                if SQLFormatterV5._is_keyword_boundary(text, i, 4):
                     case_depth += 1
                     i += 4
                     continue
 
-            # 检查 END 关键字
             if i + 3 <= len(text) and text[i:i + 3].upper() == 'END':
-                before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                after_ok = (i + 3 >= len(text) or not text[i + 3].isalnum() and text[i + 3] != '_')
-                if before_ok and after_ok:
+                if SQLFormatterV5._is_keyword_boundary(text, i, 3):
                     case_depth -= 1
                     if case_depth == 0:
                         return i + 3
@@ -929,6 +917,7 @@ class SQLFormatterV5:
         in_string = False
         quote_char = None
         i = 0
+        _ikb = SQLFormatterV5._is_keyword_boundary
 
         while i < len(text):
             c = text[i]
@@ -956,30 +945,18 @@ class SQLFormatterV5:
                 continue
 
             if paren_depth == 0:
-                # 检查 CASE
-                if i + 4 <= len(text) and text[i:i + 4].upper() == 'CASE':
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_ok = (i + 4 >= len(text) or not text[i + 4].isalnum() and text[i + 4] != '_')
-                    if before_ok and after_ok:
-                        case_depth += 1
-                        i += 4
-                        continue
+                if i + 4 <= len(text) and text[i:i + 4].upper() == 'CASE' and _ikb(text, i, 4):
+                    case_depth += 1
+                    i += 4
+                    continue
 
-                # 检查 END
-                if i + 3 <= len(text) and text[i:i + 3].upper() == 'END':
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_ok = (i + 3 >= len(text) or not text[i + 3].isalnum() and text[i + 3] != '_')
-                    if before_ok and after_ok:
-                        case_depth -= 1
-                        i += 3
-                        continue
+                if i + 3 <= len(text) and text[i:i + 3].upper() == 'END' and _ikb(text, i, 3):
+                    case_depth -= 1
+                    i += 3
+                    continue
 
-                # 只在 case_depth == 0 时匹配 ELSE
-                if case_depth == 0 and i + 4 <= len(text) and text[i:i + 4].upper() == 'ELSE':
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_ok = (i + 4 >= len(text) or not text[i + 4].isalnum() and text[i + 4] != '_')
-                    if before_ok and after_ok:
-                        return i
+                if case_depth == 0 and i + 4 <= len(text) and text[i:i + 4].upper() == 'ELSE' and _ikb(text, i, 4):
+                    return i
 
             i += 1
 
@@ -999,6 +976,7 @@ class SQLFormatterV5:
         quote_char = None
         current_start = 0
         i = 0
+        _ikb = SQLFormatterV5._is_keyword_boundary
 
         while i < len(text):
             c = text[i]
@@ -1026,33 +1004,21 @@ class SQLFormatterV5:
                 continue
 
             if paren_depth == 0:
-                # 检查 CASE
-                if i + 4 <= len(text) and text[i:i + 4].upper() == 'CASE':
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_ok = (i + 4 >= len(text) or not text[i + 4].isalnum() and text[i + 4] != '_')
-                    if before_ok and after_ok:
-                        case_depth += 1
-                        i += 4
-                        continue
+                if i + 4 <= len(text) and text[i:i + 4].upper() == 'CASE' and _ikb(text, i, 4):
+                    case_depth += 1
+                    i += 4
+                    continue
 
-                # 检查 END
-                if i + 3 <= len(text) and text[i:i + 3].upper() == 'END':
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_ok = (i + 3 >= len(text) or not text[i + 3].isalnum() and text[i + 3] != '_')
-                    if before_ok and after_ok:
-                        case_depth -= 1
-                        i += 3
-                        continue
+                if i + 3 <= len(text) and text[i:i + 3].upper() == 'END' and _ikb(text, i, 3):
+                    case_depth -= 1
+                    i += 3
+                    continue
 
-                # 只在顶层 CASE 中拆分 WHEN（case_depth == 0 表示外层 CASE 已剥离）
-                if case_depth == 0 and i + 4 <= len(text) and text[i:i + 4].upper() == 'WHEN':
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_ok = (i + 4 >= len(text) or not text[i + 4].isalnum() and text[i + 4] != '_')
-                    if before_ok and after_ok:
-                        parts.append(text[current_start:i])
-                        current_start = i
-                        i += 4
-                        continue
+                if case_depth == 0 and i + 4 <= len(text) and text[i:i + 4].upper() == 'WHEN' and _ikb(text, i, 4):
+                    parts.append(text[current_start:i])
+                    current_start = i
+                    i += 4
+                    continue
 
             i += 1
 
@@ -1175,18 +1141,7 @@ class SQLFormatterV5:
         qc = None
         i = 0
         seg_start = 0
-
-        def _kw(pos, kw):
-            e = pos + len(kw)
-            if e > len(content):
-                return False
-            if content[pos:e].upper() != kw:
-                return False
-            if pos > 0 and (content[pos - 1].isalnum() or content[pos - 1] == '_'):
-                return False
-            if e < len(content) and (content[e].isalnum() or content[e] == '_'):
-                return False
-            return True
+        _ikb = SQLFormatterV5._is_keyword_boundary
 
         while i < len(content):
             c = content[i]
@@ -1209,24 +1164,24 @@ class SQLFormatterV5:
                 i += 1
                 continue
 
-            if depth == 0 and _kw(i, 'CASE'):
+            if depth == 0 and content[i:i + 4].upper() == 'CASE' and _ikb(content, i, 4):
                 case_depth += 1
                 i += 4
                 continue
-            if depth == 0 and case_depth > 0 and _kw(i, 'END'):
+            if depth == 0 and case_depth > 0 and content[i:i + 3].upper() == 'END' and _ikb(content, i, 3):
                 case_depth -= 1
                 i += 3
                 continue
 
             if depth == 0 and case_depth == 0:
-                if _kw(i, 'THEN'):
+                if content[i:i + 4].upper() == 'THEN' and _ikb(content, i, 4):
                     seg = content[seg_start:i].strip()
                     if seg:
                         result.append(seg)
-                    seg_start = i  # THEN 作为下一段的开头
+                    seg_start = i
                     i += 4
                     continue
-                if i > seg_start and _kw(i, 'WHEN'):
+                if i > seg_start and content[i:i + 4].upper() == 'WHEN' and _ikb(content, i, 4):
                     seg = content[seg_start:i].strip()
                     if seg:
                         result.append(seg)
@@ -1517,6 +1472,25 @@ class SQLFormatterV5:
             return base_indent + 2
         return base_indent + 1  # AND
 
+    def _append_w_line(self, result, content, when_indent):
+        """Append a W-type line (WHEN/THEN/ELSE/AND/OR) with AND/OR splitting.
+
+        Handles AND/OR right-alignment and long-line splitting.
+        """
+        content_upper = content.upper().lstrip()
+        if re.match(r'\b(AND|OR)\b', content_upper):
+            result.append(f"{' ' * self._and_or_indent(when_indent, content)}{content}")
+        else:
+            output_line = f"{' ' * when_indent}{content}"
+            if len(output_line) > 250:
+                segments = self._split_and_or_in_line(content)
+                if len(segments) > 1:
+                    result.append(f"{' ' * when_indent}{segments[0]}")
+                    for seg in segments[1:]:
+                        result.append(f"{' ' * self._and_or_indent(when_indent, seg)}{seg}")
+                    return
+            result.append(output_line)
+
     def _append_case_inner_lines(self, result, inner_lines, indent):
         """将 CASE WHEN 内部行（WHEN/ELSE/END）添加到结果中，正确处理缩进。
 
@@ -1547,77 +1521,32 @@ class SQLFormatterV5:
                 depth = int(marker_match.group(2))
                 content = marker_match.group(3)
 
+                # Compute indents based on depth
                 if depth == 1:
-                    # 外层 CASE 块
-                    if marker_type == 'C' or marker_type == 'E':
-                        result.append(f"{' ' * base_case}{content}")
-                    else:
-                        # W (WHEN/THEN/ELSE/AND/OR)
-                        # AND/OR 续行右对齐关键字
-                        content_upper = content.upper().lstrip()
-                        if re.match(r'\b(AND|OR)\b', content_upper):
-                            result.append(f"{' ' * self._and_or_indent(base_inner, content)}{content}")
-                        else:
-                            output_line = f"{' ' * base_inner}{content}"
-                            if len(output_line) > 250:
-                                segments = self._split_and_or_in_line(content)
-                                if len(segments) > 1:
-                                    result.append(f"{' ' * base_inner}{segments[0]}")
-                                    for seg in segments[1:]:
-                                        result.append(f"{' ' * self._and_or_indent(base_inner, seg)}{seg}")
-                                    continue
-                            result.append(output_line)
+                    case_indent = base_case
+                    when_indent = base_inner
                 else:
-                    # 嵌套 CASE 块（depth > 1）
-                    nested_case = base_inner + (depth - 1) * 6   # CASE/END 缩进
-                    nested_when = base_inner + (depth - 1) * 6 + 4  # WHEN/THEN 缩进
+                    case_indent = base_inner + (depth - 1) * 6
+                    when_indent = base_inner + (depth - 1) * 6 + 4
 
-                    if marker_type == 'C' or marker_type == 'E':
-                        result.append(f"{' ' * nested_case}{content}")
-                    elif marker_type == 'P':
-                        # 闭括号：与同深度 CASE/END 对齐减1格
-                        result.append(f"{' ' * (nested_case - 1)}{content}")
-                    else:
-                        # W (WHEN/THEN/ELSE/AND/OR)
-                        content_upper = content.upper().lstrip()
-                        if re.match(r'\b(AND|OR)\b', content_upper):
-                            result.append(f"{' ' * self._and_or_indent(nested_when, content)}{content}")
-                        else:
-                            output_line = f"{' ' * nested_when}{content}"
-                            if len(output_line) > 250:
-                                segments = self._split_and_or_in_line(content)
-                                if len(segments) > 1:
-                                    result.append(f"{' ' * nested_when}{segments[0]}")
-                                    for seg in segments[1:]:
-                                        result.append(f"{' ' * self._and_or_indent(nested_when, seg)}{seg}")
-                                    continue
-                            result.append(output_line)
+                if marker_type == 'C' or marker_type == 'E':
+                    result.append(f"{' ' * case_indent}{content}")
+                elif marker_type == 'P':
+                    result.append(f"{' ' * (case_indent - 1)}{content}")
+                else:
+                    self._append_w_line(result, content, when_indent)
             else:
                 # 纯文本行（单行 CASE 拆分结果）
                 if stripped.startswith('END'):
                     result.append(f"{' ' * base_case}{stripped}")
                 else:
-                    stripped_upper = stripped.upper().lstrip()
-                    if re.match(r'\b(AND|OR)\b', stripped_upper):
-                        result.append(f"{' ' * self._and_or_indent(base_inner, stripped)}{stripped}")
-                    else:
-                        output_line = f"{' ' * base_inner}{stripped}"
-                        if len(output_line) > 250:
-                            segments = self._split_and_or_in_line(stripped)
-                            if len(segments) > 1:
-                                result.append(f"{' ' * base_inner}{segments[0]}")
-                                for seg in segments[1:]:
-                                    result.append(f"{' ' * self._and_or_indent(base_inner, seg)}{seg}")
-                                continue
-                        result.append(output_line)
+                    self._append_w_line(result, stripped, base_inner)
 
     def _escape_dollar_signs(self, sql: str) -> tuple:
         """转义特殊符号（sqlglot 可能误解析）
 
         转义 $ 符号和 {} 变量语法
         """
-        import re
-        # 转义 $ 符号
         escaped = re.sub(r'\$', '___DOLLAR___', sql)
         # 转义 {} 变量语法，如 {DATA_DT}
         escaped = re.sub(r'\{([^}]*)\}', r'___BRACE_OPEN___\1___BRACE_CLOSE___', escaped)
@@ -1706,37 +1635,14 @@ class SQLFormatterV5:
 
             # 收集子查询全部内容（含开闭括号）
             sub_lines = [line]
-            paren_depth = 0
-            in_str = False
-            qc = None
-            for ch in stripped:
-                if in_str:
-                    if ch == qc:
-                        in_str = False
-                elif ch in ("'", '"'):
-                    in_str = True
-                    qc = ch
-                elif ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
+            o, c = self._count_parens(stripped)
+            paren_depth = o - c
 
             j = i + 1
             while j < len(lines) and paren_depth > 0:
                 s = lines[j].strip()
-                in_str = False
-                qc = None
-                for ch in s:
-                    if in_str:
-                        if ch == qc:
-                            in_str = False
-                    elif ch in ("'", '"'):
-                        in_str = True
-                        qc = ch
-                    elif ch == '(':
-                        paren_depth += 1
-                    elif ch == ')':
-                        paren_depth -= 1
+                o, c = self._count_parens(s)
+                paren_depth += o - c
                 sub_lines.append(lines[j])
                 j += 1
 
@@ -1816,32 +1722,6 @@ class SQLFormatterV5:
         if re.search(r'\bIN\s*\(\s*SELECT\b', text, re.IGNORECASE):
             return True
         return False
-
-    @staticmethod
-    def _find_matching_paren_safe(text: str, start: int) -> int:
-        """从 start 位置（必须是 '('）找到匹配的 ')'，跳过字符串字面量。"""
-        if start >= len(text) or text[start] != '(':
-            return -1
-        depth = 0
-        in_str = False
-        qc = None
-        for i in range(start, len(text)):
-            c = text[i]
-            if in_str:
-                if c == qc:
-                    in_str = False
-                continue
-            if c in ("'", '"'):
-                in_str = True
-                qc = c
-                continue
-            if c == '(':
-                depth += 1
-            elif c == ')':
-                depth -= 1
-                if depth == 0:
-                    return i
-        return -1
 
     def _find_scalar_subquery_start(self, text: str) -> int:
         """找到标量子查询起始 '(' 的位置。
@@ -1924,11 +1804,7 @@ class SQLFormatterV5:
                     upper_ahead = text[i:i + kw_len].upper()
                     if upper_ahead != kw:
                         continue
-                    # 检查边界：关键字前后不能是字母数字或下划线
-                    before_ok = (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_')
-                    after_pos = i + kw_len
-                    after_ok = (after_pos >= len(text) or not text[after_pos].isalnum() and text[after_pos] != '_')
-                    if not (before_ok and after_ok):
+                    if not self._is_keyword_boundary(text, i, kw_len):
                         continue
 
                     # 对于 AND/OR，需要特殊处理 BETWEEN...AND
@@ -2003,7 +1879,7 @@ class SQLFormatterV5:
 
         # 前缀：子查询 ( 之前的内容
         before = stripped[:paren_pos]
-        close_pos = self._find_matching_paren_safe(stripped, paren_pos)
+        close_pos = self._find_matching_paren_str(stripped, paren_pos)
         if close_pos == -1:
             return [line]
 
@@ -2128,7 +2004,6 @@ class SQLFormatterV5:
 
     def _unescape_dollar_signs(self, sql: str) -> str:
         """恢复转义的符号"""
-        import re
         # 恢复 {} 变量语法 - 非贪婪匹配任意字符
         sql = re.sub(r'___BRACE_OPEN___(.*?)___BRACE_CLOSE___', r'{\1}', sql)
         # 恢复 $ 符号
