@@ -114,6 +114,11 @@ class SQLFormatterV5:
             new_line = line
             for match in reversed(matches):
                 comment_content = match.group(1).strip()
+
+                # 跳过 IN 子句预处理占位符（__INLINE_N__）
+                if comment_content.startswith('__INLINE_') and comment_content.endswith('__'):
+                    continue
+
                 start = match.start()
                 end = match.end()
 
@@ -649,8 +654,47 @@ class SQLFormatterV5:
             i += 1
         return cols, i
 
+    @staticmethod
+    def _count_case_end(text):
+        """统计文本中 CASE 和 END 关键字的出现次数（跳过字符串内的）。
+
+        Returns:
+            (case_count, end_count)
+        """
+        case_count = 0
+        end_count = 0
+        in_str = False
+        qc = None
+        i = 0
+        _ikb = SQLFormatterV5._is_keyword_boundary
+        while i < len(text):
+            c = text[i]
+            if in_str:
+                if c == qc:
+                    in_str = False
+                i += 1
+                continue
+            if c in ("'", '"'):
+                in_str = True
+                qc = c
+                i += 1
+                continue
+            if i + 4 <= len(text) and text[i:i + 4].upper() == 'CASE' and _ikb(text, i, 4):
+                case_count += 1
+                i += 4
+                continue
+            if i + 3 <= len(text) and text[i:i + 3].upper() == 'END' and _ikb(text, i, 3):
+                end_count += 1
+                i += 3
+                continue
+            i += 1
+        return case_count, end_count
+
     def _collect_case_block(self, lines, start_i, case_indent):
         """收集完整的 CASE 块作为一个字符串，处理嵌套 CASE。
+
+        正确追踪行中出现的 CASE/END（如 THEN CASE、ELSE CASE、
+        ELSE CASE WHEN ... END），确保深度不会提前归零。
 
         Returns:
             (joined_string, next_line_index)
@@ -662,7 +706,6 @@ class SQLFormatterV5:
         while i < len(lines):
             s = lines[i].strip()
             si = len(lines[i]) - len(lines[i].lstrip())
-
             upper_s = s.upper()
 
             # CASE 内部关键字（WHEN/THEN/ELSE/END）始终属于 CASE 块，不受缩进限制
@@ -673,20 +716,17 @@ class SQLFormatterV5:
                 if si <= case_indent or si < case_indent:
                     break
 
-            # 跟踪 CASE/END 深度
-            if re.match(r'\bCASE\b', upper_s):
-                case_depth += 1
-                # 同一行有 END（单行 CASE），深度不增加
-                if re.search(r'\bEND\b', upper_s):
-                    case_depth -= 1
+            # 跟踪 CASE/END 深度 — 使用全文搜索而非只匹配行首
+            # 这样可以正确追踪 "THEN CASE"、"ELSE CASE" 等行中嵌套的 CASE
+            cases, ends = self._count_case_end(s)
+            case_depth += cases - ends
 
             collected.append(s.rstrip(','))
 
-            if re.match(r'\bEND\b', upper_s) and not re.match(r'\bCASE\b.*\bEND\b', upper_s, re.IGNORECASE):
-                case_depth -= 1
-                if case_depth == 0:
-                    i += 1
-                    break
+            if case_depth <= 0:
+                case_depth = 0
+                i += 1
+                break
 
             i += 1
 
@@ -1125,6 +1165,127 @@ class SQLFormatterV5:
         return '\n'.join(cleaned)
 
     @staticmethod
+    def _split_merged_comment_lines(text):
+        """拆分被sqlglot合并的注释行。
+
+        sqlglot会将多条独立注释合并到同一行，例如：
+            --全部放到一张表里面  -----信贷客户插入目标表
+        应拆分为：
+            --全部放到一张表里面
+            -----信贷客户插入目标表
+
+        检测模式：行以 -- 开头（可选前导空格），中间出现 3个以上连续短横线
+        的注释头（如 -----、-------）。
+        """
+        lines = text.split('\n')
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            # 只处理纯注释行（以 -- 开头）
+            if not stripped.startswith('--'):
+                result.append(line)
+                continue
+            indent = line[:len(line) - len(line.lstrip())]
+            # 检测行内是否包含第二个注释标记（3+短横线，前面有2+空格）
+            # 模式: --comment1  ---comment2  (至少2个空格 + 3+短横线)
+            parts = re.split(r'\s{2,}(-{3,}.*)$', stripped, maxsplit=1)
+            if len(parts) == 3:
+                result.append(f'{indent}{parts[0]}')
+                result.append(f'{indent}{parts[1]}')
+            else:
+                result.append(line)
+        return '\n'.join(result)
+
+    def _split_in_clause_comments(self, text):
+        """拆分 IN 子句中被sqlglot合并的注释值。
+
+        sqlglot会将多行的 IN ('val1' --注释1, 'val2' --注释2) 合并到一行，
+        或者去掉逗号变成 IN ('val1' --注释1 'val2' --注释2)。
+        本方法将其拆分为每个值+注释独立一行，使用 leading comma 风格。
+
+        例：
+            AND col IN ('1070' --港澳 '1080' --台湾)
+        →
+            AND col IN ('1070' --港澳
+                       ,'1080' --台湾)
+        """
+        lines = text.split('\n')
+        result = []
+        for line in lines:
+            stripped = line.strip()
+
+            # 查找 IN ( 的位置（大小写不敏感）
+            in_match = re.search(r'\bIN\s*\(', stripped, re.IGNORECASE)
+            if not in_match:
+                result.append(line)
+                continue
+
+            # 找到 IN( 内部匹配的 )
+            paren_start = in_match.end() - 1  # ( 的位置
+            paren_end = self._find_matching_paren_str(stripped, paren_start)
+            if paren_end == -1:
+                result.append(line)
+                continue
+
+            # 提取 IN 子句内容
+            in_content = stripped[paren_start + 1:paren_end].strip()
+            after_paren = stripped[paren_end + 1:].strip()
+
+            # 检查 IN 内容中是否有多处注释
+            in_comments = [m.start() for m in re.finditer(r'--', in_content)]
+            if len(in_comments) < 2:
+                result.append(line)
+                continue
+
+            # 拆分策略1：按逗号拆分（如果逗号存在）
+            parts = self._split_set_columns(in_content)
+            if len(parts) > 1 and all('--' in p for p in parts):
+                # 逗号拆分成功
+                pass
+            else:
+                # 拆分策略2：按 'value' --comment 模式拆分
+                # 匹配 'xxx' --yyy 模式
+                parts = re.findall(r"('[^']*'(?:\s*,?\s*)?)\s*(--.*?)\s*(?='|$)", in_content)
+                if not parts or len(parts) < 2:
+                    result.append(line)
+                    continue
+                # 重新组合为完整的 parts（value + comment）
+                parts = [f"{val.rstrip(', ')} {comment}" for val, comment in parts]
+
+            if len(parts) < 2:
+                result.append(line)
+                continue
+
+            # 构建拆分后的输出
+            indent = line[:len(line) - len(line.lstrip())]
+            prefix = stripped[:paren_start + 1]  # 包括 (
+            value_indent = ' ' * len(prefix)
+
+            output_parts = []
+            for pi, part in enumerate(parts):
+                part = part.strip()
+                if not part:
+                    continue
+                if pi == 0:
+                    output_parts.append(part)
+                else:
+                    output_parts.append(',' + part)
+
+            if output_parts:
+                result.append(f'{indent}{prefix}{output_parts[0]}')
+                for op in output_parts[1:]:
+                    result.append(f'{indent}{value_indent}{op}')
+                paren_align = ' ' * (len(indent) + paren_start)
+                if after_paren:
+                    result.append(f'{indent}{paren_align}){after_paren}')
+                else:
+                    result.append(f'{indent}{paren_align})')
+            else:
+                result.append(line)
+
+        return '\n'.join(result)
+
+    @staticmethod
     def _split_when_then(content):
         """将同一行的 WHEN...THEN...WHEN...THEN 拆分为独立段。
 
@@ -1303,15 +1464,33 @@ class SQLFormatterV5:
                 continue
             upper = stripped.upper()
 
-            # 跟踪嵌套 CASE 深度
-            if re.match(r'\bCASE\b', upper) and not re.match(r'\bCASE\b.*\bEND\b', upper):
+            # 跟踪嵌套 CASE 深度 — 使用全文搜索追踪 CASE/END
+            cases_here, ends_here = self._count_case_end(stripped)
+
+            # 纯 CASE 行（行首 CASE，无 END）
+            if re.match(r'\bCASE\b', upper) and cases_here > 0 and ends_here == 0:
                 case_depth += 1
                 result.append(f"C{case_depth} {stripped}")
                 continue
 
+            # 纯 END 行（行首 END）
             if re.match(r'\bEND\b', upper):
                 result.append(f"E{case_depth} {stripped}")
                 case_depth = max(0, case_depth - 1)
+                continue
+
+            # 行内包含 CASE...END（如 ELSE CASE WHEN ... END、THEN CASE WHEN ... END）
+            if cases_here > 0 and ends_here > 0:
+                self._expand_embedded_case(result, stripped, case_depth)
+                # 更新深度：行内净CASE数量
+                case_depth += cases_here - ends_here
+                continue
+
+            # 行内有 CASE 但无 END（如 THEN CASE、ELSE CASE）
+            # 这是嵌套 CASE 的开始，但不是行首
+            if cases_here > 0 and ends_here == 0:
+                case_depth += 1
+                result.append(f"W{case_depth} {stripped}")
                 continue
 
             # WHEN/THEN/ELSE 等内容行
@@ -1320,9 +1499,6 @@ class SQLFormatterV5:
                 segments = self._split_when_then(stripped)
                 for seg in segments:
                     result.append(f"W{case_depth} {seg}")
-            elif re.search(r'\bCASE\b.*\bEND\b', upper, re.IGNORECASE):
-                # 同一行包含完整嵌套 CASE...END（如 THEN (CASE WHEN ... END)）
-                self._expand_embedded_case(result, stripped, case_depth)
             else:
                 result.append(f"W{case_depth} {stripped}")
 
@@ -1343,7 +1519,8 @@ class SQLFormatterV5:
 
         upper = stripped.upper()
         case_match = re.search(r'\bCASE\b', stripped, re.IGNORECASE)
-        end_match = re.search(r'\bEND\b(?=\)*\s*$)', stripped, re.IGNORECASE)
+        # 允许 END 后面跟 )、注释（--...）和空白
+        end_match = re.search(r'\bEND\b(?=\)*\s*(?:--.*)?$)', stripped, re.IGNORECASE)
 
         if not (case_match and end_match):
             result.append(f"W{depth} {stripped}")
@@ -1541,6 +1718,159 @@ class SQLFormatterV5:
                     result.append(f"{' ' * base_case}{stripped}")
                 else:
                     self._append_w_line(result, stripped, base_inner)
+
+    def _preprocess_in_clause_comments(self, sql: str) -> tuple:
+        """预处理 IN 子句中紧跟在值后面的 -- 注释。
+
+        sqlglot 无法解析 'value'--comment 这种写法（值引号后紧跟行注释）。
+        将其转换为 'value' /*__INLINE_N__*/ 格式，让 sqlglot 可以正确解析。
+
+        同时处理 NOT IN 子句。
+
+        Returns:
+            (processed_sql, comment_map) — comment_map 用于后处理恢复
+        """
+        comment_map = {}
+        counter = 0
+
+        # 使用状态机找到 IN (... 'value'--comment ...) 模式
+        # 策略：找到 IN ( 或 NOT IN ( 位置，然后在括号内
+        # 将 'xxx'--comment 替换为 'xxx' /*__INLINE_N__*/
+        result = list(sql)
+        offset = 0
+
+        i = 0
+        while i < len(sql):
+            # 查找 IN ( 或 NOT IN ( 模式
+            upper_rest = sql[i:].upper()
+            in_match = re.match(r'\b(IN|NOT\s+IN)\s*\(', upper_rest)
+            if not in_match:
+                i += 1
+                continue
+
+            # 找到 ( 的位置
+            paren_pos = i + in_match.end() - 1  # ( 在原始 sql 中的位置
+
+            # 找到匹配的 )
+            paren_end = self._find_matching_paren_str(sql, paren_pos)
+            if paren_end == -1:
+                i += 1
+                continue
+
+            # 在 IN (...) 内部，将 'value'--comment 替换为 'value' /*__INLINE_N__*/
+            in_content = sql[paren_pos + 1:paren_end]
+            new_in_content = self._replace_inline_comments_in_in_clause(in_content, comment_map, counter)
+            if new_in_content != in_content:
+                # 计算新的 counter 值
+                counter = len(comment_map)
+                # 替换
+                result_list = list(sql[:paren_pos + 1]) + list(new_in_content) + list(sql[paren_end:])
+                sql = ''.join(result_list)
+                # 重新计算 paren_end 因为内容变了
+                new_paren_end = paren_pos + 1 + len(new_in_content)
+                i = new_paren_end + 1
+            else:
+                i = paren_end + 1
+
+        return sql, comment_map
+
+    def _replace_inline_comments_in_in_clause(self, content: str, comment_map: dict, start_counter: int) -> str:
+        """替换 IN 子句内容中紧跟在值后面的 -- 注释为 /* */ 格式。
+
+        将 'value'--comment 替换为 'value' /*__INLINE_N__*/
+        """
+        counter = start_counter
+        result = []
+        i = 0
+        in_str = False
+        qc = None
+
+        while i < len(content):
+            ch = content[i]
+
+            # 字符串内
+            if in_str:
+                result.append(ch)
+                if ch == qc:
+                    in_str = False
+                i += 1
+                continue
+
+            # 进入字符串
+            if ch in ("'", '"'):
+                in_str = True
+                qc = ch
+                result.append(ch)
+                i += 1
+                continue
+
+            # 跳过 /* */ 注释
+            if ch == '/' and i + 1 < len(content) and content[i + 1] == '*':
+                end = content.find('*/', i + 2)
+                if end != -1:
+                    result.append(content[i:end + 2])
+                    i = end + 2
+                    continue
+
+            # 检测 -- 注释（紧跟在值后面）
+            if ch == '-' and i + 1 < len(content) and content[i + 1] == '-':
+                # 找到注释的结束（到行尾或到下一个引号值）
+                # 注释持续到行尾或到 , 或到 )
+                comment_start = i
+                j = i + 2
+                while j < len(content):
+                    if content[j] == '\n':
+                        break
+                    # 如果遇到逗号且后面跟着引号值，注释结束
+                    if content[j] == ',':
+                        # 检查逗号后面是否有引号值
+                        rest = content[j + 1:].lstrip()
+                        if rest and rest[0] in ("'", '"'):
+                            break
+                    j += 1
+
+                comment_text = content[comment_start:j].strip()
+                # 如果注释以逗号结尾，去掉逗号（逗号是分隔符不是注释的一部分）
+                trailing_comma = ''
+                if comment_text.endswith(','):
+                    trailing_comma = ','
+                    comment_text = comment_text[:-1].strip()
+
+                placeholder = f'__INLINE_{counter}__'
+                comment_map[placeholder] = comment_text
+                result.append(f' /*{placeholder}*/')
+                if trailing_comma:
+                    result.append(trailing_comma)
+                counter += 1
+                i = j
+                continue
+
+            result.append(ch)
+            i += 1
+
+        return ''.join(result)
+
+    def _restore_in_clause_comments(self, text: str, comment_map: dict) -> str:
+        """恢复 IN 子句中被预处理的注释。
+
+        _convert_block_comments_to_line_comments 会将 /*__INLINE_N__*/ 转为 --__INLINE_N__。
+        本方法将其恢复为原始的 --comment 内容。
+
+        Args:
+            text: 格式化后的 SQL
+            comment_map: 预处理时生成的映射 {placeholder: original_comment}
+        """
+        if not comment_map:
+            return text
+
+        for placeholder, original_comment in comment_map.items():
+            # _convert_block_comments_to_line_comments 会输出 --__INLINE_N__
+            text = text.replace(f'--{placeholder}', original_comment)
+            # 也可能保留为 /* */ 格式（sqlglot 可能加空格：/* __INLINE_N__ */）
+            text = text.replace(f'/* {placeholder} */', original_comment)
+            text = text.replace(f'/*{placeholder}*/', original_comment)
+
+        return text
 
     def _escape_dollar_signs(self, sql: str) -> tuple:
         """转义特殊符号（sqlglot 可能误解析）
@@ -2104,6 +2434,9 @@ class SQLFormatterV5:
 
         for i, stmt in enumerate(statements):
             try:
+                # 预处理：将 IN 子句中 'value'--comment 转为 /* comment */
+                stmt, in_comment_map = self._preprocess_in_clause_comments(stmt)
+
                 # 转义 $ 符号
                 escaped_stmt, _ = self._escape_dollar_signs(stmt)
 
@@ -2124,6 +2457,9 @@ class SQLFormatterV5:
                     fmt = self._unescape_dollar_signs(fmt)
                     # 将 /* */ 改回 -- 格式
                     fmt = self._convert_block_comments_to_line_comments(fmt)
+                    # 恢复 IN 子句中被预处理的注释（--__INLINE_N__ → --原始注释）
+                    if in_comment_map:
+                        fmt = self._restore_in_clause_comments(fmt, in_comment_map)
                     # V4 风格后处理（leading comma, AND/OR对齐, CASE WHEN等）
                     fmt = self._apply_v4_full_style(fmt)
                     # 修复 sqlglot 将 'col NOT IN' 改为 'NOT col IN' 的问题
@@ -2171,7 +2507,15 @@ class SQLFormatterV5:
             raise ValueError(error_msg)
 
         # Step 4: 合并结果
-        return '\n\n'.join(formatted_statements)
+        result = '\n\n'.join(formatted_statements)
+
+        # Step 5: 拆分被sqlglot合并的注释行
+        result = self._split_merged_comment_lines(result)
+
+        # Step 6: 拆分 IN 子句中被合并的注释值
+        result = self._split_in_clause_comments(result)
+
+        return result
 
 
 def format_sql_v5(sql: str, **options) -> str:
