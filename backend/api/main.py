@@ -388,5 +388,5 @@ async def format_sql_v5_sqlglot_endpoint(request: LegacyFormatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # 与 Electron 开发环境保持一致，统一端口
-    uvicorn.run(app, host="127.0.0.1", port=8889)
+    # reload=True: 文件变更自动重载，避免代码更新后需手动重启
+    uvicorn.run("api.main:app", host="127.0.0.1", port=8889, reload=True)

@@ -370,8 +370,8 @@ class SQLFormatterV5:
             if upper.startswith('CREATE TABLE') and '(' in stripped and stripped.endswith('('):
                 result.append(stripped)
                 i += 1
-                inner_indent = indent + 2
-                comma_prefix = ' ' * (inner_indent + 2)
+                inner_indent = indent + 4
+                comma_prefix = ' ' * inner_indent
                 first = True
                 while i < len(lines):
                     s = lines[i].strip()
@@ -381,12 +381,12 @@ class SQLFormatterV5:
                         continue
                     # 闭括号结束列定义
                     if s.startswith(')'):
-                        result.append(' ' * inner_indent + s)
+                        result.append(' ' * indent + s)
                         i += 1
                         break
                     col = s.rstrip(',')
                     if first:
-                        result.append(' ' * inner_indent + col)
+                        result.append(f"{comma_prefix}  {col}")
                         first = False
                     else:
                         result.append(f"{comma_prefix}, {col}")
@@ -1457,8 +1457,9 @@ class SQLFormatterV5:
 
         result = []
         case_depth = 0
+        paren_depths = set()  # 追踪哪些深度有 ( 需要匹配 )
 
-        for line in merged:
+        for idx, line in enumerate(merged):
             stripped = line.strip()
             if not stripped:
                 continue
@@ -1475,8 +1476,22 @@ class SQLFormatterV5:
 
             # 纯 END 行（行首 END）
             if re.match(r'\bEND\b', upper):
+                depth_for_end = case_depth
                 result.append(f"E{case_depth} {stripped}")
                 case_depth = max(0, case_depth - 1)
+                # 如果这个深度有匹配的 (，检查下一行是否已有 )
+                # 如果下一行是 ) 或 )--comment，留给后面的 P 标记处理
+                # 否则自动补 )
+                if depth_for_end in paren_depths:
+                    # 检查下一行是否是 ) 开头
+                    has_existing_paren = False
+                    if idx + 1 < len(merged):
+                        next_s = merged[idx + 1].strip()
+                        if re.match(r'^\)\s*(?:--.*)?$', next_s):
+                            has_existing_paren = True
+                    if not has_existing_paren:
+                        result.append(f"P{depth_for_end} )")
+                        paren_depths.discard(depth_for_end)
                 continue
 
             # 行内包含 CASE...END（如 ELSE CASE WHEN ... END、THEN CASE WHEN ... END）
@@ -1487,10 +1502,26 @@ class SQLFormatterV5:
                 continue
 
             # 行内有 CASE 但无 END（如 THEN CASE、ELSE CASE）
-            # 这是嵌套 CASE 的开始，但不是行首
+            # 拆分为 THEN ( / ELSE ( + 换行 + CASE，追踪括号
             if cases_here > 0 and ends_here == 0:
+                before_case = stripped[:re.search(r'\bCASE\b', stripped, re.IGNORECASE).start()].strip()
                 case_depth += 1
-                result.append(f"W{case_depth} {stripped}")
+                if before_case and before_case.upper() in ('THEN', 'ELSE'):
+                    result.append(f"W{case_depth - 1} {before_case} (")
+                    paren_depths.add(case_depth)
+                else:
+                    result.append(f"W{case_depth - 1} {before_case}" if before_case else "")
+                result.append(f"C{case_depth} CASE")
+                continue
+
+            # 闭括号行: ) 或 )--comment（原始 SQL 中自带的）
+            if re.match(r'^\)\s*(?:--.*)?$', stripped):
+                # 找到匹配的 ( 所在的深度
+                if case_depth + 1 in paren_depths:
+                    result.append(f"P{case_depth + 1} {stripped}")
+                    paren_depths.discard(case_depth + 1)
+                else:
+                    result.append(f"P{max(case_depth, 1)} {stripped}")
                 continue
 
             # WHEN/THEN/ELSE 等内容行
@@ -1530,8 +1561,21 @@ class SQLFormatterV5:
         inner_case = stripped[case_match.start():end_match.end()]
         after = stripped[end_match.end():].strip()
 
+        has_paren = False
         if before:
-            result.append(f"W{depth} {before}")
+            # 检测 before 中是否包含 ( — 如 THEN (、ELSE (、或独立的 (
+            paren_in_before = before.endswith('(')
+            clean_before = before[:-1].strip() if paren_in_before else before
+            # THEN/ELSE 后跟嵌套 CASE 时，添加 ( 并追踪
+            if clean_before.upper() in ('THEN', 'ELSE'):
+                result.append(f"W{depth} {clean_before} (")
+                has_paren = True
+            elif paren_in_before:
+                # ( 直接在 CASE 前面，如 (CASE WHEN ...
+                result.append(f"W{depth} {before}")
+                has_paren = True
+            else:
+                result.append(f"W{depth} {before}")
 
         # 展开内层 CASE
         inner_lines = self._format_case_when_single(inner_case)
@@ -1552,7 +1596,9 @@ class SQLFormatterV5:
                 result.append(f"W{inner_depth} {il_s}")
 
         # after 可能是 ) 或其他内容
-        if after:
+        if has_paren:
+            result.append(f"P{inner_depth} )")
+        elif after:
             if after == ')':
                 result.append(f"P{inner_depth} )")
             else:
@@ -1677,14 +1723,14 @@ class SQLFormatterV5:
         2. 纯文本行（来自 _format_case_when_single）：
            无标记，按 WHEN/ELSE/END 关键字判断
 
-        缩进规则（基于列的 leading comma 位置）：
-        - depth=1 CASE: indent + 7, WHEN/THEN/ELSE: indent + 11, END: indent + 7
-        - depth>1 嵌套: CASE/END 相对外层 WHEN 缩进+6, WHEN/THEN 相对 CASE 缩进+4
+        缩进规则（基于列的 leading comma 位置，每层 WHEN +10）：
+        - depth=1: CASE/END = indent + 7, WHEN/THEN/ELSE = indent + 11 (CASE+4)
+        - depth>1: WHEN/THEN/ELSE = indent + 11 + (depth-1)*10, CASE/END = WHEN - 4
+        - 嵌套 CASE 在 ( 后: CASE = ( + 1, 即 WHEN + 6
         - AND/OR 续行: 右对齐上面关键字 (WHEN+1 / WHEN+2)
         - P 标记: 闭括号，与同深度 CASE/END 对齐减1格
         """
         base_case = indent + 7   # depth=1 CASE/END 基础缩进
-        base_inner = indent + 11  # depth=1 WHEN/THEN/ELSE 基础缩进
 
         for line in inner_lines:
             stripped = line.strip()
@@ -1698,13 +1744,13 @@ class SQLFormatterV5:
                 depth = int(marker_match.group(2))
                 content = marker_match.group(3)
 
-                # Compute indents based on depth
+                # 每层 WHEN 固定 +10，d1 = CASE+4, d>=2 = WHEN-4
                 if depth == 1:
                     case_indent = base_case
-                    when_indent = base_inner
+                    when_indent = base_case + 4
                 else:
-                    case_indent = base_inner + (depth - 1) * 6
-                    when_indent = base_inner + (depth - 1) * 6 + 4
+                    when_indent = indent + 11 + (depth - 1) * 10
+                    case_indent = when_indent - 4
 
                 if marker_type == 'C' or marker_type == 'E':
                     result.append(f"{' ' * case_indent}{content}")
@@ -1717,7 +1763,7 @@ class SQLFormatterV5:
                 if stripped.startswith('END'):
                     result.append(f"{' ' * base_case}{stripped}")
                 else:
-                    self._append_w_line(result, stripped, base_inner)
+                    self._append_w_line(result, stripped, base_case + 4)
 
     def _preprocess_in_clause_comments(self, sql: str) -> tuple:
         """预处理 IN 子句中紧跟在值后面的 -- 注释。

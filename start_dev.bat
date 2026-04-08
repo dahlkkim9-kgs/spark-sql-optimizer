@@ -8,7 +8,7 @@ echo.
 :: 启动后端API服务
 echo [1/2] 启动后端API服务...
 cd backend
-start "Spark SQL Backend" cmd /k "python -m api.main"
+start "Spark SQL Backend" cmd /k "python -m uvicorn api.main:app --host 127.0.0.1 --port 8889 --reload --reload-dir backend"
 cd ..
 timeout /t 3 /nobreak >nul
 
@@ -21,7 +21,7 @@ cd ..
 echo.
 echo ========================================
 echo   启动完成！
-echo   后端地址: http://localhost:8888
+echo   后端地址: http://localhost:8889
 echo   前端地址: http://localhost:3000
 echo ========================================
 echo.
