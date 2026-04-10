@@ -285,8 +285,8 @@ class SQLFormatterV5:
 
             # === INSERT INTO (列定义 leading comma) ===
             # 排除 PARTITION(...) 语法，只匹配真正的列定义括号
-            # INSERT INTO table (col1, col2) VALUES (...) ← 需要处理
-            # INSERT INTO table PARTITION(dt='x') SELECT ... ← 不应匹配
+            # INSERT INTO table (col1, col2) VALUES (...) ← 需要处理（列定义）
+            # INSERT INTO table PARTITION(dt='x') SELECT ... ← sqlglot 已原生支持
             is_insert_with_cols = (
                 upper.startswith('INSERT INTO')
                 and '(' in stripped
@@ -1765,6 +1765,182 @@ class SQLFormatterV5:
                 else:
                     self._append_w_line(result, stripped, base_case + 4)
 
+    def _extract_partitioned_by(self, sql: str) -> tuple:
+        """提取 CREATE TABLE 语句中的 PARTITIONED BY 原始信息。
+
+        sqlglot 会将 PARTITIONED BY 的列合并到主列定义中，并丢失类型和注释。
+        预处理时提取完整信息，格式化后恢复。
+
+        Returns:
+            (processed_sql, partitioned_by_info) 或 (sql, None)
+        """
+        # 跳过开头的注释行
+        check_sql = sql.strip()
+        while check_sql.startswith('--'):
+            nl = check_sql.find('\n')
+            if nl == -1:
+                return sql, None
+            check_sql = check_sql[nl + 1:].strip()
+
+        upper = check_sql.upper()
+        if not upper.startswith('CREATE TABLE'):
+            return sql, None
+
+        # 查找 PARTITIONED BY 关键字（在最后的 ) 之后）
+        pb_match = re.search(r'\)\s*COMMENT\s', sql, re.IGNORECASE)
+        if not pb_match:
+            # 没有 COMMENT，试试直接找 PARTITIONED BY
+            pb_match = re.search(r'\)\s*\n\s*PARTITIONED\s+BY', sql, re.IGNORECASE)
+            if not pb_match:
+                return sql, None
+
+        # 查找 PARTITIONED BY
+        pb_keyword_match = re.search(r'PARTITIONED\s+BY\s*\(', sql, re.IGNORECASE)
+        if not pb_keyword_match:
+            return sql, None
+
+        pb_start = pb_keyword_match.start()
+
+        # 提取 PARTITIONED BY 括号内的完整内容（支持嵌套括号）
+        paren_start = pb_keyword_match.end() - 1
+        depth = 0
+        i = paren_start
+        while i < len(sql):
+            if sql[i] == '(':
+                depth += 1
+            elif sql[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+
+        pb_content = sql[pb_keyword_match.end():i]  # 括号内的内容
+        pb_full = sql[pb_start:i + 1]  # 完整的 PARTITIONED BY (...)
+
+        # 提取分区列名列表（引号感知的分割，避免 COMMENT '...' 中的逗号）
+        partition_cols = []
+        current_col = []
+        in_string = False
+        string_char = None
+        for ch in pb_content:
+            if in_string:
+                current_col.append(ch)
+                if ch == string_char:
+                    in_string = False
+            elif ch in ("'", '"'):
+                in_string = True
+                string_char = ch
+                current_col.append(ch)
+            elif ch == ',':
+                col_def = ''.join(current_col).strip()
+                if col_def:
+                    col_name = col_def.split()[0].strip()
+                    partition_cols.append(col_name)
+                current_col = []
+            else:
+                current_col.append(ch)
+        # 最后一列
+        col_def = ''.join(current_col).strip()
+        if col_def:
+            col_name = col_def.split()[0].strip()
+            partition_cols.append(col_name)
+
+        # 将 PARTITIONED BY 子句替换为占位符
+        processed = sql[:pb_start] + sql[i + 1:]
+
+        info = {
+            'full_clause': pb_full.strip(),
+            'columns': partition_cols,
+            'content': pb_content.strip(),
+        }
+
+        return processed, info
+
+    def _restore_partitioned_by(self, fmt: str, info: dict) -> str:
+        """恢复 PARTITIONED BY：移除主列中的分区列，替换为原始 PARTITIONED BY 子句。
+
+        Args:
+            fmt: 格式化后的 SQL
+            info: _extract_partitioned_by 提取的信息
+        """
+        partition_cols = [c.upper() for c in info['columns']]
+
+        lines = fmt.split('\n')
+        result_lines = []
+        in_create_cols = False  # 是否在主列定义区域内
+        close_paren_pos = None  # 主列 ) 的位置
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            stripped_upper = stripped.upper()
+
+            # 检测 CREATE TABLE 行（开始主列定义）
+            if 'CREATE TABLE' in stripped_upper:
+                in_create_cols = True
+                result_lines.append(line)
+                # 如果行内有 (，主列定义已开始
+                continue
+
+            if in_create_cols:
+                # 主列定义结束标记：行首只有 )（不带 PARTITIONED 等关键字）
+                if stripped == ')' or (stripped.startswith(')') and 'PARTITIONED' not in stripped_upper and 'COMMENT' not in stripped_upper):
+                    in_create_cols = False
+                    close_paren_pos = len(result_lines)
+                    result_lines.append(line)
+                    continue
+
+                # 检测主列中的分区列行，跳过
+                is_partition_col = False
+                for col_name in partition_cols:
+                    # 匹配 leading comma + 列名 + 类型
+                    col_pattern = r'^,?\s*' + re.escape(col_name) + r'\s+(STRING|INT|VARCHAR|DECIMAL|BIGINT|DOUBLE|FLOAT|DATE|TIMESTAMP|BOOLEAN)'
+                    if re.match(col_pattern, stripped, re.IGNORECASE):
+                        is_partition_col = True
+                        break
+
+                if is_partition_col:
+                    continue  # 跳过分区列
+
+            result_lines.append(line)
+
+        # 替换或插入 PARTITIONED BY
+        if close_paren_pos is not None and info['full_clause']:
+            # 格式化 PARTITIONED BY 内容（引号感知分割，避免 COMMENT '...' 中的逗号被误拆）
+            pb_cols = self._split_set_columns(info['content'])
+            pb_lines = ['PARTITIONED BY (']
+            for j, col in enumerate(pb_cols):
+                col = col.strip()
+                if j == 0:
+                    pb_lines.append('    ' + col)
+                else:
+                    pb_lines.append('    , ' + col)
+            pb_lines.append(')')
+
+            current = '\n'.join(result_lines)
+
+            if 'PARTITIONED BY' in current.upper():
+                # 替换已有的 PARTITIONED BY 为带类型的版本
+                new_result = []
+                skip = False
+                for rl in result_lines:
+                    if re.match(r'\s*PARTITIONED\s+BY\s*\(', rl, re.IGNORECASE):
+                        new_result.extend(pb_lines)
+                        skip = True
+                        continue
+                    if skip:
+                        if re.match(r'\s*\)', rl):
+                            skip = False
+                        continue
+                    new_result.append(rl)
+                return '\n'.join(new_result)
+            else:
+                # 插入新的 PARTITIONED BY
+                insert_idx = close_paren_pos + 1
+                for k, pb_line in enumerate(pb_lines):
+                    result_lines.insert(insert_idx + k, pb_line)
+
+        return '\n'.join(result_lines)
+
     def _preprocess_in_clause_comments(self, sql: str) -> tuple:
         """预处理 IN 子句中紧跟在值后面的 -- 注释。
 
@@ -2415,10 +2591,27 @@ class SQLFormatterV5:
                 continue
 
             # 处理 -- 注释
+            # 注意：如果注释内包含 ;，需要将其提取为语句终止符
+            # 例如：--comment; 应被拆分为 --comment\n; 以正确终止语句
             if char == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                comment_has_semicolon = False
+                comment_chars = []
                 while i < len(sql) and sql[i] not in ('\n', '\r'):
-                    current.append(sql[i])
+                    if sql[i] == ';':
+                        comment_has_semicolon = True
+                    comment_chars.append(sql[i])
                     i += 1
+                if comment_has_semicolon:
+                    # 去掉注释内的 ; ，追加注释文本，然后用 ; 终止语句
+                    comment_text = ''.join(comment_chars).rstrip(';').rstrip()
+                    current.append(comment_text)
+                    # 终止当前语句
+                    stmt = ''.join(current).strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current = []
+                else:
+                    current.extend(comment_chars)
                 continue
 
             # 处理 /* */ 注释
@@ -2483,6 +2676,9 @@ class SQLFormatterV5:
                 # 预处理：将 IN 子句中 'value'--comment 转为 /* comment */
                 stmt, in_comment_map = self._preprocess_in_clause_comments(stmt)
 
+                # 预处理：提取 CREATE TABLE 的 PARTITIONED BY 原始信息
+                stmt, partitioned_by_info = self._extract_partitioned_by(stmt)
+
                 # 转义 $ 符号
                 escaped_stmt, _ = self._escape_dollar_signs(stmt)
 
@@ -2518,9 +2714,12 @@ class SQLFormatterV5:
                     fmt = self._fix_subquery_indent(fmt)
                     # 拆分超长标量子查询
                     fmt = self._split_long_scalar_subqueries(fmt)
-                    # 添加分号
+                    # 恢复 PARTITIONED BY（移除主列中的分区列，恢复原始类型和注释）
+                    if partitioned_by_info:
+                        fmt = self._restore_partitioned_by(fmt, partitioned_by_info)
+                    # 添加分号（独立一行，避免注释干扰语句完整性）
                     if not fmt.endswith(';'):
-                        fmt += ';'
+                        fmt = fmt.rstrip() + '\n;'
                     formatted.append(fmt)
 
                 formatted_statements.extend(formatted)
