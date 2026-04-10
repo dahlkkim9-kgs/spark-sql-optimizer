@@ -1941,6 +1941,107 @@ class SQLFormatterV5:
 
         return '\n'.join(result_lines)
 
+    # 需要预处理的注释模式：被注释掉的 SQL 代码（sqlglot 会丢失）
+    _COMMENT_SQL_PATTERN = re.compile(
+        r'^--\s*(WHEN|THEN|ELSE|CASE|END|AND|OR|SELECT|FROM|WHERE|GROUP|ORDER|HAVING|JOIN|LEFT|RIGHT|INNER|ON|SET|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b',
+        re.IGNORECASE
+    )
+
+    def _preserve_standalone_comments(self, sql: str) -> tuple:
+        """预处理：移除看起来像 SQL 代码的注释行，格式化后重新插入。
+
+        只移除 --WHEN、--CASE、--SELECT 等看起来像被注释掉的 SQL 代码的行。
+        普通注释（如 --说明文字、--20240729修改）由 sqlglot 自行处理，不移除。
+
+        Returns:
+            (processed_sql, comment_infos) — comment_infos 用于后处理恢复
+        """
+        comment_infos = []
+        lines = sql.split('\n')
+        result_lines = []
+        pending_comments = []
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('--') and self._COMMENT_SQL_PATTERN.match(stripped):
+                # 被注释掉的 SQL 代码 → 移除并记录
+                pending_comments.append(stripped)
+            else:
+                for c in pending_comments:
+                    comment_infos.append({
+                        'comment': c,
+                        'anchor_next': stripped,
+                    })
+                pending_comments = []
+                result_lines.append(line)
+
+        for c in pending_comments:
+            comment_infos.append({
+                'comment': c,
+                'anchor_next': '',
+            })
+
+        return '\n'.join(result_lines), comment_infos
+
+    def _restore_preserved_comments(self, text: str, comment_infos: list) -> str:
+        """恢复被移除的注释行：按锚点在锚点行之前重新插入。
+
+        Args:
+            text: 格式化后的 SQL（已完成所有后处理）
+            comment_infos: _preserve_standalone_comments 记录的注释信息
+        """
+        if not comment_infos:
+            return text
+
+        lines = text.split('\n')
+
+        # 按锚点分组，同一锚点的注释按原始顺序排列
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for info in comment_infos:
+            key = info['anchor_next']
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(info['comment'])
+
+        # 对每组注释，找到锚点行并在其之前插入
+        for anchor_next, comments in groups.items():
+            if not anchor_next:
+                # 没有锚点（文件末尾的注释），追加到末尾
+                for c in comments:
+                    lines.append(c)
+                continue
+
+            # 提取锚点中的标识符和引号值做匹配（容忍格式化导致的空白差异）
+            tokens = re.findall(r"[a-zA-Z_]\w*|'[^']*'", anchor_next)
+            # 过滤太短的词和常见关键字，保留有区分度的 token
+            skip = {'WHEN', 'THEN', 'ELSE', 'AND', 'OR', 'CASE', 'END', 'AS', 'ON',
+                    'IN', 'NOT', 'IS', 'BY', 'TO', 'FROM', 'WHERE', 'SELECT', 'A', 'B'}
+            search_tokens = [t.upper() for t in tokens if t.upper() not in skip and len(t) > 1]
+
+            # 用第一个有区分度的 token 定位行
+            if search_tokens:
+                search_key = search_tokens[0]
+            else:
+                # 无区分度 token，用锚点第一个词
+                words = anchor_next.split()
+                search_key = words[0].upper() if words else ''
+
+            insert_idx = -1
+            for i, line in enumerate(lines):
+                if search_key in line.strip().upper():
+                    insert_idx = i
+                    break
+
+            if insert_idx >= 0:
+                # 在锚点行之前插入注释（保持缩进）
+                base_indent = lines[insert_idx][:len(lines[insert_idx]) - len(lines[insert_idx].lstrip())]
+                for c in reversed(comments):
+                    lines.insert(insert_idx, f'{base_indent}{c}')
+            # 找不到锚点则注释丢失
+
+        return '\n'.join(lines)
+
     def _preprocess_in_clause_comments(self, sql: str) -> tuple:
         """预处理 IN 子句中紧跟在值后面的 -- 注释。
 
@@ -2673,6 +2774,9 @@ class SQLFormatterV5:
 
         for i, stmt in enumerate(statements):
             try:
+                # 预处理：将独立 -- 注释行转为 /* */ 占位符，避免 sqlglot 丢失
+                stmt, preserve_comment_map = self._preserve_standalone_comments(stmt)
+
                 # 预处理：将 IN 子句中 'value'--comment 转为 /* comment */
                 stmt, in_comment_map = self._preprocess_in_clause_comments(stmt)
 
@@ -2717,6 +2821,9 @@ class SQLFormatterV5:
                     # 恢复 PARTITIONED BY（移除主列中的分区列，恢复原始类型和注释）
                     if partitioned_by_info:
                         fmt = self._restore_partitioned_by(fmt, partitioned_by_info)
+                    # 恢复被预处理的独立注释（--__PRESERVE_N__ → 原始注释）
+                    if preserve_comment_map:
+                        fmt = self._restore_preserved_comments(fmt, preserve_comment_map)
                     # 添加分号（独立一行，避免注释干扰语句完整性）
                     if not fmt.endswith(';'):
                         fmt = fmt.rstrip() + '\n;'
