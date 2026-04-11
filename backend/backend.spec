@@ -12,6 +12,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('core', 'core'),  # 包含 core 目录
+        ('../frontend/build', 'frontend/build'),  # 前端静态文件
     ],
     hiddenimports=[
         'uvicorn',
@@ -46,6 +47,8 @@ a = Analysis(
         'anyio',
         'anyio.backends',
         'anyio.backends.asyncio',
+        'webbrowser',
+        'socket',
     ],
     hookspath=[],
     hooksconfig={},

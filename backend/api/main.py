@@ -4,10 +4,14 @@ Spark SQL优化工具的REST API
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import sys
 import os
+import socket
+import webbrowser
 
 # 处理 PyInstaller 打包后的路径
 if getattr(sys, 'frozen', False):
@@ -106,7 +110,16 @@ class LegacyFormatRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    """API根路径"""
+    """单机版：返回前端页面；开发版：返回 API 信息"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，返回前端 index.html
+        if hasattr(sys, '_MEIPASS'):
+            static_dir = os.path.join(sys._MEIPASS, 'frontend', 'build')
+        else:
+            static_dir = os.path.join(os.path.dirname(sys.executable), 'frontend', 'build')
+        index_path = os.path.join(static_dir, 'index.html')
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
     return {
         "name": "Spark SQL 优化工具",
         "version": "1.0.0",
@@ -386,7 +399,50 @@ async def format_sql_v5_sqlglot_endpoint(request: LegacyFormatRequest):
         }
 
 
+# 挂载前端静态文件（单机版）
+def _get_frontend_dir():
+    """获取前端静态文件目录"""
+    if getattr(sys, 'frozen', False):
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, 'frontend', 'build')
+        else:
+            return os.path.join(os.path.dirname(sys.executable), 'frontend', 'build')
+    else:
+        return os.path.join(os.path.dirname(__file__), '..', '..', 'frontend', 'build')
+
+_frontend_dir = _get_frontend_dir()
+if os.path.isdir(_frontend_dir):
+    # 挂载静态资源（JS/CSS/图片等），放在所有 API 路由之后
+    app.mount("/static", StaticFiles(directory=os.path.join(_frontend_dir, 'static')), name="static")
+
+
+def _find_free_port(start=8889, end=8900):
+    """查找可用端口"""
+    for port in range(start, end):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port
+        except OSError:
+            continue
+    return start  # fallback
+
+
 if __name__ == "__main__":
     import uvicorn
-    # reload=True: 文件变更自动重载，避免代码更新后需手动重启
-    uvicorn.run("api.main:app", host="127.0.0.1", port=8889, reload=True)
+
+    is_frozen = getattr(sys, 'frozen', False)
+    port = _find_free_port()
+
+    if is_frozen:
+        # 单机版：启动后自动打开浏览器，不启用 reload
+        import threading
+        url = f"http://127.0.0.1:{port}"
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+        print(f"Spark SQL 优化工具启动中...")
+        print(f"浏览器将自动打开: {url}")
+        print(f"如未自动打开，请手动访问上述地址")
+        uvicorn.run(app, host="127.0.0.1", port=port)
+    else:
+        # 开发版：启用热重载
+        uvicorn.run("api.main:app", host="127.0.0.1", port=port, reload=True)
