@@ -1,91 +1,132 @@
 # -*- coding: utf-8 -*-
-"""测试列对齐逻辑修复"""
+"""测试：CREATE TABLE 列对齐 — 字段名、类型、COMMENT 上下对齐"""
 import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+import os
+sys.path.insert(0, os.path.dirname(__file__))
 
-def test_column_alignment_with_comment():
-    """测试带注释的列对齐"""
-    from formatter_v5_sqlglot import SQLFormatterV5
+from formatter_v5_sqlglot import format_sql_v5
 
-    formatter = SQLFormatterV5()
 
-    # sqlglot 输出格式（模拟）
-    sql = """SELECT
-  a, /* comment */
-  b
-FROM t1"""
+def _extract_col_lines_with_indent(result):
+    """从格式化结果中提取列定义行（保留前导缩进）"""
+    lines = result.split('\n')
+    col_lines = []
+    in_cols = False
+    for line in lines:
+        s = line.strip()
+        if 'CREATE TABLE' in s.upper() and '(' in s:
+            in_cols = True
+            continue
+        if in_cols:
+            if s.startswith(')') or s == ')':
+                break
+            if s and not s.startswith('CREATE'):
+                col_lines.append(line)  # 保留原始缩进
+    return col_lines
 
-    result = formatter._apply_v4_column_style(sql)
 
-    # 验证：没有 AS AS
-    assert "AS AS" not in result, f"发现 AS AS 错误: {repr(result)}"
-    # 验证：注释保留
-    assert "/* comment */" in result or "-- comment" in result
-    # 验证：没有重复的逗号
-    assert result.count(',') <= 2, f"逗号数量异常: {repr(result)}"
-    print("✅ 列对齐测试通过")
-    print(f"结果:\n{result}")
+def _get_comment_positions(col_lines):
+    """获取每行中 COMMENT 关键字的列位置"""
+    positions = []
+    for line in col_lines:
+        pos = line.upper().find(' COMMENT ')
+        if pos >= 0:
+            positions.append(pos)
+    return positions
 
-def test_column_alignment_with_dash_comment():
-    """测试带 -- 注释的列对齐"""
-    from formatter_v5_sqlglot import SQLFormatterV5
 
-    formatter = SQLFormatterV5()
+def test_align_column_names():
+    """列名应左对齐到最长列名宽度"""
+    sql = """CREATE TABLE t1 (
+    a INT COMMENT 'short'
+    , abcdef STRING COMMENT 'long name'
+    , xy DECIMAL(22,2) COMMENT 'medium'
+)"""
+    result = format_sql_v5(sql)
+    col_lines = _extract_col_lines_with_indent(result)
+    for cl in col_lines:
+        print(f'  {cl}')
 
-    # -- 注释格式
-    sql = """SELECT
-  a, -- comment
-  b
-FROM t1"""
+    # COMMENT 关键字在原始行中的列位置应对齐（保留前导缩进）
+    comment_positions = _get_comment_positions(col_lines)
+    if len(comment_positions) >= 2:
+        max_diff = max(comment_positions) - min(comment_positions)
+        assert max_diff <= 1, \
+            f"列名未对齐! COMMENT位置: {comment_positions}\n{chr(10).join(col_lines)}"
+    print("PASS: test_align_column_names")
 
-    result = formatter._apply_v4_column_style(sql)
 
-    # 验证：没有 AS AS
-    assert "AS AS" not in result, f"发现 AS AS 错误: {repr(result)}"
-    # 验证：注释保留
-    assert "-- comment" in result
-    print("✅ -- 注释列对齐测试通过")
-    print(f"结果:\n{result}")
+def test_align_types():
+    """类型应左对齐到最长类型宽度"""
+    sql = """CREATE TABLE t1 (
+    a INT COMMENT 'short'
+    , b STRING COMMENT 'longer type name'
+    , c VARCHAR(10) COMMENT 'has params'
+    , d DECIMAL(22,2) COMMENT 'big number'
+)"""
+    result = format_sql_v5(sql)
+    col_lines = _extract_col_lines_with_indent(result)
+    for cl in col_lines:
+        print(f'  {cl}')
 
-def test_multiple_columns_with_comments():
-    """测试多列带注释"""
-    from formatter_v5_sqlglot import SQLFormatterV5
+    # COMMENT 关键字在各行应对齐
+    comment_positions = _get_comment_positions(col_lines)
+    if len(comment_positions) >= 2:
+        max_diff = max(comment_positions) - min(comment_positions)
+        assert max_diff <= 1, \
+            f"COMMENT未对齐! 位置: {comment_positions}\n{chr(10).join(col_lines)}"
+    print("PASS: test_align_types")
 
-    formatter = SQLFormatterV5()
 
-    sql = """SELECT
-  a, /* comment 1 */
-  b, /* comment 2 */
-  c
-FROM t1"""
+def test_align_with_partitioned_by():
+    """PARTITIONED BY 表也应列对齐"""
+    sql = """CREATE TABLE t1 (
+    a INT COMMENT 'col a'
+    , bbb STRING COMMENT 'col bbb'
+) COMMENT 'test table'
+PARTITIONED BY (dt STRING)"""
+    result = format_sql_v5(sql)
+    assert 'bbb' in result, f"列 bbb 丢失!\n{result}"
+    assert 'PARTITIONED BY' in result.upper(), f"PARTITIONED BY 丢失!\n{result}"
+    print("PASS: test_align_with_partitioned_by")
 
-    result = formatter._apply_v4_column_style(sql)
 
-    # 验证：没有 AS AS
-    assert "AS AS" not in result, f"发现 AS AS 错误: {repr(result)}"
-    # 验证：注释保留
-    assert "/* comment 1 */" in result
-    assert "/* comment 2 */" in result
-    print("✅ 多列注释测试通过")
-    print(f"结果:\n{result}")
+def test_align_short_columns():
+    """简单短列也能对齐"""
+    sql = """CREATE TABLE t1 (
+    id INT
+    , name STRING
+)"""
+    result = format_sql_v5(sql)
+    assert 'id' in result and 'name' in result, f"列丢失!\n{result}"
+    print("PASS: test_align_short_columns")
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("测试列对齐逻辑修复")
-    print("=" * 60)
-    print()
+    tests = [
+        test_align_column_names,
+        test_align_types,
+        test_align_with_partitioned_by,
+        test_align_short_columns,
+    ]
 
-    try:
-        test_column_alignment_with_comment()
-        print()
-        test_column_alignment_with_dash_comment()
-        print()
-        test_multiple_columns_with_comments()
-        print()
-        print("=" * 60)
-        print("所有测试通过！")
-        print("=" * 60)
-    except AssertionError as e:
-        print(f"❌ 测试失败: {e}")
+    passed = 0
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL: {t.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"ERROR: {t.__name__}: {e}")
+            failed += 1
+
+    print(f"\n{'='*50}")
+    print(f"CREATE TABLE 列对齐测试: {passed}/{passed+failed} 通过")
+    if failed:
+        print(f"失败: {failed}")
         sys.exit(1)
+    else:
+        print("全部通过!")

@@ -117,28 +117,6 @@ body {
   background: #d5dbdb;
 }
 
-/* 格式化器版本选择器 */
-.formatter-select {
-  padding: 6px 10px;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  font-size: 12px;
-  background: white;
-  color: #2c3e50;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.formatter-select:hover {
-  border-color: #667eea;
-}
-
-.formatter-select:focus {
-  outline: none;
-  border-color: #667eea;
-  box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2);
-}
-
 /* Editor */
 .editor-container {
   border: 2px solid #ecf0f1;

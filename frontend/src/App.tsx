@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import Editor from '@monaco-editor/react';
 import './App.css';
-import { API_URLS, getFormatUrl, FORMATTER_VERSIONS, type FormatterVersion } from './config';
-import { VersionInfo } from './VersionInfo';
+import { API_URLS } from './config';
 
 interface Issue {
   rule: string;
@@ -37,8 +36,6 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [formatterVersion, setFormatterVersion] = useState<string>('');
-  // 新增: 格式化器版本选择
-  const [selectedFormatter, setSelectedFormatter] = useState<FormatterVersion>(FORMATTER_VERSIONS.V4);
 
   const handleEditorWillMount = () => {
     // 配置 Monaco Editor
@@ -57,11 +54,8 @@ function App() {
     setLoading(true);
     setEditorError(null);
     try {
-      // 根据选择的版本获取对应的 API 端点
-      const formatUrl = getFormatUrl(selectedFormatter);
-
       // 调用后端API格式化SQL
-      const response = await fetch(formatUrl, {
+      const response = await fetch(API_URLS.format, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -85,7 +79,7 @@ function App() {
 
       // 保存版本信息
       if (data.version) {
-        setFormatterVersion(`${data.version} (${data.formatter_file || 'formatter_v4_fixed.py'})`);
+        setFormatterVersion(`${data.version} (${data.formatter_file || 'formatter_v5_sqlglot.py'})`);
       }
 
       if (!data.success) {
@@ -140,16 +134,6 @@ function App() {
           <div className="section-header">
             <h2>SQL编辑器</h2>
             <div className="actions">
-              {/* 格式化器版本选择器 */}
-              <select
-                value={selectedFormatter}
-                onChange={(e) => setSelectedFormatter(e.target.value as FormatterVersion)}
-                className="formatter-select"
-                title="选择格式化器版本"
-              >
-                <option value={FORMATTER_VERSIONS.V4}>V4 (正则表达式)</option>
-                <option value={FORMATTER_VERSIONS.V5}>V5 (sqlglot AST)</option>
-              </select>
               <button className="btn btn-secondary" onClick={() => setSql('')}>
                 清空
               </button>

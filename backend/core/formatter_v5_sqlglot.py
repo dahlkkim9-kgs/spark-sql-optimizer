@@ -525,7 +525,10 @@ class SQLFormatterV5:
             i += 1
 
         # 清理多余空行
-        return self._cleanup_empty_lines('\n'.join(result))
+        text = self._cleanup_empty_lines('\n'.join(result))
+        # CREATE TABLE 列对齐
+        text = self._align_create_table_columns(text)
+        return text
 
     def _split_set_columns(self, set_rest: str) -> list:
         """安全分割 SET 子句的列赋值，排除括号和字符串内的逗号。"""
@@ -1163,6 +1166,154 @@ class SQLFormatterV5:
                 cleaned.append(line)
                 prev_empty = False
         return '\n'.join(cleaned)
+
+    @staticmethod
+    def _align_create_table_columns(text: str) -> str:
+        """对齐 CREATE TABLE 语句中的列定义：列名、类型、COMMENT。
+
+        两遍扫描：
+        1. 找到列定义区域，解析每列的（列名, 类型, 后缀）
+        2. 按最大宽度填充空格，使列名和 COMMENT 关键字上下对齐
+        """
+        lines = text.split('\n')
+        result = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            upper = stripped.upper()
+
+            # 检测 CREATE TABLE 行
+            if not (upper.startswith('CREATE TABLE') or upper.startswith('CREATE EXTERNAL TABLE')):
+                result.append(line)
+                i += 1
+                continue
+
+            # 收集 CREATE TABLE 行到闭括号的所有行
+            create_block = [line]
+            j = i + 1
+            paren_depth = 0
+            # 计算 CREATE TABLE 行中的括号深度
+            for ch in stripped:
+                if ch == '(':
+                    paren_depth += 1
+                elif ch == ')':
+                    paren_depth -= 1
+
+            while j < len(lines) and paren_depth > 0:
+                create_block.append(lines[j])
+                for ch in lines[j]:
+                    if ch == '(':
+                        paren_depth += 1
+                    elif ch == ')':
+                        paren_depth -= 1
+                j += 1
+
+            # 收集闭括号后的内容（COMMENT, PARTITIONED BY 等）
+            while j < len(lines):
+                s = lines[j].strip()
+                if not s or s.upper().startswith('CREATE') or s.upper().startswith('INSERT') or s.upper().startswith('ALTER') or s.upper().startswith('DROP') or s.upper().startswith('SELECT'):
+                    break
+                create_block.append(lines[j])
+                j += 1
+
+            # 对齐列定义
+            aligned_block = SQLFormatterV5._align_col_block(create_block)
+            result.extend(aligned_block)
+            i = j
+
+        return '\n'.join(result)
+
+    @staticmethod
+    def _align_col_block(block_lines):
+        """对单个 CREATE TABLE 块中的列行做对齐。
+
+        统一所有列行的缩进格式，按最大列名和类型宽度填充空格。
+        所有列行统一缩进为 leading comma 位置对齐。
+        """
+        # 找到 ( 所在行：支持 CREATE TABLE ... ( 和 CREATE TABLE ... \n ( 两种格式
+        paren_line_idx = None
+        for idx, line in enumerate(block_lines):
+            if '(' in line and 'CREATE TABLE' in line.upper():
+                paren_line_idx = idx
+                break
+            # ( 在独立行（上一行是 CREATE TABLE）
+            if line.strip() == '(' and idx > 0 and 'CREATE TABLE' in block_lines[idx - 1].upper():
+                paren_line_idx = idx
+                break
+
+        if paren_line_idx is None:
+            return block_lines
+
+        # 从现有行推断缩进（取第一个列行的前导空格数，去掉 leading comma 后）
+        # 如果首列无逗号，后续列有逗号，统一用后续列的缩进
+        base_indent = ''
+        for idx in range(paren_line_idx + 1, len(block_lines)):
+            s = block_lines[idx]
+            if not s.strip() or s.strip().startswith(')'):
+                continue
+            # 有 leading comma 的行：取逗号前的空格作为 base_indent
+            stripped_s = s.strip()
+            if stripped_s.startswith(','):
+                base_indent = s[:s.index(',')]
+                break
+            # 首列（无逗号）：取内容前的空格 - 2（因为首列额外有 2 空格替代 ", "）
+            content_start = len(s) - len(s.lstrip())
+            if content_start >= 2:
+                base_indent = ' ' * (content_start - 2)
+            break
+
+        # 解析列定义
+        col_data = []  # [(block_idx, col_name, col_type, rest)]
+        for idx in range(paren_line_idx + 1, len(block_lines)):
+            s = block_lines[idx].strip()
+            if not s or s.startswith(')'):
+                break
+
+            # 去掉 leading comma 和多余空格
+            content = s.lstrip(', ').strip()
+            parts = content.split()
+            if len(parts) < 2:
+                continue
+
+            col_name = parts[0]
+            rest_after_name = content[len(col_name):].strip()
+
+            # 提取类型（含括号参数，如 VARCHAR(10)、DECIMAL(22, 2)）
+            type_match = re.match(r"(\w+(?:\s*\([^)]*\))?)\s*(.*)", rest_after_name)
+            if type_match:
+                col_type = type_match.group(1)
+                after_type = type_match.group(2)
+            else:
+                col_type = rest_after_name
+                after_type = ''
+
+            col_data.append((idx, col_name, col_type, after_type))
+
+        if not col_data:
+            return block_lines
+
+        # 计算最大宽度
+        max_name = max(len(d[1]) for d in col_data)
+        max_type = max(len(d[2]) for d in col_data if d[2])
+
+        # 统一缩进重建列行
+        result = list(block_lines)
+
+        for k, (idx, col_name, col_type, rest) in enumerate(col_data):
+            if col_type:
+                aligned = f"{col_name:<{max_name}} {col_type:<{max_type}} {rest}".rstrip()
+            else:
+                aligned = col_name
+
+            if k == 0:
+                # 首列：无逗号，补 2 空格对齐到后续列的 ", " 位置
+                result[idx] = f"{base_indent}  {aligned}"
+            else:
+                result[idx] = f"{base_indent}, {aligned}"
+
+        return result
 
     @staticmethod
     def _split_merged_comment_lines(text):
