@@ -1908,6 +1908,9 @@ class SQLFormatterV5:
 
                 # 如果有未闭合的括号，继续合并直到括号全部闭合
                 if open_parens > 0:
+                    # CASE/END 始终是硬边界，即使在括号内也不能合并
+                    if re.match(r'\b(CASE|END)\b', next_upper):
+                        break
                     open_parens += next_s.count('(') - next_s.count(')')
                     accumulated += ' ' + next_s
                     i += 1
@@ -2239,6 +2242,11 @@ class SQLFormatterV5:
                 depth = int(marker_match.group(2))
                 content = marker_match.group(3)
 
+                # depth=0: 非 CASE 内容（如 CASE 块外的函数前缀），保持原始缩进
+                if depth == 0:
+                    result.append(f"{' ' * indent}{content}")
+                    continue
+
                 # 每层 WHEN 固定 +10，d1 = CASE+4, d>=2 = WHEN-4
                 if depth == 1:
                     case_indent = base_case
@@ -2255,7 +2263,8 @@ class SQLFormatterV5:
                     self._append_w_line(result, content, when_indent)
             else:
                 # 纯文本行（单行 CASE 拆分结果）
-                if stripped.startswith('END'):
+                # CASE/END 对齐到 base_case，WHEN/THEN/ELSE 用 base_case+4
+                if re.match(r'^(CASE|END)\b', stripped, re.IGNORECASE):
                     result.append(f"{' ' * base_case}{stripped}")
                 else:
                     self._append_w_line(result, stripped, base_case + 4)
