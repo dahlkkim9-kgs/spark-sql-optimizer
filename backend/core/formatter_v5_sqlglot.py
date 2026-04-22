@@ -18,6 +18,13 @@ class SQLFormatterV5:
     _STANDALONE_PREFIX = '__STANDALONE_'
     _INLINE_PREFIX = '__INLINE_'
 
+    # sqlglot 会重写的函数名映射（新增函数只需修改此处）
+    _FUNC_MAP = {
+        'NVL': '___NVL___',
+        'SUBSTR': '___SUBSTR___',
+        'GET_JSON_OBJECT': '___GJSON___',
+    }
+
     def __init__(self, indent_spaces: int = 4):
         self.indent_spaces = indent_spaces
 
@@ -1245,6 +1252,8 @@ class SQLFormatterV5:
 
         partition_info: [(name, type, comment), ...] — 预处理时提取的原始分区列定义
         """
+        if not partition_info:
+            return text
         partition_names = {p[0].upper() for p in partition_info}
 
         # 找到主列定义的 ( ... ) 块
@@ -2274,8 +2283,14 @@ class SQLFormatterV5:
         i = 0
         while i < len(sql):
             # 查找 IN ( 或 NOT IN ( 模式
+            # 手动检查左侧词边界：如果前一个字符是字母/数字/下划线，
+            # 说明 IN 是单词内部（如 JOIN、DISTINCT、BEGIN），跳过
+            if i > 0 and (sql[i - 1].isalnum() or sql[i - 1] == '_'):
+                i += 1
+                continue
+
             upper_rest = sql[i:].upper()
-            in_match = re.match(r'\b(IN|NOT\s+IN)\s*\(', upper_rest)
+            in_match = re.match(r'(IN|NOT\s+IN)\s*\(', upper_rest)
             if not in_match:
                 i += 1
                 continue
@@ -2903,14 +2918,16 @@ class SQLFormatterV5:
         return sql
 
     @staticmethod
-    def _escape_nvl(sql: str) -> tuple:
-        """将 NVL( 替换为占位符，防止 sqlglot 转为 COALESCE。
+    def _escape_functions(sql: str) -> tuple:
+        """将 sqlglot 会重写的函数名替换为占位符。
 
-        只替换代码中的 NVL，跳过字符串和注释内的。
+        只替换代码中的函数调用，跳过字符串和注释内的。
+        函数名映射见 _FUNC_MAP 类属性。
         """
+        func_map = SQLFormatterV5._FUNC_MAP
         result = []
         i = 0
-        count = 0
+        found = set()
         in_str = False
         qc = None
         in_line_comment = False
@@ -2935,6 +2952,10 @@ class SQLFormatterV5:
 
             if in_str:
                 result.append(ch)
+                if ch == '\\' and i + 1 < len(sql):
+                    result.append(sql[i + 1])
+                    i += 2
+                    continue
                 if ch == qc:
                     in_str = False
                 i += 1
@@ -2959,25 +2980,232 @@ class SQLFormatterV5:
                 i += 1
                 continue
 
-            # 检查 NVL( 模式
-            if (i + 4 <= len(sql)
-                    and sql[i:i + 3].upper() == 'NVL'
-                    and sql[i + 3] == '('
-                    and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == '_'))):
-                result.append('___NVL___(')
-                count += 1
-                i += 4
+            # 检查函数名( 模式
+            for fname, placeholder in func_map.items():
+                flen = len(fname)
+                if (i + flen + 1 <= len(sql)
+                        and sql[i:i + flen].upper() == fname
+                        and sql[i + flen] == '('
+                        and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == '_'))):
+                    result.append(placeholder + '(')
+                    found.add(fname)
+                    i += flen + 1
+                    break
+            else:
+                result.append(ch)
+                i += 1
+
+        return ''.join(result), found
+
+    @staticmethod
+    def _unescape_functions(sql: str) -> str:
+        """恢复被转义的函数名（使用 _FUNC_MAP 的反向映射）"""
+        for placeholder, name in {v: k for k, v in SQLFormatterV5._FUNC_MAP.items()}.items():
+            sql = sql.replace(placeholder, name)
+        return sql
+
+    @staticmethod
+    def _restore_negation_syntax(text: str) -> str:
+        """恢复被 sqlglot 重写的否定模式。
+
+        sqlglot 将以下写法统一提取 NOT 到前面：
+        - a IS NOT NULL      → NOT a IS NULL
+        - a NOT LIKE 'x'     → NOT a LIKE 'x'
+        - a NOT IN (...)     → NOT a IN (...)
+        - a NOT BETWEEN x AND y → NOT a BETWEEN x AND y
+
+        本方法将其恢复为更自然的写法。仅处理简单标识符（含表前缀）。
+        """
+        ident = r'\w+(?:\.\w+)*'
+        # NOT identifier IS NULL → identifier IS NOT NULL
+        text = re.sub(
+            rf'\bNOT\s+({ident})\s+IS\s+NULL\b',
+            r'\1 IS NOT NULL',
+            text
+        )
+        # NOT identifier LIKE → identifier NOT LIKE
+        text = re.sub(
+            rf'\bNOT\s+({ident})\s+LIKE\b',
+            r'\1 NOT LIKE',
+            text
+        )
+        # NOT identifier IN ( → identifier NOT IN (
+        text = re.sub(
+            rf'\bNOT\s+({ident})\s+IN\s*\(',
+            r'\1 NOT IN (',
+            text
+        )
+        # NOT identifier BETWEEN → identifier NOT BETWEEN
+        text = re.sub(
+            rf'\bNOT\s+({ident})\s+BETWEEN\b',
+            r'\1 NOT BETWEEN',
+            text
+        )
+        return text
+
+    @staticmethod
+    def _restore_operator_syntax(text: str, original: str) -> str:
+        """恢复被 sqlglot 重写的运算符和字面量。
+
+        仅在原始 SQL 使用了非标准写法时才恢复：
+        - <> → != (如果原始使用了 !=)
+        - CAST('...' AS DATE) → DATE '...' (如果原始使用了 DATE 字面量)
+        """
+        # <> → != (仅当原始 SQL 使用了 !=)
+        if '!=' in original and '<>' not in original.upper():
+            text = text.replace('<>', '!=')
+
+        # CAST('...' AS DATE) → DATE '...'
+        if re.search(r'\bDATE\s+\'', original, re.IGNORECASE):
+            text = re.sub(
+                r"CAST\s*\(\s*'([^']+)'\s+AS\s+DATE\s*\)",
+                r"DATE '\1'",
+                text,
+                flags=re.IGNORECASE
+            )
+
+        # RLIKE → REGEXP (如果原始使用了 regexp)
+        if re.search(r'\bregexp\b', original, re.IGNORECASE):
+            text = re.sub(r'\bRLIKE\b', 'REGEXP', text, flags=re.IGNORECASE)
+
+        return text
+
+    def _protect_backslash_strings(self, sql: str) -> tuple:
+        """保护含反斜杠的字符串字面量，防止 sqlglot 重复转义。
+
+        将 '\\\.' 这类含反斜杠的字符串替换为安全的占位符字符串，
+        sqlglot 不会对普通字符串字面量做二次转义。
+
+        Returns:
+            (protected_sql, string_map) — string_map: {placeholder: original_content}
+        """
+        string_map = {}
+        result = []
+        i = 0
+        in_str = False
+        qc = None
+        current = []
+        counter = 0
+        in_line_comment = False
+        in_block_comment = False
+
+        while i < len(sql):
+            ch = sql[i]
+
+            if in_line_comment:
+                result.append(ch)
+                if ch == '\n':
+                    in_line_comment = False
+                i += 1
+                continue
+
+            if in_block_comment:
+                result.append(ch)
+                if ch == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+                    in_block_comment = False
+                i += 1
+                continue
+
+            if in_str:
+                current.append(ch)
+                if ch == '\\' and i + 1 < len(sql):
+                    current.append(sql[i + 1])
+                    i += 2
+                    continue
+                if ch == qc:
+                    content = ''.join(current)
+                    inner = content[1:-1]  # 去掉首尾引号
+                    if '\\' in inner:
+                        placeholder = f'___BSTR{counter}___'
+                        string_map[placeholder] = inner
+                        result.append(qc + placeholder + qc)
+                        counter += 1
+                    else:
+                        result.append(content)
+                    in_str = False
+                    current = []
+                i += 1
+                continue
+
+            if ch in ("'", '"'):
+                in_str = True
+                qc = ch
+                current = [ch]
+                i += 1
+                continue
+
+            if ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                in_line_comment = True
+                result.append(ch)
+                i += 1
+                continue
+
+            if ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                in_block_comment = True
+                result.append(ch)
+                i += 1
                 continue
 
             result.append(ch)
             i += 1
 
-        return ''.join(result), count > 0
+        return ''.join(result), string_map
 
     @staticmethod
-    def _unescape_nvl(sql: str) -> str:
-        """恢复 NVL 函数名"""
-        return sql.replace('___NVL___', 'NVL')
+    def _restore_backslash_strings(sql: str, string_map: dict) -> str:
+        """恢复被保护的反斜杠字符串"""
+        for placeholder, original in string_map.items():
+            sql = sql.replace(placeholder, original)
+        return sql
+
+    def _protect_multi_line_blocks(self, sql: str) -> tuple:
+        """保护多行函数调用块，防止 sqlglot 重组参数结构。
+
+        检测跨 5 行以上的 CONCAT/SPLIT 调用，替换为占位符。
+        这些块通常已经被用户手动排版对齐，不需要 sqlglot 重新格式化。
+
+        Returns:
+            (protected_sql, block_map) — block_map: {placeholder: original_block}
+        """
+        block_map = {}
+        blocks = []
+
+        for match in re.finditer(r'\b(CONCAT|SPLIT)\s*\(', sql, re.IGNORECASE):
+            paren_start = match.end() - 1
+            paren_end = self._find_matching_paren_str(sql, paren_start)
+            if paren_end == -1:
+                continue
+
+            full_block = sql[match.start():paren_end + 1]
+            if full_block.count('\n') >= 5:
+                blocks.append((match.start(), paren_end + 1))
+
+        # 去掉被其他块包含的嵌套块，只保留最外层
+        filtered = []
+        for start, end in blocks:
+            contained = any(
+                s2 <= start and end <= e2 and (s2, e2) != (start, end)
+                for s2, e2 in blocks
+            )
+            if not contained:
+                filtered.append((start, end))
+
+        # 从后往前替换，避免位置偏移
+        counter = 0
+        for start, end in reversed(filtered):
+            placeholder = f'___COMPLEX_{counter}___'
+            block_map[placeholder] = sql[start:end]
+            sql = sql[:start] + placeholder + sql[end:]
+            counter += 1
+
+        return sql, block_map
+
+    @staticmethod
+    def _restore_complex_blocks(sql: str, block_map: dict) -> str:
+        """恢复被保护的多行块，保留原始排版"""
+        for placeholder, original in block_map.items():
+            sql = sql.replace(placeholder, original)
+        return sql
 
     @staticmethod
     def _protect_comment_slash_star(sql: str) -> tuple:
@@ -3006,6 +3234,10 @@ class SQLFormatterV5:
 
             if in_str:
                 result.append(ch)
+                if ch == '\\' and i + 1 < len(sql):
+                    result.append(sql[i + 1])
+                    i += 2
+                    continue
                 if ch == qc:
                     in_str = False
                 i += 1
@@ -3174,11 +3406,17 @@ class SQLFormatterV5:
                 # 预处理：提取 PARTITIONED BY 原始定义（sqlglot 会合并到主列并丢失类型）
                 escaped_stmt, partition_info = self._extract_partitioned_by(stmt)
 
-                # 转义 $ 符号
-                escaped_stmt, _ = self._escape_dollar_signs(stmt)
+                # 转义 $ 符号（在 PARTITIONED BY 提取结果基础上继续）
+                escaped_stmt, _ = self._escape_dollar_signs(escaped_stmt)
 
-                # 预处理：保留 NVL 函数名（sqlglot 会转为 COALESCE）
-                escaped_stmt, has_nvl = self._escape_nvl(escaped_stmt)
+                # 预处理：保留函数名（sqlglot 会重写 NVL→COALESCE, SUBSTR→SUBSTRING, GET_JSON_OBJECT→路径重写）
+                escaped_stmt, escaped_funcs = self._escape_functions(escaped_stmt)
+
+                # 预处理：保护多行函数块（CONCAT/SPLIT 跨 5+ 行），防止 sqlglot 重组参数结构
+                escaped_stmt, block_map = self._protect_multi_line_blocks(escaped_stmt)
+
+                # 预处理：保护含反斜杠的字符串字面量，防止 sqlglot 重复转义
+                escaped_stmt, bstr_map = self._protect_backslash_strings(escaped_stmt)
 
                 # 预处理：保护 -- 注释内的 /* */ 文本
                 escaped_stmt, comment_protect_map = self._protect_comment_slash_star(escaped_stmt)
@@ -3196,36 +3434,35 @@ class SQLFormatterV5:
                 formatted = []
                 for ast in asts:
                     fmt = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
-                    # 恢复 $ 符号
+                    # 恢复被保护的反斜杠字符串（必须在 _unescape_dollar_signs 之前，
+                    # 因为被保护的字符串内容中可能包含 ___DOLLAR___ 占位符）
+                    fmt = self._restore_backslash_strings(fmt, bstr_map)
+                    # 恢复 $ 符号（在反斜杠字符串恢复之后，这样字符串中的 ___DOLLAR___ 也能被还原）
                     fmt = self._unescape_dollar_signs(fmt)
-                    # 恢复 NVL 函数名
-                    if has_nvl:
-                        fmt = self._unescape_nvl(fmt)
+                    # 恢复被转义的函数名（NVL, SUBSTR, GET_JSON_OBJECT 等）
+                    fmt = self._unescape_functions(fmt)
                     # 恢复注释内的 /* */ 文本
-                    if comment_protect_map:
-                        fmt = self._restore_comment_slash_star(fmt, comment_protect_map)
+                    fmt = self._restore_comment_slash_star(fmt, comment_protect_map)
                     # 将 /* */ 改回 -- 格式
                     fmt = self._convert_block_comments_to_line_comments(fmt)
-                    # IN 子句注释不在此处恢复 — 保持 /* __INLINE_N__ */ 格式
-                    # 避免被 _apply_v4_full_style / _merge_case_lines 折叠后
-                    # --注释吞掉后续值。由 _split_in_clause_comments 统一处理。
                     # V4 风格后处理（leading comma, AND/OR对齐, CASE WHEN等）
                     fmt = self._apply_v4_full_style(fmt)
-                    # 修复 sqlglot 将 'col NOT IN' 改为 'NOT col IN' 的问题
-                    fmt = re.sub(
-                        r'\bNOT\s+([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)\s+IN\s*\(',
-                        r'\1 NOT IN (',
-                        fmt
-                    )
+                    # 恢复被 sqlglot 重写的否定语法（IS NOT NULL, NOT LIKE, NOT IN, NOT BETWEEN）
+                    fmt = self._restore_negation_syntax(fmt)
+                    # 恢复被 sqlglot 重写的运算符（!=, DATE字面量, regexp）
+                    fmt = self._restore_operator_syntax(fmt, stmt)
                     # 修复子查询括号对齐和内容缩进
                     fmt = self._fix_subquery_indent(fmt)
                     # CREATE TABLE 列对齐（列名、类型、COMMENT上下对齐）
                     fmt = self._align_create_table_columns(fmt)
-                    # 恢复 PARTITIONED BY 原始定义（从主列中移除分区列，重建内联定义）
-                    if partition_info:
-                        fmt = self._restore_partitioned_by(fmt, partition_info)
+                    # 恢复 PARTITIONED BY 原始定义
+                    fmt = self._restore_partitioned_by(fmt, partition_info)
                     # 拆分超长标量子查询
                     fmt = self._split_long_scalar_subqueries(fmt)
+                    # 恢复被保护的多行函数块（CONCAT/SPLIT 等），保留原始排版
+                    # 必须在所有其他后处理之后，避免缩进修复等步骤破坏块内换行
+                    if block_map:
+                        fmt = self._restore_complex_blocks(fmt, block_map)
                     # 分号独立行：避免追加到 -- 注释行末尾导致 ; 被注释吃掉
                     if not fmt.endswith(';'):
                         fmt += '\n;'
