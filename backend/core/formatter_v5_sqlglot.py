@@ -15,6 +15,9 @@ import re
 class SQLFormatterV5:
     """基于 sqlglot 的 SQL 格式化器"""
 
+    _STANDALONE_PREFIX = '__STANDALONE_'
+    _INLINE_PREFIX = '__INLINE_'
+
     def __init__(self, indent_spaces: int = 4):
         self.indent_spaces = indent_spaces
 
@@ -101,6 +104,7 @@ class SQLFormatterV5:
         - `a, /* comment */` -> `a --comment` (移除注释前的逗号)
         - `a /* comment */` -> `a --comment`
         - `a /* comment */ b` -> `a b  --comment` (注释后有内容时移到行末)
+        - 多注释行且注释之间有 OR/AND: 按注释边界拆分为多行
         """
         result = []
         lines = sql.split('\n')
@@ -110,14 +114,44 @@ class SQLFormatterV5:
             pattern = r'/\*\s+(.*?)\s+\*/'
             matches = list(re.finditer(pattern, line))
 
-            # 从后往前替换（避免位置偏移）
-            new_line = line
-            for match in reversed(matches):
-                comment_content = match.group(1).strip()
+            # 过滤掉 IN 子句和独立注释占位符
+            real_matches = [m for m in matches
+                            if not (m.group(1).strip().startswith(self._INLINE_PREFIX)
+                                    and m.group(1).strip().endswith('__'))
+                            and not (m.group(1).strip().startswith(self._STANDALONE_PREFIX)
+                                    and m.group(1).strip().endswith('__'))]
 
-                # 跳过 IN 子句预处理占位符（__INLINE_N__）
-                if comment_content.startswith('__INLINE_') and comment_content.endswith('__'):
+            # 多注释行：检查注释之间是否有 OR/AND，有则拆分
+            if len(real_matches) > 1:
+                has_or_and_between = False
+                for j in range(len(real_matches) - 1):
+                    between = line[real_matches[j].end():real_matches[j + 1].start()].strip()
+                    if re.match(r'^(AND|OR)\b', between, re.IGNORECASE):
+                        has_or_and_between = True
+                        break
+
+                if has_or_and_between:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    split_lines = []
+                    last_end = 0
+                    for m in real_matches:
+                        code_before = line[last_end:m.start()].strip()
+                        comment = m.group(1).strip()
+                        if code_before:
+                            if code_before.endswith(','):
+                                code_before = code_before[:-1].strip()
+                            split_lines.append(f"{indent}{code_before} --{comment}")
+                        last_end = m.end()
+                    remaining = line[last_end:].strip()
+                    if remaining:
+                        split_lines.append(f"{indent}{remaining}")
+                    result.extend(split_lines)
                     continue
+
+            # 单注释或无 OR/AND — 原有逻辑
+            new_line = line
+            for match in reversed(real_matches):
+                comment_content = match.group(1).strip()
 
                 start = match.start()
                 end = match.end()
@@ -133,8 +167,6 @@ class SQLFormatterV5:
                 replacement = f"--{comment_content}"
 
                 if after_comment:
-                    # 注释后有代码内容（如 ELSE、END 等），必须把注释移到行末
-                    # 否则 -- 会把后面的代码也变成注释
                     if has_comma:
                         new_line = before_comment[:-1] + ' ' + after_comment + '  ' + replacement
                     else:
@@ -212,36 +244,7 @@ class SQLFormatterV5:
             if upper == 'SELECT':
                 cols, i = self._collect_indented_cols(lines, i + 1, indent)
                 if cols:
-                    first_lines = self._format_column_with_case(cols[0])
-                    # 判断是否为带标记的多行 CASE 或子查询
-                    if first_lines and re.match(r'^[CWE]\d+\s', first_lines[0]):
-                        result.append(f"{' ' * indent}SELECT")
-                        self._append_case_inner_lines(result, first_lines, indent)
-                    elif first_lines and first_lines[0].startswith('S '):
-                        subquery_str = re.sub(r'^S\s+', '', first_lines[0])
-                        self._append_subquery_col(result, subquery_str, ' ' * indent, indent)
-                    else:
-                        result.append(f"{' ' * indent}SELECT {first_lines[0]}")
-                        if len(first_lines) > 1:
-                            self._append_case_inner_lines(result, first_lines[1:], indent)
-                    comma_prefix = ' ' * (indent + 5)
-                    for c in cols[1:]:
-                        col_lines = self._format_column_with_case(c)
-                        # 先检测子查询标记（单元素但含换行）
-                        if col_lines and len(col_lines) == 1 and col_lines[0].startswith('S '):
-                            subquery_str = re.sub(r'^S\s+', '', col_lines[0])
-                            self._append_subquery_col(result, subquery_str, comma_prefix, indent)
-                        elif len(col_lines) == 1:
-                            result.append(f"{comma_prefix}, {col_lines[0]}")
-                        else:
-                            # 判断是否为带标记的多行 CASE
-                            if col_lines and re.match(r'^[CWE]\d+\s', col_lines[0]):
-                                case_content = re.sub(r'^[CWE]\d+\s+', '', col_lines[0])
-                                result.append(f"{comma_prefix}, {case_content}")
-                                self._append_case_inner_lines(result, col_lines[1:], indent)
-                            else:
-                                result.append(f"{comma_prefix}, {col_lines[0]}")
-                                self._append_case_inner_lines(result, col_lines[1:], indent)
+                    self._emit_select_columns(result, cols, indent, first_on_select_line=True)
                 else:
                     result.append(f"{' ' * indent}SELECT")
                 continue
@@ -249,6 +252,28 @@ class SQLFormatterV5:
             # === SELECT with first column on same line ===
             if upper.startswith('SELECT '):
                 first_col = stripped[7:].rstrip(',')
+                first_col_stripped = first_col.strip()
+
+                # SELECT DISTINCT (无列名) — 复用 _collect_indented_cols 正确处理 CASE 块
+                if first_col_stripped.upper() == 'DISTINCT':
+                    result.append(f"{' ' * indent}SELECT DISTINCT")
+                    i += 1
+                    cols, i = self._collect_indented_cols(lines, i, indent)
+                    if cols:
+                        self._emit_select_columns(result, cols, indent, first_on_select_line=False)
+                    continue
+
+                # SELECT DISTINCT col1... — 提取 DISTINCT，复用 _collect_indented_cols
+                if first_col_stripped.upper().startswith('DISTINCT '):
+                    actual_col = first_col_stripped[9:].strip()
+                    result.append(f"{' ' * indent}SELECT DISTINCT {actual_col}")
+                    i += 1
+                    cols, i = self._collect_indented_cols(lines, i, indent)
+                    if cols:
+                        self._emit_select_columns(result, cols, indent, first_on_select_line=True)
+                    continue
+
+                # 普通 SELECT col1...
                 first_lines = self._format_column_with_case(first_col)
                 if first_lines and re.match(r'^[CWE]\d+\s', first_lines[0]):
                     self._append_case_inner_lines(result, first_lines, indent)
@@ -260,33 +285,15 @@ class SQLFormatterV5:
                     if len(first_lines) > 1:
                         self._append_case_inner_lines(result, first_lines[1:], indent)
                 i += 1
-                comma_prefix = ' ' * (indent + 5)
-                while i < len(lines):
-                    s = lines[i].strip()
-                    si = len(lines[i]) - len(lines[i].lstrip())
-                    if not s or (si <= indent and self._is_clause_line(s)):
-                        break
-                    if si <= indent and self._is_and_or(s):
-                        break
-                    col_content = s.rstrip(',')
-                    col_lines = self._format_column_with_case(col_content)
-                    if col_lines and len(col_lines) == 1 and col_lines[0].startswith('S '):
-                        subquery_str = re.sub(r'^S\s+', '', col_lines[0])
-                        self._append_subquery_col(result, subquery_str, comma_prefix, indent)
-                    elif len(col_lines) == 1:
-                        result.append(f"{comma_prefix}, {col_lines[0]}")
-                    else:
-                        if col_lines and re.match(r'^[CWE]\d+\s', col_lines[0]):
-                            case_content = re.sub(r'^[CWE]\d+\s+', '', col_lines[0])
-                            result.append(f"{comma_prefix}, {case_content}")
-                            self._append_case_inner_lines(result, col_lines[1:], indent)
-                    i += 1
+                cols, i = self._collect_indented_cols(lines, i, indent)
+                if cols:
+                    self._emit_select_columns(result, cols, indent, first_on_select_line=True)
                 continue
 
             # === INSERT INTO (列定义 leading comma) ===
             # 排除 PARTITION(...) 语法，只匹配真正的列定义括号
-            # INSERT INTO table (col1, col2) VALUES (...) ← 需要处理（列定义）
-            # INSERT INTO table PARTITION(dt='x') SELECT ... ← sqlglot 已原生支持
+            # INSERT INTO table (col1, col2) VALUES (...) ← 需要处理
+            # INSERT INTO table PARTITION(dt='x') SELECT ... ← 不应匹配
             is_insert_with_cols = (
                 upper.startswith('INSERT INTO')
                 and '(' in stripped
@@ -525,10 +532,7 @@ class SQLFormatterV5:
             i += 1
 
         # 清理多余空行
-        text = self._cleanup_empty_lines('\n'.join(result))
-        # CREATE TABLE 列对齐
-        text = self._align_create_table_columns(text)
-        return text
+        return self._cleanup_empty_lines('\n'.join(result))
 
     def _split_set_columns(self, set_rest: str) -> list:
         """安全分割 SET 子句的列赋值，排除括号和字符串内的逗号。"""
@@ -560,6 +564,58 @@ class SQLFormatterV5:
         if current:
             cols.append(''.join(current).strip())
         return [c for c in cols if c]
+
+    def _emit_select_columns(self, result, cols, indent, first_on_select_line=True):
+        """将 SELECT 列列表输出到 result，正确处理 CASE 块和子查询。
+
+        Args:
+            result: 输出行列表
+            cols: _collect_indented_cols 返回的列字符串列表
+            indent: 基础缩进
+            first_on_select_line: 首列是否已输出在 SELECT 行（True=standalone SELECT，
+                False=SELECT DISTINCT 等 SELECT 后面已有内容）
+        """
+        comma_prefix = ' ' * (indent + 5)
+
+        if not cols:
+            return
+
+        # 处理第一列
+        first_lines = self._format_column_with_case(cols[0])
+        if first_lines and re.match(r'^[CWE]\d+\s', first_lines[0]):
+            if first_on_select_line:
+                result.append(f"{' ' * indent}SELECT")
+            self._append_case_inner_lines(result, first_lines, indent)
+        elif first_lines and first_lines[0].startswith('S '):
+            subquery_str = re.sub(r'^S\s+', '', first_lines[0])
+            if first_on_select_line:
+                self._append_subquery_col(result, subquery_str, ' ' * indent, indent)
+            else:
+                self._append_subquery_col(result, subquery_str, comma_prefix, indent)
+        else:
+            if first_on_select_line:
+                result.append(f"{' ' * indent}SELECT {first_lines[0]}")
+            else:
+                result.append(f"{comma_prefix} {first_lines[0]}")
+            if len(first_lines) > 1:
+                self._append_case_inner_lines(result, first_lines[1:], indent)
+
+        # 后续列：leading comma
+        for c in cols[1:]:
+            col_lines = self._format_column_with_case(c)
+            if col_lines and len(col_lines) == 1 and col_lines[0].startswith('S '):
+                subquery_str = re.sub(r'^S\s+', '', col_lines[0])
+                self._append_subquery_col(result, subquery_str, comma_prefix, indent)
+            elif len(col_lines) == 1:
+                result.append(f"{comma_prefix}, {col_lines[0]}")
+            else:
+                if col_lines and re.match(r'^[CWE]\d+\s', col_lines[0]):
+                    case_content = re.sub(r'^[CWE]\d+\s+', '', col_lines[0])
+                    result.append(f"{comma_prefix}, {case_content}")
+                    self._append_case_inner_lines(result, col_lines[1:], indent)
+                else:
+                    result.append(f"{comma_prefix}, {col_lines[0]}")
+                    self._append_case_inner_lines(result, col_lines[1:], indent)
 
     def _collect_indented_cols(self, lines, start_i, parent_indent):
         """收集缩进的列行，直到遇到同级或更低级的子句关键字或闭括号。
@@ -1151,6 +1207,283 @@ class SQLFormatterV5:
         """移除表别名中的 AS 关键字（V4 风格），只合并多余空格"""
         return re.sub(r'\s+AS\b\s+', ' ', line, flags=re.IGNORECASE)
 
+    def _extract_partitioned_by(self, sql: str) -> tuple:
+        """提取 PARTITIONED BY 子句的原始列定义信息。
+
+        sqlglot 会将分区列合并到主列定义并丢失原始类型和注释。
+        本方法在 sqlglot 处理前提取原始信息，供后处理恢复。
+
+        Returns:
+            (sql, partition_info) — partition_info 为 list[(name, type, comment)] 或 None
+        """
+        m = re.search(r'\bPARTITIONED\s+BY\s*\(', sql, re.IGNORECASE)
+        if not m:
+            return sql, None
+
+        paren_start = m.end() - 1
+        paren_end = self._find_matching_paren_str(sql, paren_start)
+        if paren_end == -1:
+            return sql, None
+
+        content = sql[paren_start + 1:paren_end].strip()
+        if not content:
+            return sql, None
+
+        # 用引号感知的分割方法
+        cols = self._split_set_columns(content)
+        partition_info = []
+        for col in cols:
+            col = col.strip()
+            p = self._parse_col_def(col)
+            if p:
+                partition_info.append(p)
+
+        return sql, partition_info if partition_info else None
+
+    def _restore_partitioned_by(self, text: str, partition_info: list) -> str:
+        """恢复 PARTITIONED BY 子句的原始内联定义，并从主列中移除分区列。
+
+        partition_info: [(name, type, comment), ...] — 预处理时提取的原始分区列定义
+        """
+        partition_names = {p[0].upper() for p in partition_info}
+
+        # 找到主列定义的 ( ... ) 块
+        create_match = re.search(r'\bCREATE\s+TABLE\b', text, re.IGNORECASE)
+        if not create_match:
+            return text
+
+        # 找到主列 ( 的位置
+        rest = text[create_match.start():]
+        paren_start_rel = rest.index('(')
+        paren_start = create_match.start() + paren_start_rel
+        paren_end = self._find_matching_paren_str(text, paren_start)
+        if paren_end == -1:
+            return text
+
+        # 解析主列内容，移除分区列
+        col_content = text[paren_start + 1:paren_end]
+        col_lines = col_content.split('\n')
+        kept_lines = []
+        for cl in col_lines:
+            cl_stripped = cl.strip()
+            if not cl_stripped:
+                kept_lines.append(cl)
+                continue
+            # 去掉前导逗号
+            col_def = cl_stripped.lstrip(', ').strip()
+            p = self._parse_col_def(col_def)
+            if p and p[0].upper() in partition_names:
+                continue  # 跳过分区列
+            kept_lines.append(cl)
+
+        # 重建主列内容（去掉尾部空行）
+        while kept_lines and not kept_lines[-1].strip():
+            kept_lines.pop()
+
+        new_col_content = '\n'.join(kept_lines)
+        before = text[:paren_start + 1]
+        after_paren = text[paren_end + 1:]
+
+        # 找到 PARTITIONED BY 并替换
+        part_match = re.search(r'\n\s*PARTITIONED\s+BY\s*\([^)]*\)', after_paren, re.IGNORECASE | re.DOTALL)
+        if not part_match:
+            return before + new_col_content + ')' + after_paren
+
+        # 构建对齐的 PARTITIONED BY
+        max_name = max(len(p[0]) for p in partition_info)
+        max_type = max(len(p[1]) for p in partition_info if p[1])
+
+        part_lines = []
+        indent = len(text[:paren_start]) - len(text[:paren_start].lstrip())
+        inner_indent = indent + 4
+        comma_prefix = ' ' * (indent + 2)
+        for j, (name, typ, suffix) in enumerate(partition_info):
+            name_pad = name.ljust(max_name)
+            parts = name_pad
+            if typ:
+                parts += f"  {typ.ljust(max_type)}"
+            if suffix:
+                parts += f"  {suffix}"
+            if j == 0:
+                part_lines.append(f"{' ' * inner_indent}{parts}")
+            else:
+                part_lines.append(f"{comma_prefix}, {parts}")
+
+        new_part = '\n' + ' ' * indent + 'PARTITIONED BY (\n' + '\n'.join(part_lines) + '\n' + ' ' * indent + ')'
+        new_after = after_paren[:part_match.start()] + new_part + after_paren[part_match.end():]
+
+        # 主列的 ) 独立一行，与 CREATE TABLE 缩进对齐
+        base_indent = len(text[:create_match.start()]) - len(text[:create_match.start()].lstrip())
+        return before + new_col_content + '\n' + ' ' * base_indent + ')' + new_after
+
+    def _align_create_table_columns(self, text: str) -> str:
+        """对齐 CREATE TABLE 列定义：列名、类型、COMMENT 上下对齐。"""
+        # Short-circuit: no CREATE TABLE in text
+        if 'CREATE TABLE' not in text.upper():
+            return text
+
+        lines = text.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].strip()
+            upper = stripped.upper()
+
+            if upper.startswith('CREATE TABLE') and '(' in stripped and stripped.endswith('('):
+                block_lines = [lines[i]]
+                i += 1
+                paren_depth = 1
+                while i < len(lines) and paren_depth > 0:
+                    o, c = self._count_parens(lines[i])
+                    paren_depth += o - c
+                    block_lines.append(lines[i])
+                    i += 1
+                aligned = self._align_col_block(block_lines)
+                result.extend(aligned)
+                continue
+
+            # 单行 CREATE TABLE (... ) 格式
+            if upper.startswith('CREATE TABLE') and '(' in stripped and not stripped.endswith('('):
+                paren_start = stripped.index('(')
+                before_paren = stripped[:paren_start].rstrip()
+                last_word = before_paren.split()[-1].upper() if before_paren.split() else ''
+                skip_keywords = {'PARTITION', 'PARTITIONED', 'TBLPROPERTIES', 'BY'}
+                if last_word not in skip_keywords:
+                    paren_end = self._find_matching_paren_str(stripped, paren_start)
+                    if paren_end > paren_start:
+                        cols = self._split_set_columns(stripped[paren_start + 1:paren_end])
+                        if len(cols) >= 2:
+                            aligned = self._align_col_block(lines[i:i + 1], force_single_line=stripped)
+                            result.extend(aligned)
+                            i += 1
+                            continue
+
+            result.append(lines[i])
+            i += 1
+
+        return '\n'.join(result)
+
+    def _align_col_block(self, block_lines: list, force_single_line: str = None) -> list:
+        """对齐一个 CREATE TABLE 列定义块。
+
+        Args:
+            block_lines: 包含 CREATE TABLE 行到 ) 行的所有行
+            force_single_line: 如果提供，从该单行中提取列定义
+        """
+        if force_single_line:
+            stripped = force_single_line.strip()
+            indent = force_single_line[:len(force_single_line) - len(force_single_line.lstrip())]
+            paren_start = stripped.index('(')
+            paren_end = self._find_matching_paren_str(stripped, paren_start)
+            if paren_end == -1:
+                return block_lines
+
+            cols = self._split_set_columns(stripped[paren_start + 1:paren_end])
+            if not cols:
+                return block_lines
+
+            parsed = [p for col in cols if (p := self._parse_col_def(col.strip()))]
+            if len(parsed) < 2:
+                return block_lines
+
+            header_lines = [f'{indent}{stripped[:paren_start]}', f'{indent}(']
+            footer_lines = [f'{indent}){stripped[paren_end + 1:].strip()}']
+            return self._format_aligned_cols(parsed, header_lines, footer_lines, len(indent))
+
+        # 多行格式 — 解析列定义行
+        parsed = []
+        header_line = None
+        footer_lines = []
+        in_cols = False
+
+        for bl in block_lines:
+            s = bl.strip()
+            if s.upper().startswith('CREATE TABLE'):
+                header_line = bl
+                in_cols = True
+                continue
+            if s.startswith(')'):
+                footer_lines.append(bl)
+                in_cols = False
+                continue
+            if not in_cols or not s:
+                if not in_cols:
+                    footer_lines.append(bl)
+                continue
+            col_def = s.lstrip(', ').strip() if s.startswith(',') else s.strip()
+            p = self._parse_col_def(col_def)
+            if p:
+                parsed.append(p)
+            else:
+                footer_lines.append(bl)
+
+        if len(parsed) < 2:
+            return block_lines
+
+        indent = len(block_lines[0]) - len(block_lines[0].lstrip()) if block_lines[0].strip() else 0
+        header_lines = [header_line] if header_line else []
+        return self._format_aligned_cols(parsed, header_lines, footer_lines, indent)
+
+    @staticmethod
+    def _format_aligned_cols(parsed: list, header_lines: list, footer_lines: list, indent: int) -> list:
+        """格式化对齐后的列定义行。
+
+        parsed: [(name, type, suffix), ...]
+        header_lines: CREATE TABLE 行等前缀行
+        footer_lines: ) 及后续行
+        indent: 基础缩进空格数
+        """
+        max_name = max(len(p[0]) for p in parsed)
+        max_type = max(len(p[1]) for p in parsed if p[1])
+        comma_prefix = ' ' * (indent + 2)
+
+        result = list(header_lines)
+        for j, (name, typ, suffix) in enumerate(parsed):
+            parts = name.ljust(max_name)
+            if typ:
+                parts += f"  {typ.ljust(max_type)}"
+            if suffix:
+                parts += f"  {suffix}"
+            if j == 0:
+                result.append(f"{comma_prefix}  {parts}")
+            else:
+                result.append(f"{comma_prefix}, {parts}")
+        result.extend(footer_lines)
+        return result
+
+    @staticmethod
+    def _parse_col_def(col_def: str):
+        """解析单个列定义，返回 (name, type, suffix) 或 None。
+
+        支持格式：
+        - ACTIONTYPE VARCHAR(1) COMMENT '操作类型'
+        - BUOCMONTH DECIMAL(6, 0) COMMENT '报告期'
+        - DATA_DT STRING
+        - col1 INT
+        """
+        col_def = col_def.strip()
+        if not col_def:
+            return None
+
+        # 匹配：列名 + 类型(可选括号参数) + 后缀(COMMENT等)
+        m = re.match(
+            r'(\w+)\s+(\w+(?:\s*\([^)]*\))?)\s*(.*)',
+            col_def,
+            re.IGNORECASE | re.DOTALL
+        )
+        if m:
+            name = m.group(1)
+            typ = m.group(2)
+            suffix = m.group(3).strip()
+            return (name, typ, suffix)
+
+        # 只有列名（无类型）
+        m2 = re.match(r'(\w+)\s*$', col_def)
+        if m2:
+            return (m2.group(1), '', '')
+
+        return None
+
     @staticmethod
     def _cleanup_empty_lines(text):
         """清理多余空行，最多保留一个连续空行"""
@@ -1168,152 +1501,107 @@ class SQLFormatterV5:
         return '\n'.join(cleaned)
 
     @staticmethod
-    def _align_create_table_columns(text: str) -> str:
-        """对齐 CREATE TABLE 语句中的列定义：列名、类型、COMMENT。
+    def _preserve_standalone_comments(sql, start_counter=0):
+        """预处理：将被注释掉的SQL代码行（-- WHEN ... THEN ...）转为 /* __STANDALONE_N__ */
+        占位符附在 THEN 值后。sqlglot 会保留 THEN 值后的 /* */ 注释。
 
-        两遍扫描：
-        1. 找到列定义区域，解析每列的（列名, 类型, 后缀）
-        2. 按最大宽度填充空格，使列名和 COMMENT 关键字上下对齐
+        Args:
+            sql: 原始SQL文本
+            start_counter: 起始计数器（避免多语句间占位符名冲突）
+
+        Returns:
+            (cleaned_sql, comment_map, next_counter)
         """
-        lines = text.split('\n')
-        result = []
-        i = 0
+        lines = sql.split('\n')
+        comment_map = {}
+        counter = start_counter
+        result_lines = []
+        last_content_idx = -1
+        # 延迟附着：orig_line_idx -> [placeholder, ...]
+        deferred = {}
 
-        while i < len(lines):
-            line = lines[i]
+        def _insert_before_comment(text, placeholder):
+            """在 text 的 -- 行注释之前插入 /* placeholder */ """
+            in_str = False
+            for k in range(len(text) - 1):
+                if text[k] == "'" and (k == 0 or text[k - 1] != '\\'):
+                    in_str = not in_str
+                elif text[k:k + 2] == '--' and not in_str:
+                    return f'{text[:k].rstrip()} /* {placeholder} */ {text[k:]}'
+            return f'{text} /* {placeholder} */'
+
+        for i, line in enumerate(lines):
             stripped = line.strip()
-            upper = stripped.upper()
+            is_standalone = (stripped.startswith('--')
+                    and re.match(
+                        r'^--\s*(WHEN|CASE|SELECT|THEN|ELSE|END|AND|OR|FROM|WHERE)\b',
+                        stripped, re.IGNORECASE))
 
-            # 检测 CREATE TABLE 行
-            if not (upper.startswith('CREATE TABLE') or upper.startswith('CREATE EXTERNAL TABLE')):
-                result.append(line)
-                i += 1
-                continue
+            if is_standalone:
+                placeholder = f'{SQLFormatterV5._STANDALONE_PREFIX}{counter}__'
+                comment_map[placeholder] = stripped
+                counter += 1
 
-            # 收集 CREATE TABLE 行到闭括号的所有行
-            create_block = [line]
-            j = i + 1
-            paren_depth = 0
-            # 计算 CREATE TABLE 行中的括号深度
-            for ch in stripped:
-                if ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
+                if last_content_idx >= 0:
+                    prev_stripped = result_lines[last_content_idx].strip()
+                    attached = False
+                    # 裸 CASE（无 THEN）后 sqlglot 会移走 /* */，需延迟附着到前方 THEN 行
+                    if (re.match(r'^CASE\b', prev_stripped, re.IGNORECASE)
+                            and not re.search(r'\bTHEN\b', prev_stripped, re.IGNORECASE)):
+                        for j in range(i + 1, len(lines)):
+                            ns = lines[j].strip()
+                            if not ns or ns.startswith('--'):
+                                continue
+                            if re.match(r'^END\b', ns, re.IGNORECASE):
+                                break
+                            if re.search(r'\bTHEN\b', ns, re.IGNORECASE):
+                                deferred.setdefault(j, []).append(placeholder)
+                                attached = True
+                                break
+                    if not attached:
+                        result_lines[last_content_idx] = _insert_before_comment(
+                            result_lines[last_content_idx], placeholder)
+            else:
+                # 检查此行是否有延迟附着的占位符
+                if i in deferred:
+                    for ph in deferred[i]:
+                        line = _insert_before_comment(line, ph)
 
-            while j < len(lines) and paren_depth > 0:
-                create_block.append(lines[j])
-                for ch in lines[j]:
-                    if ch == '(':
-                        paren_depth += 1
-                    elif ch == ')':
-                        paren_depth -= 1
-                j += 1
+                result_lines.append(line)
+                if stripped and not stripped.startswith('--'):
+                    last_content_idx = len(result_lines) - 1
 
-            # 收集闭括号后的内容（COMMENT, PARTITIONED BY 等）
-            while j < len(lines):
-                s = lines[j].strip()
-                if not s or s.upper().startswith('CREATE') or s.upper().startswith('INSERT') or s.upper().startswith('ALTER') or s.upper().startswith('DROP') or s.upper().startswith('SELECT'):
-                    break
-                create_block.append(lines[j])
-                j += 1
-
-            # 对齐列定义
-            aligned_block = SQLFormatterV5._align_col_block(create_block)
-            result.extend(aligned_block)
-            i = j
-
-        return '\n'.join(result)
+        return '\n'.join(result_lines), comment_map, counter
 
     @staticmethod
-    def _align_col_block(block_lines):
-        """对单个 CREATE TABLE 块中的列行做对齐。
+    def _restore_standalone_placeholders(text, comment_map):
+        """后处理：将 /* __STANDALONE_N__ */ 占位符替换为原始注释，拆到独立行。"""
+        if not comment_map:
+            return text
 
-        统一所有列行的缩进格式，按最大列名和类型宽度填充空格。
-        所有列行统一缩进为 leading comma 位置对齐。
-        """
-        # 找到 ( 所在行：支持 CREATE TABLE ... ( 和 CREATE TABLE ... \n ( 两种格式
-        paren_line_idx = None
-        for idx, line in enumerate(block_lines):
-            if '(' in line and 'CREATE TABLE' in line.upper():
-                paren_line_idx = idx
-                break
-            # ( 在独立行（上一行是 CREATE TABLE）
-            if line.strip() == '(' and idx > 0 and 'CREATE TABLE' in block_lines[idx - 1].upper():
-                paren_line_idx = idx
-                break
+        lines = text.split('\n')
+        result = []
 
-        if paren_line_idx is None:
-            return block_lines
+        for line in lines:
+            clean = line
+            originals = []
+            for placeholder, original in comment_map.items():
+                marker = f'/* {placeholder} */'
+                if marker in clean:
+                    clean = clean.replace(marker, '')
+                    originals.append(original)
 
-        # 从现有行推断缩进（取第一个列行的前导空格数，去掉 leading comma 后）
-        # 如果首列无逗号，后续列有逗号，统一用后续列的缩进
-        base_indent = ''
-        for idx in range(paren_line_idx + 1, len(block_lines)):
-            s = block_lines[idx]
-            if not s.strip() or s.strip().startswith(')'):
-                continue
-            # 有 leading comma 的行：取逗号前的空格作为 base_indent
-            stripped_s = s.strip()
-            if stripped_s.startswith(','):
-                base_indent = s[:s.index(',')]
-                break
-            # 首列（无逗号）：取内容前的空格 - 2（因为首列额外有 2 空格替代 ", "）
-            content_start = len(s) - len(s.lstrip())
-            if content_start >= 2:
-                base_indent = ' ' * (content_start - 2)
-            break
-
-        # 解析列定义
-        col_data = []  # [(block_idx, col_name, col_type, rest)]
-        for idx in range(paren_line_idx + 1, len(block_lines)):
-            s = block_lines[idx].strip()
-            if not s or s.startswith(')'):
-                break
-
-            # 去掉 leading comma 和多余空格
-            content = s.lstrip(', ').strip()
-            parts = content.split()
-            if len(parts) < 2:
-                continue
-
-            col_name = parts[0]
-            rest_after_name = content[len(col_name):].strip()
-
-            # 提取类型（含括号参数，如 VARCHAR(10)、DECIMAL(22, 2)）
-            type_match = re.match(r"(\w+(?:\s*\([^)]*\))?)\s*(.*)", rest_after_name)
-            if type_match:
-                col_type = type_match.group(1)
-                after_type = type_match.group(2)
+            if originals:
+                indent = line[:len(line) - len(line.lstrip())]
+                clean = clean.rstrip()
+                if clean.strip():
+                    result.append(clean)
+                for original in originals:
+                    result.append(indent + original)
             else:
-                col_type = rest_after_name
-                after_type = ''
+                result.append(line)
 
-            col_data.append((idx, col_name, col_type, after_type))
-
-        if not col_data:
-            return block_lines
-
-        # 计算最大宽度
-        max_name = max(len(d[1]) for d in col_data)
-        max_type = max(len(d[2]) for d in col_data if d[2])
-
-        # 统一缩进重建列行
-        result = list(block_lines)
-
-        for k, (idx, col_name, col_type, rest) in enumerate(col_data):
-            if col_type:
-                aligned = f"{col_name:<{max_name}} {col_type:<{max_type}} {rest}".rstrip()
-            else:
-                aligned = col_name
-
-            if k == 0:
-                # 首列：无逗号，补 2 空格对齐到后续列的 ", " 位置
-                result[idx] = f"{base_indent}  {aligned}"
-            else:
-                result[idx] = f"{base_indent}, {aligned}"
-
-        return result
+        return '\n'.join(result)
 
     @staticmethod
     def _split_merged_comment_lines(text):
@@ -1347,18 +1635,73 @@ class SQLFormatterV5:
                 result.append(line)
         return '\n'.join(result)
 
-    def _split_in_clause_comments(self, text):
+    @staticmethod
+    def _split_in_values_with_comments(in_content, comment_map=None):
+        """将 IN 子句内容按值拆分，正确处理值和注释的关联。
+
+        支持两种注释格式：
+        - /* __INLINE_N__ */ 占位符（来自预处理，comment_map 不为空时使用）
+        - --comment 行注释（已恢复的格式，comment_map 为空时使用）
+
+        输出示例：["'AAA'", "'BBB' --comment1", "'CCC' --comment2"]
+        """
+        parts = []
+        i = 0
+        n = len(in_content)
+        while i < n:
+            # 跳过逗号和空白
+            while i < n and in_content[i] in (' ', ',', '\t'):
+                i += 1
+            if i >= n:
+                break
+            # 期望一个字符串值 'xxx'
+            if in_content[i] != "'":
+                i += 1
+                continue
+            # 找到字符串结束
+            j = i + 1
+            while j < n and in_content[j] != "'":
+                j += 1
+            if j >= n:
+                break
+            value = in_content[i:j + 1]  # 包含引号
+            i = j + 1
+            # 跳过逗号和空白（逗号可能在值和注释之间，如 'val', /* comment */）
+            while i < n and in_content[i] in (' ', ',', '\t'):
+                i += 1
+            # 检查注释：先检查 /* __INLINE_N__ */ 占位符
+            comment = ''
+            if comment_map and in_content[i:i + 2] == '/*':
+                end_star = in_content.find('*/', i + 2)
+                if end_star != -1:
+                    placeholder_text = in_content[i + 2:end_star].strip()
+                    if placeholder_text.startswith('__INLINE_') and placeholder_text.endswith('__'):
+                        # 找到占位符，替换为原始注释
+                        comment = comment_map.get(placeholder_text, '')
+                        i = end_star + 2
+            # 如果没有 /* */ 占位符，检查 --comment
+            if not comment and i < n and in_content[i:i + 2] == '--':
+                k = i + 2
+                # 注释持续到下一个 ' 开头（下一个值的开始）或到结尾
+                while k < n and in_content[k] != "'":
+                    k += 1
+                comment = in_content[i:k].rstrip()
+                i = k
+            if comment:
+                parts.append(f"{value} {comment}")
+            else:
+                parts.append(value)
+        return parts
+
+    def _split_in_clause_comments(self, text, comment_map=None):
         """拆分 IN 子句中被sqlglot合并的注释值。
 
-        sqlglot会将多行的 IN ('val1' --注释1, 'val2' --注释2) 合并到一行，
-        或者去掉逗号变成 IN ('val1' --注释1 'val2' --注释2)。
-        本方法将其拆分为每个值+注释独立一行，使用 leading comma 风格。
+        处理两种情况：
+        1. /* __INLINE_N__ */ 占位符（CASE WHEN 中被折叠到一行的 IN 子句）
+        2. --comment 行注释（简单 WHERE IN 子句）
 
-        例：
-            AND col IN ('1070' --港澳 '1080' --台湾)
-        →
-            AND col IN ('1070' --港澳
-                       ,'1080' --台湾)
+        两种情况都拆分为每个值+注释独立一行，使用 leading comma 风格。
+        对于占位符情况，同时将 /* __INLINE_N__ */ 替换为 --原始注释。
         """
         lines = text.split('\n')
         result = []
@@ -1382,27 +1725,19 @@ class SQLFormatterV5:
             in_content = stripped[paren_start + 1:paren_end].strip()
             after_paren = stripped[paren_end + 1:].strip()
 
-            # 检查 IN 内容中是否有多处注释
-            in_comments = [m.start() for m in re.finditer(r'--', in_content)]
-            if len(in_comments) < 2:
+            # 检查是否需要拆分：/* __INLINE_ */ 占位符 或 多处 -- 注释
+            has_inline_placeholders = (
+                comment_map
+                and re.search(r'/\*\s*__INLINE_\d+__\s*\*/', in_content)
+            )
+            dash_comment_count = len(re.findall(r'--', in_content))
+
+            if not has_inline_placeholders and dash_comment_count < 2:
                 result.append(line)
                 continue
 
-            # 拆分策略1：按逗号拆分（如果逗号存在）
-            parts = self._split_set_columns(in_content)
-            if len(parts) > 1 and all('--' in p for p in parts):
-                # 逗号拆分成功
-                pass
-            else:
-                # 拆分策略2：按 'value' --comment 模式拆分
-                # 匹配 'xxx' --yyy 模式
-                parts = re.findall(r"('[^']*'(?:\s*,?\s*)?)\s*(--.*?)\s*(?='|$)", in_content)
-                if not parts or len(parts) < 2:
-                    result.append(line)
-                    continue
-                # 重新组合为完整的 parts（value + comment）
-                parts = [f"{val.rstrip(', ')} {comment}" for val, comment in parts]
-
+            # 拆分策略：按 'value' 模式逐个提取，每个值后可选跟注释
+            parts = self._split_in_values_with_comments(in_content, comment_map)
             if len(parts) < 2:
                 result.append(line)
                 continue
@@ -1426,7 +1761,7 @@ class SQLFormatterV5:
                 result.append(f'{indent}{prefix}{output_parts[0]}')
                 for op in output_parts[1:]:
                     result.append(f'{indent}{value_indent}{op}')
-                paren_align = ' ' * (len(indent) + paren_start)
+                paren_align = ' ' * paren_start
                 if after_paren:
                     result.append(f'{indent}{paren_align}){after_paren}')
                 else:
@@ -1916,283 +2251,6 @@ class SQLFormatterV5:
                 else:
                     self._append_w_line(result, stripped, base_case + 4)
 
-    def _extract_partitioned_by(self, sql: str) -> tuple:
-        """提取 CREATE TABLE 语句中的 PARTITIONED BY 原始信息。
-
-        sqlglot 会将 PARTITIONED BY 的列合并到主列定义中，并丢失类型和注释。
-        预处理时提取完整信息，格式化后恢复。
-
-        Returns:
-            (processed_sql, partitioned_by_info) 或 (sql, None)
-        """
-        # 跳过开头的注释行
-        check_sql = sql.strip()
-        while check_sql.startswith('--'):
-            nl = check_sql.find('\n')
-            if nl == -1:
-                return sql, None
-            check_sql = check_sql[nl + 1:].strip()
-
-        upper = check_sql.upper()
-        if not upper.startswith('CREATE TABLE'):
-            return sql, None
-
-        # 查找 PARTITIONED BY 关键字（在最后的 ) 之后）
-        pb_match = re.search(r'\)\s*COMMENT\s', sql, re.IGNORECASE)
-        if not pb_match:
-            # 没有 COMMENT，试试直接找 PARTITIONED BY
-            pb_match = re.search(r'\)\s*\n\s*PARTITIONED\s+BY', sql, re.IGNORECASE)
-            if not pb_match:
-                return sql, None
-
-        # 查找 PARTITIONED BY
-        pb_keyword_match = re.search(r'PARTITIONED\s+BY\s*\(', sql, re.IGNORECASE)
-        if not pb_keyword_match:
-            return sql, None
-
-        pb_start = pb_keyword_match.start()
-
-        # 提取 PARTITIONED BY 括号内的完整内容（支持嵌套括号）
-        paren_start = pb_keyword_match.end() - 1
-        depth = 0
-        i = paren_start
-        while i < len(sql):
-            if sql[i] == '(':
-                depth += 1
-            elif sql[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-
-        pb_content = sql[pb_keyword_match.end():i]  # 括号内的内容
-        pb_full = sql[pb_start:i + 1]  # 完整的 PARTITIONED BY (...)
-
-        # 提取分区列名列表（引号感知的分割，避免 COMMENT '...' 中的逗号）
-        partition_cols = []
-        current_col = []
-        in_string = False
-        string_char = None
-        for ch in pb_content:
-            if in_string:
-                current_col.append(ch)
-                if ch == string_char:
-                    in_string = False
-            elif ch in ("'", '"'):
-                in_string = True
-                string_char = ch
-                current_col.append(ch)
-            elif ch == ',':
-                col_def = ''.join(current_col).strip()
-                if col_def:
-                    col_name = col_def.split()[0].strip()
-                    partition_cols.append(col_name)
-                current_col = []
-            else:
-                current_col.append(ch)
-        # 最后一列
-        col_def = ''.join(current_col).strip()
-        if col_def:
-            col_name = col_def.split()[0].strip()
-            partition_cols.append(col_name)
-
-        # 将 PARTITIONED BY 子句替换为占位符
-        processed = sql[:pb_start] + sql[i + 1:]
-
-        info = {
-            'full_clause': pb_full.strip(),
-            'columns': partition_cols,
-            'content': pb_content.strip(),
-        }
-
-        return processed, info
-
-    def _restore_partitioned_by(self, fmt: str, info: dict) -> str:
-        """恢复 PARTITIONED BY：移除主列中的分区列，替换为原始 PARTITIONED BY 子句。
-
-        Args:
-            fmt: 格式化后的 SQL
-            info: _extract_partitioned_by 提取的信息
-        """
-        partition_cols = [c.upper() for c in info['columns']]
-
-        lines = fmt.split('\n')
-        result_lines = []
-        in_create_cols = False  # 是否在主列定义区域内
-        close_paren_pos = None  # 主列 ) 的位置
-
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            stripped_upper = stripped.upper()
-
-            # 检测 CREATE TABLE 行（开始主列定义）
-            if 'CREATE TABLE' in stripped_upper:
-                in_create_cols = True
-                result_lines.append(line)
-                # 如果行内有 (，主列定义已开始
-                continue
-
-            if in_create_cols:
-                # 主列定义结束标记：行首只有 )（不带 PARTITIONED 等关键字）
-                if stripped == ')' or (stripped.startswith(')') and 'PARTITIONED' not in stripped_upper and 'COMMENT' not in stripped_upper):
-                    in_create_cols = False
-                    close_paren_pos = len(result_lines)
-                    result_lines.append(line)
-                    continue
-
-                # 检测主列中的分区列行，跳过
-                is_partition_col = False
-                for col_name in partition_cols:
-                    # 匹配 leading comma + 列名 + 类型
-                    col_pattern = r'^,?\s*' + re.escape(col_name) + r'\s+(STRING|INT|VARCHAR|DECIMAL|BIGINT|DOUBLE|FLOAT|DATE|TIMESTAMP|BOOLEAN)'
-                    if re.match(col_pattern, stripped, re.IGNORECASE):
-                        is_partition_col = True
-                        break
-
-                if is_partition_col:
-                    continue  # 跳过分区列
-
-            result_lines.append(line)
-
-        # 替换或插入 PARTITIONED BY
-        if close_paren_pos is not None and info['full_clause']:
-            # 格式化 PARTITIONED BY 内容（引号感知分割，避免 COMMENT '...' 中的逗号被误拆）
-            pb_cols = self._split_set_columns(info['content'])
-            pb_lines = ['PARTITIONED BY (']
-            for j, col in enumerate(pb_cols):
-                col = col.strip()
-                if j == 0:
-                    pb_lines.append('    ' + col)
-                else:
-                    pb_lines.append('    , ' + col)
-            pb_lines.append(')')
-
-            current = '\n'.join(result_lines)
-
-            if 'PARTITIONED BY' in current.upper():
-                # 替换已有的 PARTITIONED BY 为带类型的版本
-                new_result = []
-                skip = False
-                for rl in result_lines:
-                    if re.match(r'\s*PARTITIONED\s+BY\s*\(', rl, re.IGNORECASE):
-                        new_result.extend(pb_lines)
-                        skip = True
-                        continue
-                    if skip:
-                        if re.match(r'\s*\)', rl):
-                            skip = False
-                        continue
-                    new_result.append(rl)
-                return '\n'.join(new_result)
-            else:
-                # 插入新的 PARTITIONED BY
-                insert_idx = close_paren_pos + 1
-                for k, pb_line in enumerate(pb_lines):
-                    result_lines.insert(insert_idx + k, pb_line)
-
-        return '\n'.join(result_lines)
-
-    # 需要预处理的注释模式：被注释掉的 SQL 代码（sqlglot 会丢失）
-    _COMMENT_SQL_PATTERN = re.compile(
-        r'^--\s*(WHEN|THEN|ELSE|CASE|END|AND|OR|SELECT|FROM|WHERE|GROUP|ORDER|HAVING|JOIN|LEFT|RIGHT|INNER|ON|SET|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b',
-        re.IGNORECASE
-    )
-
-    def _preserve_standalone_comments(self, sql: str) -> tuple:
-        """预处理：移除看起来像 SQL 代码的注释行，格式化后重新插入。
-
-        只移除 --WHEN、--CASE、--SELECT 等看起来像被注释掉的 SQL 代码的行。
-        普通注释（如 --说明文字、--20240729修改）由 sqlglot 自行处理，不移除。
-
-        Returns:
-            (processed_sql, comment_infos) — comment_infos 用于后处理恢复
-        """
-        comment_infos = []
-        lines = sql.split('\n')
-        result_lines = []
-        pending_comments = []
-
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('--') and self._COMMENT_SQL_PATTERN.match(stripped):
-                # 被注释掉的 SQL 代码 → 移除并记录
-                pending_comments.append(stripped)
-            else:
-                for c in pending_comments:
-                    comment_infos.append({
-                        'comment': c,
-                        'anchor_next': stripped,
-                    })
-                pending_comments = []
-                result_lines.append(line)
-
-        for c in pending_comments:
-            comment_infos.append({
-                'comment': c,
-                'anchor_next': '',
-            })
-
-        return '\n'.join(result_lines), comment_infos
-
-    def _restore_preserved_comments(self, text: str, comment_infos: list) -> str:
-        """恢复被移除的注释行：按锚点在锚点行之前重新插入。
-
-        Args:
-            text: 格式化后的 SQL（已完成所有后处理）
-            comment_infos: _preserve_standalone_comments 记录的注释信息
-        """
-        if not comment_infos:
-            return text
-
-        lines = text.split('\n')
-
-        # 按锚点分组，同一锚点的注释按原始顺序排列
-        from collections import OrderedDict
-        groups = OrderedDict()
-        for info in comment_infos:
-            key = info['anchor_next']
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(info['comment'])
-
-        # 对每组注释，找到锚点行并在其之前插入
-        for anchor_next, comments in groups.items():
-            if not anchor_next:
-                # 没有锚点（文件末尾的注释），追加到末尾
-                for c in comments:
-                    lines.append(c)
-                continue
-
-            # 提取锚点中的标识符和引号值做匹配（容忍格式化导致的空白差异）
-            tokens = re.findall(r"[a-zA-Z_]\w*|'[^']*'", anchor_next)
-            # 过滤太短的词和常见关键字，保留有区分度的 token
-            skip = {'WHEN', 'THEN', 'ELSE', 'AND', 'OR', 'CASE', 'END', 'AS', 'ON',
-                    'IN', 'NOT', 'IS', 'BY', 'TO', 'FROM', 'WHERE', 'SELECT', 'A', 'B'}
-            search_tokens = [t.upper() for t in tokens if t.upper() not in skip and len(t) > 1]
-
-            # 用第一个有区分度的 token 定位行
-            if search_tokens:
-                search_key = search_tokens[0]
-            else:
-                # 无区分度 token，用锚点第一个词
-                words = anchor_next.split()
-                search_key = words[0].upper() if words else ''
-
-            insert_idx = -1
-            for i, line in enumerate(lines):
-                if search_key in line.strip().upper():
-                    insert_idx = i
-                    break
-
-            if insert_idx >= 0:
-                # 在锚点行之前插入注释（保持缩进）
-                base_indent = lines[insert_idx][:len(lines[insert_idx]) - len(lines[insert_idx].lstrip())]
-                for c in reversed(comments):
-                    lines.insert(insert_idx, f'{base_indent}{c}')
-            # 找不到锚点则注释丢失
-
-        return '\n'.join(lines)
-
     def _preprocess_in_clause_comments(self, sql: str) -> tuple:
         """预处理 IN 子句中紧跟在值后面的 -- 注释。
 
@@ -2330,6 +2388,9 @@ class SQLFormatterV5:
         _convert_block_comments_to_line_comments 会将 /*__INLINE_N__*/ 转为 --__INLINE_N__。
         本方法将其恢复为原始的 --comment 内容。
 
+        关键：替换为 --comment 后，如果行内还有后续内容（如另一个值），
+        必须在注释后插入换行，否则 -- 会把后续内容变成注释。
+
         Args:
             text: 格式化后的 SQL
             comment_map: 预处理时生成的映射 {placeholder: original_comment}
@@ -2339,11 +2400,30 @@ class SQLFormatterV5:
 
         for placeholder, original_comment in comment_map.items():
             # _convert_block_comments_to_line_comments 会输出 --__INLINE_N__
-            text = text.replace(f'--{placeholder}', original_comment)
+            text = self._safe_replace_inline_comment(text, f'--{placeholder}', original_comment)
             # 也可能保留为 /* */ 格式（sqlglot 可能加空格：/* __INLINE_N__ */）
-            text = text.replace(f'/* {placeholder} */', original_comment)
-            text = text.replace(f'/*{placeholder}*/', original_comment)
+            text = self._safe_replace_inline_comment(text, f'/* {placeholder} */', original_comment)
+            text = self._safe_replace_inline_comment(text, f'/*{placeholder}*/', original_comment)
 
+        return text
+
+    @staticmethod
+    def _safe_replace_inline_comment(text: str, pattern: str, replacement: str) -> str:
+        """安全替换行内注释，确保 --comment 后的代码不会被吞掉。
+
+        如果 replacement 是 --comment 格式且 pattern 后面紧跟非空白字符，
+        在 replacement 后插入换行符防止后续代码被注释掉。
+        """
+        while pattern in text:
+            idx = text.index(pattern)
+            after_idx = idx + len(pattern)
+            after_char = text[after_idx] if after_idx < len(text) else ''
+
+            if replacement.startswith('--') and after_char and after_char not in (' ', '\t', '\n', '\r'):
+                # 注释后紧跟代码，插入换行防止吞掉
+                text = text[:idx] + replacement + '\n' + text[after_idx:]
+            else:
+                text = text[:idx] + replacement + text[after_idx:]
         return text
 
     def _escape_dollar_signs(self, sql: str) -> tuple:
@@ -2418,14 +2498,22 @@ class SQLFormatterV5:
                         # 检查合并后是否还有未闭合的括号
                         open_p = merged_line.count('(') - merged_line.count(')')
                         k = i + 2
+                        has_comment = '--' in stripped or '--' in next_s
                         while open_p > 0 and k < len(lines):
                             ns = lines[k].strip()
                             if not ns:
                                 k += 1
                                 continue
+                            if '--' in ns:
+                                has_comment = True
                             open_p += ns.count('(') - ns.count(')')
                             merged_line += ' ' + ns
                             k += 1
+                        # 如果合并链中含 -- 注释，不合并（注释会吞掉后续内容）
+                        if has_comment:
+                            result.append(line)
+                            i += 1
+                            continue
                         # 清理括号内外多余空格
                         merged_line = re.sub(r'\(\s+', '(', merged_line)
                         merged_line = re.sub(r'\s+\)', ')', merged_line)
@@ -2814,6 +2902,167 @@ class SQLFormatterV5:
         sql = re.sub(r'___DOLLAR___', '$', sql)
         return sql
 
+    @staticmethod
+    def _escape_nvl(sql: str) -> tuple:
+        """将 NVL( 替换为占位符，防止 sqlglot 转为 COALESCE。
+
+        只替换代码中的 NVL，跳过字符串和注释内的。
+        """
+        result = []
+        i = 0
+        count = 0
+        in_str = False
+        qc = None
+        in_line_comment = False
+        in_block_comment = False
+
+        while i < len(sql):
+            ch = sql[i]
+
+            if in_line_comment:
+                result.append(ch)
+                if ch == '\n':
+                    in_line_comment = False
+                i += 1
+                continue
+
+            if in_block_comment:
+                result.append(ch)
+                if ch == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+                    in_block_comment = False
+                i += 1
+                continue
+
+            if in_str:
+                result.append(ch)
+                if ch == qc:
+                    in_str = False
+                i += 1
+                continue
+
+            if ch in ("'", '"'):
+                in_str = True
+                qc = ch
+                result.append(ch)
+                i += 1
+                continue
+
+            if ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                in_line_comment = True
+                result.append(ch)
+                i += 1
+                continue
+
+            if ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                in_block_comment = True
+                result.append(ch)
+                i += 1
+                continue
+
+            # 检查 NVL( 模式
+            if (i + 4 <= len(sql)
+                    and sql[i:i + 3].upper() == 'NVL'
+                    and sql[i + 3] == '('
+                    and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == '_'))):
+                result.append('___NVL___(')
+                count += 1
+                i += 4
+                continue
+
+            result.append(ch)
+            i += 1
+
+        return ''.join(result), count > 0
+
+    @staticmethod
+    def _unescape_nvl(sql: str) -> str:
+        """恢复 NVL 函数名"""
+        return sql.replace('___NVL___', 'NVL')
+
+    @staticmethod
+    def _protect_comment_slash_star(sql: str) -> tuple:
+        """保护 -- 注释内的 /* 和 */ 文本，防止 sqlglot 误解析。
+
+        将 -- 注释内的 /* 替换为 ___CSS___ ，*/ 替换为 ___CSE___。
+        跳过字符串和块注释内的内容。
+        """
+        result = []
+        protect_map = {}
+        counter = 0
+        i = 0
+        in_str = False
+        qc = None
+        in_block_comment = False
+
+        while i < len(sql):
+            ch = sql[i]
+
+            if in_block_comment:
+                result.append(ch)
+                if ch == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+                    in_block_comment = False
+                i += 1
+                continue
+
+            if in_str:
+                result.append(ch)
+                if ch == qc:
+                    in_str = False
+                i += 1
+                continue
+
+            if ch in ("'", '"'):
+                in_str = True
+                qc = ch
+                result.append(ch)
+                i += 1
+                continue
+
+            if ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                in_block_comment = True
+                result.append(ch)
+                i += 1
+                continue
+
+            # 检测 -- 行注释
+            if ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                # 输出 --
+                result.append(ch)
+                i += 1
+                result.append(ch)
+                i += 1
+                # 处理注释内容直到行尾
+                while i < len(sql) and sql[i] not in ('\n', '\r'):
+                    c2 = sql[i]
+                    if c2 == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                        ph = f'___CSS{counter}___'
+                        protect_map[ph] = '/*'
+                        result.append(ph)
+                        counter += 1
+                        i += 2
+                    elif c2 == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+                        ph = f'___CSS{counter}___'
+                        protect_map[ph] = '*/'
+                        result.append(ph)
+                        counter += 1
+                        i += 2
+                    else:
+                        result.append(c2)
+                        i += 1
+                continue
+
+            result.append(ch)
+            i += 1
+
+        return ''.join(result), protect_map
+
+    @staticmethod
+    def _restore_comment_slash_star(sql: str, protect_map: dict) -> str:
+        """恢复被保护的 /* 和 */ 文本"""
+        for placeholder, original in protect_map.items():
+            sql = sql.replace(placeholder, original)
+        return sql
+
     def _split_sql_statements(self, sql: str) -> list:
         """分割 SQL 语句
 
@@ -2843,27 +3092,10 @@ class SQLFormatterV5:
                 continue
 
             # 处理 -- 注释
-            # 注意：如果注释内包含 ;，需要将其提取为语句终止符
-            # 例如：--comment; 应被拆分为 --comment\n; 以正确终止语句
             if char == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
-                comment_has_semicolon = False
-                comment_chars = []
                 while i < len(sql) and sql[i] not in ('\n', '\r'):
-                    if sql[i] == ';':
-                        comment_has_semicolon = True
-                    comment_chars.append(sql[i])
+                    current.append(sql[i])
                     i += 1
-                if comment_has_semicolon:
-                    # 去掉注释内的 ; ，追加注释文本，然后用 ; 终止语句
-                    comment_text = ''.join(comment_chars).rstrip(';').rstrip()
-                    current.append(comment_text)
-                    # 终止当前语句
-                    stmt = ''.join(current).strip()
-                    if stmt:
-                        statements.append(stmt)
-                    current = []
-                else:
-                    current.extend(comment_chars)
                 continue
 
             # 处理 /* */ 注释
@@ -2922,20 +3154,34 @@ class SQLFormatterV5:
         # Step 2: 分别格式化每个语句
         formatted_statements = []
         failed_statements = []
+        all_in_comment_maps = []  # 收集所有语句的 IN 注释映射
+        all_standalone_maps = {}  # 收集所有语句的独立注释占位符映射
+        global_standalone_counter = 0  # 跨语句全局计数器，避免占位符名冲突
 
         for i, stmt in enumerate(statements):
             try:
-                # 预处理：将独立 -- 注释行转为 /* */ 占位符，避免 sqlglot 丢失
-                stmt, preserve_comment_map = self._preserve_standalone_comments(stmt)
-
                 # 预处理：将 IN 子句中 'value'--comment 转为 /* comment */
                 stmt, in_comment_map = self._preprocess_in_clause_comments(stmt)
+                if in_comment_map:
+                    all_in_comment_maps.append(in_comment_map)
 
-                # 预处理：提取 CREATE TABLE 的 PARTITIONED BY 原始信息
-                stmt, partitioned_by_info = self._extract_partitioned_by(stmt)
+                # 预处理：将被注释掉的SQL代码行转为占位符附在THEN值后
+                stmt, standalone_map, global_standalone_counter = self._preserve_standalone_comments(
+                    stmt, start_counter=global_standalone_counter)
+                if standalone_map:
+                    all_standalone_maps.update(standalone_map)
+
+                # 预处理：提取 PARTITIONED BY 原始定义（sqlglot 会合并到主列并丢失类型）
+                escaped_stmt, partition_info = self._extract_partitioned_by(stmt)
 
                 # 转义 $ 符号
                 escaped_stmt, _ = self._escape_dollar_signs(stmt)
+
+                # 预处理：保留 NVL 函数名（sqlglot 会转为 COALESCE）
+                escaped_stmt, has_nvl = self._escape_nvl(escaped_stmt)
+
+                # 预处理：保护 -- 注释内的 /* */ 文本
+                escaped_stmt, comment_protect_map = self._protect_comment_slash_star(escaped_stmt)
 
                 # sqlglot 解析并格式化
                 asts = parse(escaped_stmt, dialect=dialect, read=dialect)
@@ -2952,11 +3198,17 @@ class SQLFormatterV5:
                     fmt = ast.sql(dialect=dialect, pretty=True, indent=self.indent_spaces)
                     # 恢复 $ 符号
                     fmt = self._unescape_dollar_signs(fmt)
+                    # 恢复 NVL 函数名
+                    if has_nvl:
+                        fmt = self._unescape_nvl(fmt)
+                    # 恢复注释内的 /* */ 文本
+                    if comment_protect_map:
+                        fmt = self._restore_comment_slash_star(fmt, comment_protect_map)
                     # 将 /* */ 改回 -- 格式
                     fmt = self._convert_block_comments_to_line_comments(fmt)
-                    # 恢复 IN 子句中被预处理的注释（--__INLINE_N__ → --原始注释）
-                    if in_comment_map:
-                        fmt = self._restore_in_clause_comments(fmt, in_comment_map)
+                    # IN 子句注释不在此处恢复 — 保持 /* __INLINE_N__ */ 格式
+                    # 避免被 _apply_v4_full_style / _merge_case_lines 折叠后
+                    # --注释吞掉后续值。由 _split_in_clause_comments 统一处理。
                     # V4 风格后处理（leading comma, AND/OR对齐, CASE WHEN等）
                     fmt = self._apply_v4_full_style(fmt)
                     # 修复 sqlglot 将 'col NOT IN' 改为 'NOT col IN' 的问题
@@ -2967,17 +3219,16 @@ class SQLFormatterV5:
                     )
                     # 修复子查询括号对齐和内容缩进
                     fmt = self._fix_subquery_indent(fmt)
+                    # CREATE TABLE 列对齐（列名、类型、COMMENT上下对齐）
+                    fmt = self._align_create_table_columns(fmt)
+                    # 恢复 PARTITIONED BY 原始定义（从主列中移除分区列，重建内联定义）
+                    if partition_info:
+                        fmt = self._restore_partitioned_by(fmt, partition_info)
                     # 拆分超长标量子查询
                     fmt = self._split_long_scalar_subqueries(fmt)
-                    # 恢复 PARTITIONED BY（移除主列中的分区列，恢复原始类型和注释）
-                    if partitioned_by_info:
-                        fmt = self._restore_partitioned_by(fmt, partitioned_by_info)
-                    # 恢复被预处理的独立注释（--__PRESERVE_N__ → 原始注释）
-                    if preserve_comment_map:
-                        fmt = self._restore_preserved_comments(fmt, preserve_comment_map)
-                    # 添加分号（独立一行，避免注释干扰语句完整性）
+                    # 分号独立行：避免追加到 -- 注释行末尾导致 ; 被注释吃掉
                     if not fmt.endswith(';'):
-                        fmt = fmt.rstrip() + '\n;'
+                        fmt += '\n;'
                     formatted.append(fmt)
 
                 formatted_statements.extend(formatted)
@@ -3015,8 +3266,15 @@ class SQLFormatterV5:
         # Step 5: 拆分被sqlglot合并的注释行
         result = self._split_merged_comment_lines(result)
 
-        # Step 6: 拆分 IN 子句中被合并的注释值
-        result = self._split_in_clause_comments(result)
+        # Step 6: 拆分 IN 子句中被合并的注释值，同时恢复占位符为原始注释
+        all_in_map = {}
+        for m in all_in_comment_maps:
+            all_in_map.update(m)
+        result = self._split_in_clause_comments(result, all_in_map)
+
+        # Step 7: 恢复独立注释占位符为原始注释行
+        if all_standalone_maps:
+            result = self._restore_standalone_placeholders(result, all_standalone_maps)
 
         return result
 
