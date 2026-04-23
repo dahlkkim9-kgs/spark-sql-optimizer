@@ -2453,12 +2453,66 @@ class SQLFormatterV5:
     def _escape_dollar_signs(self, sql: str) -> tuple:
         """转义特殊符号（sqlglot 可能误解析）
 
-        转义 $ 符号和 {} 变量语法
+        转义 $ 符号和 {} 变量语法。
+        {} 转义仅作用于字符串字面量外部，避免跨越字符串边界导致标记分离。
         """
+        # $ 符号全局替换（单个字符，不会跨越边界）
         escaped = re.sub(r'\$', '___DOLLAR___', sql)
-        # 转义 {} 变量语法，如 {DATA_DT}
-        escaped = re.sub(r'\{([^}]*)\}', r'___BRACE_OPEN___\1___BRACE_CLOSE___', escaped)
+        # {} 变量语法：仅在字符串外部转义，防止正则内的 {{ }} 被误匹配
+        escaped = self._escape_braces_outside_strings(escaped)
         return escaped, sql.count('$') + sql.count('{')
+
+    @staticmethod
+    def _escape_braces_outside_strings(sql: str) -> str:
+        """仅转义字符串字面量外部的 {var} 模式。
+
+        逐字符扫描，追踪字符串边界和反斜杠转义，
+        只在字符串外部将 {content} 替换为 ___BRACE_OPEN___content___BRACE_CLOSE___。
+        """
+        result = []
+        i = 0
+        n = len(sql)
+        while i < n:
+            ch = sql[i]
+            # 进入字符串字面量
+            if ch in ("'", '"'):
+                qc = ch
+                result.append(ch)
+                i += 1
+                while i < n:
+                    c = sql[i]
+                    result.append(c)
+                    if c == '\\' and i + 1 < n:
+                        result.append(sql[i + 1])
+                        i += 2
+                        continue
+                    if c == qc:
+                        break
+                    i += 1
+                i += 1
+                continue
+            # 字符串外部遇到 { — 尝试匹配 {content}
+            if ch == '{':
+                # 找到下一个 } 的位置
+                close_pos = sql.find('}', i + 1)
+                if close_pos != -1:
+                    # 中间不能有引号（说明跨越了字符串边界）
+                    between = sql[i + 1:close_pos]
+                    if "'" not in between and '"' not in between:
+                        content = between
+                        result.append('___BRACE_OPEN___')
+                        result.append(content)
+                        result.append('___BRACE_CLOSE___')
+                        i = close_pos + 1
+                        continue
+                # 无匹配的 } 或跨越了字符串，保留原字符
+                result.append(ch)
+                i += 1
+                continue
+            # 普通字符
+            result.append(ch)
+            i += 1
+        return ''.join(result)
 
     def _fix_subquery_indent(self, text):
         """修复子查询内的缩进不一致和括号不对齐问题。
