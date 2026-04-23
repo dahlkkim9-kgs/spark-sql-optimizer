@@ -160,6 +160,10 @@ class SQLFormatterV5:
             for match in reversed(real_matches):
                 comment_content = match.group(1).strip()
 
+                # 装饰性块注释（/****/ 风格）：保留 /* ... */ 格式
+                if re.match(r'^[*=\-~]{2,}', comment_content) or re.search(r'[*=\-~]{2,}$', comment_content):
+                    continue
+
                 start = match.start()
                 end = match.end()
 
@@ -900,6 +904,7 @@ class SQLFormatterV5:
 
         每个段包含完整内容（AND/OR 与其后的条件在同一行）。
         忽略字符串和括号内的 AND/OR。
+        BETWEEN ... AND ... 中的 AND 不作为拆分点。
 
         Returns:
             list of segments，如 ['cond1', 'AND cond2', 'OR cond3']
@@ -909,6 +914,7 @@ class SQLFormatterV5:
         in_string = False
         quote_char = None
         current_start = 0
+        between_pending = False
 
         for i, c in enumerate(text):
             if in_string:
@@ -928,15 +934,22 @@ class SQLFormatterV5:
 
             if depth == 0:
                 remaining = text[i:]
+                # 检测 BETWEEN 关键字，标记下一个 AND 属于 BETWEEN 语法
+                if re.match(r'\bBETWEEN\b', remaining, re.IGNORECASE):
+                    between_pending = True
+                    continue
                 m = re.match(r'\b(AND|OR)\b\s+', remaining, re.IGNORECASE)
                 if m:
+                    # BETWEEN ... AND 不拆分
+                    if between_pending and m.group(1).upper() == 'AND':
+                        between_pending = False
+                        continue
+                    between_pending = False
                     cond = text[current_start:i].strip()
                     if cond:
                         segments.append(cond)
-                    # 从 AND/OR 位置开始新段（包含后续条件）
                     current_start = i
 
-        # 添加剩余部分
         remaining = text[current_start:].strip()
         if remaining:
             segments.append(remaining)
