@@ -17,20 +17,23 @@ FROM t1;</textarea>
     <pre id="debug"></pre>
     <script>
         async function fetchFromAPI() {
-            const response = await fetch('http://localhost:5000/api/format', {
+            const response = await fetch('http://localhost:8888/format/v4fixed', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     sql: 'SELECT 1 FROM t1',
-                    options: { keyword_case: 'upper', semicolon_newline: true }
+                    keyword_case: 'upper'
                 })
             });
             const data = await response.json();
-            document.getElementById('api').value = data.formatted;
-            document.getElementById('debug').textContent = 
-                'formatted: ' + JSON.stringify(data.formatted) + '\n' +
-                'length: ' + data.formatted.length + '\n' +
-                'newlines count: ' + (data.formatted.match(/\n/g) || []).length;
+            // v4fixed API 返回 { formatted: "...", success: true }
+            const formatted = data.formatted || data.formatted_sql || '';
+            document.getElementById('api').value = formatted;
+            document.getElementById('debug').textContent =
+                'response: ' + JSON.stringify(data, null, 2) + '\n' +
+                'formatted: ' + JSON.stringify(formatted) + '\n' +
+                'length: ' + formatted.length + '\n' +
+                'newlines count: ' + (formatted.match(/\n/g) || []).length;
         }
     </script>
 </body>

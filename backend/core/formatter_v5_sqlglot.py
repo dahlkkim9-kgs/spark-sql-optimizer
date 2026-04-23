@@ -18,12 +18,28 @@ class SQLFormatterV5:
     _STANDALONE_PREFIX = '__STANDALONE_'
     _INLINE_PREFIX = '__INLINE_'
 
-    # sqlglot 会重写的函数名映射（新增函数只需修改此处）
-    _FUNC_MAP = {
-        'NVL': '___NVL___',
-        'SUBSTR': '___SUBSTR___',
-        'GET_JSON_OBJECT': '___GJSON___',
-    }
+    # 不应被转义的标识符：SQL 关键字和类型名（它们虽然可以被 ( 跟随，但不是函数调用）
+    # 只有不在此集合中的 identifier( 才会被保护
+    _NO_ESCAPE_FUNCS = frozenset({
+        # 特殊语法函数（sqlglot 需要理解内部关键字）
+        'CAST', 'EXTRACT', 'TRIM',
+        # SQL 子句关键字
+        'SELECT', 'FROM', 'WHERE', 'HAVING', 'SET', 'ON', 'AS',
+        # SQL 操作符（后跟括号）
+        'IN', 'EXISTS', 'ALL', 'ANY', 'SOME', 'NOT', 'AND', 'OR',
+        # JOIN 关键字
+        'JOIN',
+        # 窗口/分区关键字
+        'OVER', 'PARTITION',
+        # 分组构造
+        'ROLLUP', 'CUBE', 'GROUPING',
+        # SQL 类型（使用括号语法）
+        'DECIMAL', 'NUMERIC', 'VARCHAR', 'CHAR', 'CHARACTER',
+        'FLOAT', 'DOUBLE', 'REAL', 'PRECISION',
+        'VARBINARY', 'BINARY',
+        # 其他 SQL 构造
+        'VALUES', 'LATERAL',
+    })
 
     def __init__(self, indent_spaces: int = 4):
         self.indent_spaces = indent_spaces
@@ -159,10 +175,6 @@ class SQLFormatterV5:
             new_line = line
             for match in reversed(real_matches):
                 comment_content = match.group(1).strip()
-
-                # 装饰性块注释（/****/ 风格）：保留 /* ... */ 格式
-                if re.match(r'^[*=\-~]{2,}', comment_content) or re.search(r'[*=\-~]{2,}$', comment_content):
-                    continue
 
                 start = match.start()
                 end = match.end()
@@ -904,7 +916,6 @@ class SQLFormatterV5:
 
         每个段包含完整内容（AND/OR 与其后的条件在同一行）。
         忽略字符串和括号内的 AND/OR。
-        BETWEEN ... AND ... 中的 AND 不作为拆分点。
 
         Returns:
             list of segments，如 ['cond1', 'AND cond2', 'OR cond3']
@@ -914,7 +925,6 @@ class SQLFormatterV5:
         in_string = False
         quote_char = None
         current_start = 0
-        between_pending = False
 
         for i, c in enumerate(text):
             if in_string:
@@ -934,22 +944,15 @@ class SQLFormatterV5:
 
             if depth == 0:
                 remaining = text[i:]
-                # 检测 BETWEEN 关键字，标记下一个 AND 属于 BETWEEN 语法
-                if re.match(r'\bBETWEEN\b', remaining, re.IGNORECASE):
-                    between_pending = True
-                    continue
                 m = re.match(r'\b(AND|OR)\b\s+', remaining, re.IGNORECASE)
                 if m:
-                    # BETWEEN ... AND 不拆分
-                    if between_pending and m.group(1).upper() == 'AND':
-                        between_pending = False
-                        continue
-                    between_pending = False
                     cond = text[current_start:i].strip()
                     if cond:
                         segments.append(cond)
+                    # 从 AND/OR 位置开始新段（包含后续条件）
                     current_start = i
 
+        # 添加剩余部分
         remaining = text[current_start:].strip()
         if remaining:
             segments.append(remaining)
@@ -2467,65 +2470,90 @@ class SQLFormatterV5:
         """转义特殊符号（sqlglot 可能误解析）
 
         转义 $ 符号和 {} 变量语法。
-        {} 转义仅作用于字符串字面量外部，避免跨越字符串边界导致标记分离。
+        {} 替换需要跳过字符串字面量，避免误匹配跨字符串边界。
         """
-        # $ 符号全局替换（单个字符，不会跨越边界）
-        escaped = re.sub(r'\$', '___DOLLAR___', sql)
-        # {} 变量语法：仅在字符串外部转义，防止正则内的 {{ }} 被误匹配
-        escaped = self._escape_braces_outside_strings(escaped)
-        return escaped, sql.count('$') + sql.count('{')
-
-    @staticmethod
-    def _escape_braces_outside_strings(sql: str) -> str:
-        """仅转义字符串字面量外部的 {var} 模式。
-
-        逐字符扫描，追踪字符串边界和反斜杠转义，
-        只在字符串外部将 {content} 替换为 ___BRACE_OPEN___content___BRACE_CLOSE___。
-        """
+        # 先处理 $ 符号（$ 不会跨越字符串边界，简单的全局替换安全）
         result = []
         i = 0
-        n = len(sql)
-        while i < n:
+        in_str = False
+        qc = None
+        in_line_comment = False
+        in_block_comment = False
+        dollar_count = 0
+        brace_count = 0
+
+        while i < len(sql):
             ch = sql[i]
-            # 进入字符串字面量
+
+            if in_line_comment:
+                result.append(ch)
+                if ch == '\n':
+                    in_line_comment = False
+                i += 1
+                continue
+
+            if in_block_comment:
+                result.append(ch)
+                if ch == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+                    in_block_comment = False
+                i += 1
+                continue
+
+            if in_str:
+                result.append(ch)
+                if ch == '\\' and i + 1 < len(sql):
+                    result.append(sql[i + 1])
+                    i += 2
+                    continue
+                if ch == qc:
+                    in_str = False
+                i += 1
+                continue
+
             if ch in ("'", '"'):
+                in_str = True
                 qc = ch
                 result.append(ch)
                 i += 1
-                while i < n:
-                    c = sql[i]
-                    result.append(c)
-                    if c == '\\' and i + 1 < n:
-                        result.append(sql[i + 1])
-                        i += 2
-                        continue
-                    if c == qc:
-                        break
-                    i += 1
-                i += 1
                 continue
-            # 字符串外部遇到 { — 尝试匹配 {content}
-            if ch == '{':
-                # 找到下一个 } 的位置
-                close_pos = sql.find('}', i + 1)
-                if close_pos != -1:
-                    # 中间不能有引号（说明跨越了字符串边界）
-                    between = sql[i + 1:close_pos]
-                    if "'" not in between and '"' not in between:
-                        content = between
-                        result.append('___BRACE_OPEN___')
-                        result.append(content)
-                        result.append('___BRACE_CLOSE___')
-                        i = close_pos + 1
-                        continue
-                # 无匹配的 } 或跨越了字符串，保留原字符
+
+            if ch == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+                in_line_comment = True
                 result.append(ch)
                 i += 1
                 continue
-            # 普通字符
+
+            if ch == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+                in_block_comment = True
+                result.append(ch)
+                i += 1
+                continue
+
+            if ch == '$':
+                result.append('___DOLLAR___')
+                dollar_count += 1
+                i += 1
+                continue
+
+            if ch == '{':
+                # 收集 {var} 中的变量名（到下一个 } 为止，不含嵌套）
+                j = sql.index('}', i + 1) if '}' in sql[i + 1:] else -1
+                if j >= 0:
+                    var_name = sql[i + 1:j]
+                    result.append('___BRACE_OPEN___')
+                    result.append(var_name)
+                    result.append('___BRACE_CLOSE___')
+                    brace_count += 1
+                    i = j + 1
+                else:
+                    result.append(ch)
+                    i += 1
+                continue
+
             result.append(ch)
             i += 1
-        return ''.join(result)
+
+        return ''.join(result), dollar_count + brace_count
 
     def _fix_subquery_indent(self, text):
         """修复子查询内的缩进不一致和括号不对齐问题。
@@ -2995,12 +3023,18 @@ class SQLFormatterV5:
 
     @staticmethod
     def _escape_functions(sql: str) -> tuple:
-        """将 sqlglot 会重写的函数名替换为占位符。
+        """保护所有函数名不被 sqlglot 重写。
 
-        只替换代码中的函数调用，跳过字符串和注释内的。
-        函数名映射见 _FUNC_MAP 类属性。
+        扫描 SQL 中的 identifier( 模式（函数调用），将函数名替换为
+        ___FN_name___ 占位符。这从根本上防止 sqlglot 识别并重写函数名
+        （如 SUBSTR→SUBSTRING, INSTR→LOCATE, NVL→COALESCE 等）。
+
+        例外：CAST、EXTRACT、TRIM 具有特殊语法，sqlglot 需要理解它们
+        才能正确解析内部的 AS/FROM 关键字。
+
+        跳过字符串字面量和注释内的内容。
         """
-        func_map = SQLFormatterV5._FUNC_MAP
+        no_escape = SQLFormatterV5._NO_ESCAPE_FUNCS
         result = []
         i = 0
         found = set()
@@ -3056,28 +3090,40 @@ class SQLFormatterV5:
                 i += 1
                 continue
 
-            # 检查函数名( 模式
-            for fname, placeholder in func_map.items():
-                flen = len(fname)
-                if (i + flen + 1 <= len(sql)
-                        and sql[i:i + flen].upper() == fname
-                        and sql[i + flen] == '('
-                        and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == '_'))):
-                    result.append(placeholder + '(')
-                    found.add(fname)
-                    i += flen + 1
-                    break
-            else:
-                result.append(ch)
-                i += 1
+            # 检查标识符（可能的函数名）
+            if ch.isalpha() or ch == '_':
+                j = i
+                while j < len(sql) and (sql[j].isalnum() or sql[j] == '_'):
+                    j += 1
+                name = sql[i:j]
+
+                # 检查后面是否跟着 ( （跳过空白）
+                k = j
+                while k < len(sql) and sql[k] in (' ', '\t', '\n', '\r'):
+                    k += 1
+
+                if (k < len(sql) and sql[k] == '('
+                        and name.upper() not in no_escape
+                        and (i == 0 or sql[i - 1] != '.')):
+                    # 是函数调用 → 替换为占位符，保留原始名称
+                    placeholder = f'___FN_{name}___'
+                    result.append(placeholder)
+                    found.add(name.upper())
+                    i = j
+                else:
+                    result.append(name)
+                    i = j
+                continue
+
+            result.append(ch)
+            i += 1
 
         return ''.join(result), found
 
     @staticmethod
     def _unescape_functions(sql: str) -> str:
-        """恢复被转义的函数名（使用 _FUNC_MAP 的反向映射）"""
-        for placeholder, name in {v: k for k, v in SQLFormatterV5._FUNC_MAP.items()}.items():
-            sql = sql.replace(placeholder, name)
+        """恢复所有被保护的函数名"""
+        return re.sub(r'___FN_(\w+)___', r'\1', sql)
         return sql
 
     @staticmethod
@@ -3539,6 +3585,9 @@ class SQLFormatterV5:
                     # 必须在所有其他后处理之后，避免缩进修复等步骤破坏块内换行
                     if block_map:
                         fmt = self._restore_complex_blocks(fmt, block_map)
+                        # 恢复的块中可能含有函数占位符（如 ___SUBSTR___），
+                        # 需要再次执行恢复，因为原始块在 _unescape_functions 之前被保存
+                        fmt = self._unescape_functions(fmt)
                     # 分号独立行：避免追加到 -- 注释行末尾导致 ; 被注释吃掉
                     if not fmt.endswith(';'):
                         fmt += '\n;'
