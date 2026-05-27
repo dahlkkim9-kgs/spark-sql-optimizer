@@ -25,10 +25,14 @@ class SQLFormatterV5:
         'CAST', 'EXTRACT', 'TRIM',
         # SQL 子句关键字
         'SELECT', 'FROM', 'WHERE', 'HAVING', 'SET', 'ON', 'AS',
+        # CASE 表达式关键字（可后跟括号表达式: WHEN (cond), THEN (val)）
+        'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
         # SQL 操作符（后跟括号）
         'IN', 'EXISTS', 'ALL', 'ANY', 'SOME', 'NOT', 'AND', 'OR',
         # JOIN 关键字
         'JOIN',
+        # BY 关键字（PARTITIONED BY, DISTRIBUTED BY, SORTED BY, CLUSTERED BY 等后跟括号）
+        'BY',
         # 窗口/分区关键字
         'OVER', 'PARTITION',
         # 分组构造
@@ -179,6 +183,10 @@ class SQLFormatterV5:
                 start = match.start()
                 end = match.end()
 
+                # 装饰性注释（如 *******注释测试****** 或 -----分隔线-----）：
+                # 星号装饰不加 -- 前缀，短横线装饰保留 -- 前缀（因为 sqlglot 消费了原始 --）
+                is_decorative = bool(re.match(r'^\*{3,}', comment_content))
+
                 # 检查注释前是否有逗号
                 before_comment = new_line[:start].rstrip()
                 has_comma = before_comment.endswith(',')
@@ -186,8 +194,11 @@ class SQLFormatterV5:
                 # 检查注释后是否有内容
                 after_comment = new_line[end:].strip()
 
-                # 替换为 -- 格式
-                replacement = f"--{comment_content}"
+                # 装饰性注释保留 /* ... */ 格式，普通注释加 --
+                if is_decorative:
+                    replacement = f"/* {comment_content} */"
+                else:
+                    replacement = f"--{comment_content}"
 
                 if after_comment:
                     if has_comma:
@@ -491,7 +502,7 @@ class SQLFormatterV5:
                 segments = self._split_and_or_in_line(on_rest)
                 result.append(f"{on_prefix}ON {segments[0]}")
                 for seg in segments[1:]:
-                    result.append(f"{and_prefix}{seg}")
+                    self._append_on_and_line(result, seg, and_prefix, indent)
                 i += 1
                 while i < len(lines):
                     s = lines[i].strip()
@@ -499,8 +510,12 @@ class SQLFormatterV5:
                     if not s or (si <= indent and self._is_clause_line(s)):
                         break
                     if self._is_and_or(s):
-                        result.append(f"{and_prefix}{s}")
-                        i += 1
+                        # AND/OR 行后可能跟着 (CASE...END = 1) 的多行模式
+                        # 收集 AND 后续直到匹配 ) 的所有行
+                        collected, next_i = self._collect_on_and_block(lines, i)
+                        combined = '\n'.join(collected)
+                        self._append_on_and_line(result, combined.strip(), and_prefix, indent)
+                        i = next_i
                     else:
                         break
                 continue
@@ -528,13 +543,14 @@ class SQLFormatterV5:
             # === CASE WHEN (single-line, need to split) ===
             if upper.startswith('CASE') and 'WHEN' in stripped and '\n' not in stripped:
                 case_lines = self._format_case_when_single(stripped, indent)
-                result.extend(case_lines)
+                for cl in case_lines:
+                    result.append(' ' * indent + cl)
                 i += 1
                 continue
 
             # === CASE (already multi-line or complex) ===
             if upper.startswith('CASE'):
-                result.append(stripped)
+                result.append(' ' * indent + stripped)
                 i += 1
                 continue
 
@@ -874,29 +890,40 @@ class SQLFormatterV5:
         return i
 
     def _format_group_order(self, lines, start_i, indent, keyword, result):
-        """格式化 GROUP BY / ORDER BY 子句（leading comma）"""
+        """格式化 GROUP BY / ORDER BY 子句（leading comma），支持 CASE WHEN 展开。"""
         stripped = lines[start_i].strip()
         rest = stripped[len(keyword):].strip()
         i = start_i
 
+        case_indent = indent + 7  # CASE/END 位置，与 SELECT 列对齐
+        comma_prefix = ' ' * (indent + 5)  # leading comma 位置
+
         if rest:
-            result.append(f"{' ' * indent}{keyword} {rest.rstrip(',')}")
+            c = rest.rstrip(',')
+            if re.search(r'\bCASE\b', c, re.IGNORECASE):
+                result.append(f"{' ' * indent}{keyword}")
+                self._append_group_case(result, c, case_indent)
+            else:
+                result.append(f"{' ' * indent}{keyword} {c}")
             i += 1
         else:
             i += 1
             first_cond, i = self._merge_standalone_keyword(lines, i, indent)
             if first_cond:
-                result.append(f"{' ' * indent}{keyword} {first_cond.rstrip(',')}")
+                c = first_cond.rstrip(',')
+                if re.search(r'\bCASE\b', c, re.IGNORECASE):
+                    result.append(f"{' ' * indent}{keyword}")
+                    self._append_group_case(result, c, case_indent)
+                else:
+                    result.append(f"{' ' * indent}{keyword} {c}")
             else:
                 result.append(f"{' ' * indent}{keyword}")
 
-        comma_prefix = ' ' * (indent + 7)
         while i < len(lines):
             s = lines[i].strip()
             si = len(lines[i]) - len(lines[i].lstrip())
             if not s:
                 break
-            # 在闭括号处停止
             if s == ')' or s.startswith(')'):
                 break
             if si <= indent and self._is_clause_line(s):
@@ -905,10 +932,119 @@ class SQLFormatterV5:
                 break
             c = s.rstrip(',')
             if c:
-                result.append(f"{comma_prefix}, {c}")
+                if re.search(r'\bCASE\b', c, re.IGNORECASE):
+                    result.append(f"{comma_prefix},")
+                    self._append_group_case(result, c, case_indent)
+                else:
+                    result.append(f"{comma_prefix}, {c}")
             i += 1
 
         return result, i
+
+    def _append_group_case(self, result, text, case_indent):
+        """将 GROUP BY / ORDER BY 中的 CASE WHEN 展开为多行，缩进与 SELECT 一致。"""
+        case_match = re.search(r'\bCASE\b', text, re.IGNORECASE)
+        if not case_match:
+            result.append(' ' * case_indent + text)
+            return
+        before_case = text[:case_match.start()].strip()
+        case_str = text[case_match.start():]
+        case_end = self._find_case_end(case_str, 0)
+        if case_end == -1:
+            result.append(' ' * case_indent + text)
+            return
+        after_case = case_str[case_end:].strip()
+        case_body = case_str[:case_end]
+
+        if before_case:
+            result.append(' ' * case_indent + before_case)
+
+        case_lines = self._format_case_when_single(case_body, 0)
+        self._append_case_inner_lines(result, case_lines, case_indent - 7)
+
+        if after_case:
+            result.append(' ' * case_indent + after_case)
+
+    def _collect_on_and_block(self, lines, start_i):
+        """收集 ON 条件中 AND/OR 行及其后续的多行块（如 AND (CASE...END = 1)）。
+
+        Returns:
+            (collected_lines, next_line_index)
+        """
+        collected = [lines[start_i].strip()]
+        i = start_i + 1
+        while i < len(lines):
+            s = lines[i].strip()
+            si = len(lines[i]) - len(lines[i].lstrip())
+            if not s:
+                break
+            if si <= 1 and self._is_clause_line(s):
+                break
+            if self._is_and_or(s):
+                break
+            collected.append(s)
+            i += 1
+        return collected, i
+
+    def _append_on_and_line(self, result, text, and_prefix, on_indent):
+        """输出 ON 条件的 AND/OR 行，如果包含 CASE 则展开为多行。"""
+        if not re.search(r'\bCASE\b', text, re.IGNORECASE):
+            result.append(f"{and_prefix}{text}")
+            return
+
+        # 提取 AND/OR 关键字
+        kw_match = re.match(r'^(AND|OR)\b\s*', text, re.IGNORECASE)
+        if not kw_match:
+            result.append(f"{and_prefix}{text}")
+            return
+        keyword = kw_match.group(0).strip()
+        rest = text[kw_match.end():].strip()
+
+        # 检查是否有包裹的 (CASE...END = x) = y 模式
+        paren_wrap = False
+        trailing = ''
+        if rest.startswith('('):
+            paren_end = self._find_matching_paren_str(rest, 0)
+            if paren_end != -1 and paren_end < len(rest) - 1:
+                inner = rest[1:paren_end].strip()
+                trailing = rest[paren_end + 1:].strip()
+                rest = inner
+                paren_wrap = True
+
+        # 展开 CASE
+        case_match = re.search(r'\bCASE\b', rest, re.IGNORECASE)
+        if not case_match:
+            result.append(f"{and_prefix}{text}")
+            return
+        before_case = rest[:case_match.start()].strip()
+        case_str = rest[case_match.start():]
+        case_end = self._find_case_end(case_str, 0)
+        if case_end == -1:
+            result.append(f"{and_prefix}{text}")
+            return
+        after_case = case_str[case_end:].strip()
+        case_body = case_str[:case_end]
+
+        # 缩进: CASE 相对 AND 偏移 2, WHEN 再偏移 4
+        case_indent = len(and_prefix) + len(keyword) + 1
+        when_indent = case_indent + 4
+
+        if paren_wrap:
+            result.append(f"{and_prefix}{keyword} {before_case + ' ' if before_case else ''}(")
+        else:
+            result.append(f"{and_prefix}{keyword} {before_case}" if before_case else f"{and_prefix}{keyword}")
+
+        case_lines = self._format_case_when_single(case_body, 0)
+        for cl in case_lines:
+            cl_s = cl.strip()
+            if re.match(r'^(CASE|END)\b', cl_s, re.IGNORECASE):
+                end_suffix = after_case if cl_s.upper().startswith('END') and after_case else ''
+                result.append(' ' * case_indent + cl_s + (' ' + end_suffix if end_suffix else ''))
+            else:
+                result.append(' ' * when_indent + cl_s)
+
+        if paren_wrap:
+            result.append(f"{and_prefix}){(' ' + trailing) if trailing else ''}")
 
     @staticmethod
     def _split_and_or_in_line(text):
@@ -1301,6 +1437,16 @@ class SQLFormatterV5:
                 continue  # 跳过分区列
             kept_lines.append(cl)
 
+        # 清理第一个非空行的前导逗号（移除分区列后可能残留）
+        for idx, cl in enumerate(kept_lines):
+            if cl.strip():
+                stripped = cl.lstrip()
+                if stripped.startswith(','):
+                    # V4 leading comma: "  , col" → "    col" (首列无逗号，多2格缩进)
+                    old_indent = cl[:len(cl) - len(cl.lstrip())]
+                    kept_lines[idx] = old_indent + '  ' + stripped[1:].lstrip()
+                break
+
         # 重建主列内容（去掉尾部空行）
         while kept_lines and not kept_lines[-1].strip():
             kept_lines.pop()
@@ -1508,6 +1654,188 @@ class SQLFormatterV5:
             return (m2.group(1), '', '')
 
         return None
+
+    # ============================================================
+    # SELECT 列别名 + 注释智能对齐
+    # ============================================================
+
+    def _align_select_columns(self, text):
+        """SELECT 列别名 + 行尾注释智能对齐。
+
+        同一 SELECT 块内的列定义自动对齐：
+        - AS 关键字根据最长表达式自适应对齐
+        - --注释 根据最长别名自适应对齐
+        - 无别名列的注释直接对齐到注释列
+        - 多行 CASE 表达式跳过，注释在 END 行对齐
+        - 每个 SELECT 块独立计算对齐
+        """
+        lines = text.split('\n')
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.lstrip()
+            # 检测 SELECT 关键字行（排除注释行）
+            if re.match(r'^SELECT\b', stripped, re.IGNORECASE) and not stripped.startswith('--'):
+                block_end = self._find_select_end(lines, i)
+                aligned = self._do_select_align(lines, i, block_end)
+                result.extend(aligned)
+                i = block_end + 1
+            else:
+                result.append(line)
+                i += 1
+        return '\n'.join(result)
+
+    def _find_select_end(self, lines, start):
+        """找到 SELECT 列区域的最后一行（FROM 等子句关键字之前）"""
+        case_depth = 0
+        paren_depth = 0
+        for i in range(start + 1, len(lines)):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                return i - 1
+            # 先检测子句关键字（在括号跟踪之前，避免 FROM ( 被误跳过）
+            if case_depth == 0 and paren_depth == 0:
+                if re.match(
+                    r'^(FROM|WHERE|GROUP\s|HAVING|ORDER|LIMIT|UNION|INTERSECT|EXCEPT'
+                    r'|LATERAL|DISTRIBUTE|SORT|CLUSTER)\b', stripped, re.IGNORECASE
+                ):
+                    return i - 1
+                if re.match(r'^(LEFT|RIGHT|INNER|FULL|CROSS)\s+JOIN\b', stripped, re.IGNORECASE):
+                    return i - 1
+                if re.match(r'^JOIN\b', stripped, re.IGNORECASE):
+                    return i - 1
+                if re.match(r'^ON\b', stripped, re.IGNORECASE):
+                    return i - 1
+            # 跟踪 CASE/END 深度
+            for kw in re.finditer(r'\b(CASE|END)\b', stripped, re.IGNORECASE):
+                if kw.group().upper() == 'CASE':
+                    case_depth += 1
+                else:
+                    case_depth = max(0, case_depth - 1)
+            # 跟踪括号深度
+            for ch in stripped:
+                if ch == '(':
+                    paren_depth += 1
+                elif ch == ')':
+                    paren_depth = max(0, paren_depth - 1)
+        return len(lines) - 1
+
+    @staticmethod
+    def _parse_col_content(text):
+        """解析列内容为 (expression, alias_full, comment)
+
+        示例:
+            "SUBSTR(x,1,5) AS short_name --注释" → ("SUBSTR(x,1,5)", "AS short_name", "--注释")
+            "t1.amount --金额" → ("t1.amount", "", "--金额")
+            "t1.id AS id" → ("t1.id", "AS id", "")
+        """
+        comment = ""
+        code = text
+        # 找行尾 -- 注释（跳过字符串内的）
+        in_str = False
+        for j in range(len(text)):
+            ch = text[j]
+            if ch == "'":
+                in_str = not in_str
+            elif ch == '-' and j + 1 < len(text) and text[j + 1] == '-' and not in_str:
+                comment = text[j:]
+                code = text[:j].rstrip()
+                break
+        # 找末尾 AS alias
+        as_match = re.search(r'\bAS\s+(\w+)\s*$', code, re.IGNORECASE)
+        if as_match:
+            expr = code[:as_match.start()].rstrip()
+            return (expr, as_match.group(0), comment)
+        return (code, "", comment)
+
+    def _do_select_align(self, lines, start, end):
+        """对齐单个 SELECT 块的列行"""
+        # Phase 1: 解析所有列行
+        entries = []  # [{idx, prefix, expr, alias, comment}]
+        select_line = lines[start]
+        m = re.match(r'^(\s*SELECT\s+)(.*)', select_line, re.IGNORECASE)
+        if m:
+            prefix = m.group(1)
+            content = m.group(2).strip()
+            if content and not re.match(r'^(DISTINCT|ALL|TOP)\b', content, re.IGNORECASE):
+                parsed = self._parse_col_content(content)
+                if parsed[0]:
+                    entries.append({'idx': start, 'prefix': prefix,
+                                    'expr': parsed[0], 'alias': parsed[1], 'comment': parsed[2]})
+
+        case_depth = 0
+        paren_depth = 0
+        for i in range(start + 1, end + 1):
+            line = lines[i]
+            stripped = line.strip()
+            indent = line[:len(line) - len(line.lstrip())]
+            # 跟踪 CASE 深度
+            old_case = case_depth
+            for kw in re.finditer(r'\b(CASE|END)\b', stripped, re.IGNORECASE):
+                if kw.group().upper() == 'CASE':
+                    case_depth += 1
+                else:
+                    case_depth = max(0, case_depth - 1)
+            # 跟踪括号深度
+            for ch in stripped:
+                if ch == '(':
+                    paren_depth += 1
+                elif ch == ')':
+                    paren_depth = max(0, paren_depth - 1)
+            # CASE 块内：只处理 END 行
+            if old_case > 0:
+                if case_depth < old_case:
+                    parsed = self._parse_col_content(stripped)
+                    if parsed[1] or parsed[2]:
+                        entries.append({'idx': i, 'prefix': indent,
+                                        'expr': parsed[0], 'alias': parsed[1], 'comment': parsed[2]})
+                continue
+            # 括号内（子查询）：跳过
+            if paren_depth > 0:
+                continue
+            # Leading comma 列行
+            if stripped.startswith(','):
+                content = stripped[1:].strip()
+                parsed = self._parse_col_content(content)
+                if parsed[0]:
+                    entries.append({'idx': i, 'prefix': indent + ', ',
+                                    'expr': parsed[0], 'alias': parsed[1], 'comment': parsed[2]})
+
+        # Phase 2: 至少2个可对齐行
+        alignable = [e for e in entries if e['alias'] or e['comment']]
+        if len(alignable) < 2:
+            return lines[start:end + 1]
+
+        # Phase 3: 计算对齐位置
+        max_expr = max(len(e['expr']) for e in entries)
+        as_col = max_expr + 2
+        # 如果最长表达式超过50字符，只用短表达式计算
+        if max_expr > 50:
+            short = [len(e['expr']) for e in entries if len(e['expr']) <= 50]
+            if short:
+                as_col = max(short) + 2
+
+        has_as = any(e['alias'] for e in entries)
+        max_alias = max((len(e['alias']) for e in entries if e['alias']), default=0)
+        comment_col = as_col + max_alias + 2 if has_as else as_col + 2
+
+        # Phase 4: 重建行
+        aligned_map = {}
+        for e in entries:
+            parts = [e['expr']]
+            if e['alias']:
+                pad = max(as_col - len(e['expr']), 2)
+                parts.append(' ' * pad + e['alias'])
+                if e['comment']:
+                    cur = len(e['expr']) + pad + len(e['alias'])
+                    parts.append(' ' * max(comment_col - cur, 2) + e['comment'])
+            elif e['comment']:
+                parts.append(' ' * max(comment_col - len(e['expr']), 2) + e['comment'])
+            aligned_map[e['idx']] = e['prefix'] + ''.join(parts)
+
+        return [aligned_map.get(i, lines[i]) for i in range(start, end + 1)]
 
     @staticmethod
     def _cleanup_empty_lines(text):
@@ -2046,6 +2374,9 @@ class SQLFormatterV5:
                     result.append(f"W{case_depth} {seg}")
             else:
                 result.append(f"W{case_depth} {stripped}")
+                # 追踪内容行中的 (（如 THEN (、ELSE (），确保后续 ) 匹配正确深度
+                if stripped.endswith('('):
+                    paren_depths.add(case_depth + 1)
 
         return result
 
@@ -3292,7 +3623,7 @@ class SQLFormatterV5:
         block_map = {}
         blocks = []
 
-        for match in re.finditer(r'\b(CONCAT|SPLIT)\s*\(', sql, re.IGNORECASE):
+        for match in re.finditer(r'\b(CONCAT(?:_WS)?|SPLIT|COLLECT_(?:LIST|SET))\s*\(', sql, re.IGNORECASE):
             paren_start = match.end() - 1
             paren_end = self._find_matching_paren_str(sql, paren_start)
             if paren_end == -1:
@@ -3528,14 +3859,15 @@ class SQLFormatterV5:
                 # 预处理：提取 PARTITIONED BY 原始定义（sqlglot 会合并到主列并丢失类型）
                 escaped_stmt, partition_info = self._extract_partitioned_by(stmt)
 
+                # 预处理：保护多行函数块（CONCAT/SPLIT/COLLECT_LIST 等 跨 5+ 行），防止 sqlglot 重组参数结构
+                # 必须在所有转义步骤之前执行，确保保存的块内容为原始文本，恢复后无需额外处理
+                escaped_stmt, block_map = self._protect_multi_line_blocks(escaped_stmt)
+
                 # 转义 $ 符号（在 PARTITIONED BY 提取结果基础上继续）
                 escaped_stmt, _ = self._escape_dollar_signs(escaped_stmt)
 
                 # 预处理：保留函数名（sqlglot 会重写 NVL→COALESCE, SUBSTR→SUBSTRING, GET_JSON_OBJECT→路径重写）
                 escaped_stmt, escaped_funcs = self._escape_functions(escaped_stmt)
-
-                # 预处理：保护多行函数块（CONCAT/SPLIT 跨 5+ 行），防止 sqlglot 重组参数结构
-                escaped_stmt, block_map = self._protect_multi_line_blocks(escaped_stmt)
 
                 # 预处理：保护含反斜杠的字符串字面量，防止 sqlglot 重复转义
                 escaped_stmt, bstr_map = self._protect_backslash_strings(escaped_stmt)
@@ -3577,6 +3909,8 @@ class SQLFormatterV5:
                     fmt = self._fix_subquery_indent(fmt)
                     # CREATE TABLE 列对齐（列名、类型、COMMENT上下对齐）
                     fmt = self._align_create_table_columns(fmt)
+                    # SELECT 列别名 + 行尾注释智能对齐
+                    fmt = self._align_select_columns(fmt)
                     # 恢复 PARTITIONED BY 原始定义
                     fmt = self._restore_partitioned_by(fmt, partition_info)
                     # 拆分超长标量子查询
@@ -3585,8 +3919,7 @@ class SQLFormatterV5:
                     # 必须在所有其他后处理之后，避免缩进修复等步骤破坏块内换行
                     if block_map:
                         fmt = self._restore_complex_blocks(fmt, block_map)
-                        # 恢复的块中可能含有函数占位符（如 ___SUBSTR___），
-                        # 需要再次执行恢复，因为原始块在 _unescape_functions 之前被保存
+                        # 块在转义之前保存，恢复后为原始文本，此调用为安全措施
                         fmt = self._unescape_functions(fmt)
                     # 分号独立行：避免追加到 -- 注释行末尾导致 ; 被注释吃掉
                     if not fmt.endswith(';'):
